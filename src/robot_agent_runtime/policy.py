@@ -10,7 +10,16 @@ from robot_agent_runtime.ports import Skill
 from robot_agent_runtime.registry import SkillRegistry
 
 
-class SafetyManager:
+class PolicyEnforcer:
+    """Admission policy applied to every step before a task is queued.
+
+    Two rules are enforced: a call must be well formed against the skill's own
+    input schema, and the skill's declared permissions must be covered by the
+    deployment's allowlist. Both are properties of the request and the skill
+    definition — nothing here observes the robot. Semantic validity of a
+    parameter is left to the skill itself.
+    """
+
     def __init__(
         self,
         registry: SkillRegistry,

@@ -113,9 +113,11 @@ src/robot_agent_runtime/
 ├── models.py              任务/事件/技能的数据模型与状态枚举
 ├── errors.py              结构化错误码
 ├── ports.py               Skill / TaskRepository / Reconciler 三个 Protocol
-├── core.py                RuntimeCore：任务生命周期与执行编排
+├── core.py                RuntimeCore：运行时生命周期与公开任务 API
+├── task_state.py          TaskStateStore：本机任务归属与状态机唯一写入点
+├── executor.py            WorkflowExecutor：单任务步骤编排
 ├── registry.py            SkillRegistry：技能注册与查找
-├── safety.py              SafetyManager：参数 Schema 校验与权限检查
+├── policy.py              PolicyEnforcer：准入策略（Schema 校验与权限检查）
 ├── resources.py           ResourceManager：按技能声明的资源互斥
 ├── events.py              EventBus：历史回放 + 实时事件推送
 ├── recovery.py            重启恢复与状态对账
@@ -151,6 +153,20 @@ SkillDefinition(
 ```
 
 实现 `ports.Skill` Protocol 即可接入：`definition` 属性 + `async execute(context, params)`。
+
+## 内部分工
+
+三个模块的边界是“谁可以写状态”：
+
+- `TaskStateStore` 持有六个以 task id 为键的字典（任务、锁、序号、取消事件、进度任务、
+  执行任务），并提供唯一的 `transition()`。它在持有该任务锁的前提下把快照与事件交给仓储
+  一次原子写入，再把权威结果回填到活的 `Task` 对象，最后才发布到事件总线。
+- `WorkflowExecutor` 自身无状态，只负责顺序：申请资源 → 带超时启动技能 → 把结果、超时、
+  取消、意外异常映射成恰好一次终态转换。
+- `RuntimeCore` 负责生命周期（启动恢复、关闭）与公开 API，并在提交时完成校验。
+
+所有带 guard 的转换都走同一把任务锁，因此“取消请求”与“执行推进”是公平竞速，不存在已
+取消的任务又被推进成功的窗口。
 
 ## 测试
 
