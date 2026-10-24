@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Runtime artifacts
+*.db
+*.sqlite
+*.sqlite3
+*.sock
+
+# Packaged deliverables (rebuild from source instead)
+*.zip
+
+# macOS
+.DS_Store
+
+# Local tooling state
+.claude/settings.local.json
+.claude/.cc-writes/
+.workbuddy/

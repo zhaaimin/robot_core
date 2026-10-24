@@ -1,0 +1,137 @@
+import asyncio
+import json
+import os
+import signal
+import sys
+from pathlib import Path
+
+import jsonschema
+import pytest
+
+from robot_agent_runtime.adapters.simulator import Simulator
+from robot_agent_runtime.models import SkillCall, SkillContext, TaskRequest, TaskState
+from robot_agent_runtime.sdk import RemoteRuntime
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+class SkillAdapterContract:
+    """Reusable behavioral checks for future Walker and ROS 2 skill adapters."""
+
+    def create_skills(self) -> dict[str, object]:
+        raise NotImplementedError
+
+    def successful_params(self) -> dict[str, dict]:
+        raise NotImplementedError
+
+    def test_skill_registry_and_schemas_are_valid(self) -> None:
+        skills = self.create_skills()
+        assert skills
+        assert set(skills) == set(self.successful_params())
+        for name, skill in skills.items():
+            definition = skill.definition
+            assert definition.name == name
+            assert definition.version
+            jsonschema.validators.validator_for(definition.input_schema).check_schema(
+                definition.input_schema
+            )
+            assert definition.timeout_s > 0
+
+    async def test_skills_execute_through_the_public_port(self) -> None:
+        skills = self.create_skills()
+        for name, params in self.successful_params().items():
+            jsonschema.validate(params, skills[name].definition.input_schema)
+            context = SkillContext(
+                task_id=f"contract-{name}",
+                execution_id="contract-execution",
+                cancel_event=asyncio.Event(),
+            )
+            result = await skills[name].execute(context, params)
+            assert result.success, result.error
+            assert result.error is None
+
+
+class TestSimulatorSkillContract(SkillAdapterContract):
+    def create_skills(self) -> dict[str, object]:
+        return Simulator().skills
+
+    def successful_params(self) -> dict[str, dict]:
+        return {
+            "navigation.navigate_to": {"target": "contract-dock"},
+            "audio.speak": {"message": "contract complete"},
+            "robot.get_state": {},
+            "wait.delay": {"delay_s": 0},
+        }
+
+
+@pytest.mark.parametrize("example_name", ["embedded_demo.py", "remote_demo.py"])
+async def test_examples_emit_ordered_success_results(example_name: str) -> None:
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(PROJECT_ROOT / "examples" / example_name),
+        cwd=PROJECT_ROOT,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+    assert process.returncode == 0, stderr.decode()
+    payload = json.loads(stdout)
+    assert payload["state"] == TaskState.SUCCEEDED.value
+    assert payload["events"]
+    assert payload["events"] == list(range(1, len(payload["events"]) + 1))
+    assert payload["result"]["steps"][0]["output"]["target"] == "meeting_room"
+
+
+async def test_cli_daemon_runs_remote_task_and_cleans_up_on_sigterm(tmp_path: Path) -> None:
+    socket_path = str(tmp_path / "runtime.sock")
+    database_path = str(tmp_path / "runtime.db")
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "robot_agent_runtime",
+        "serve",
+        "--socket",
+        socket_path,
+        "--database",
+        database_path,
+        cwd=PROJECT_ROOT,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    remote = RemoteRuntime(socket_path)
+    try:
+        async with asyncio.timeout(5):
+            while True:
+                try:
+                    await remote.start()
+                    break
+                except Exception:
+                    if process.returncode is not None:
+                        stderr = await process.stderr.read()
+                        raise AssertionError(stderr.decode())
+                    await asyncio.sleep(0.02)
+
+        task = await remote.submit_task(
+            TaskRequest(
+                task_type="cli-contract",
+                steps=[SkillCall(skill="robot.get_state")],
+                idempotency_key="cli-contract-1",
+            )
+        )
+        events = []
+        async with asyncio.timeout(2):
+            async for event in remote.subscribe_task_events(task.id):
+                events.append(event)
+        final = await remote.get_task_status(task.id)
+        assert final.state == TaskState.SUCCEEDED
+        assert [event.sequence for event in events] == list(range(1, len(events) + 1))
+        assert Path(database_path).is_file()
+    finally:
+        await remote.close()
+        if process.returncode is None:
+            process.send_signal(signal.SIGTERM)
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
+
+    assert process.returncode == 0, stderr.decode()
+    assert not os.path.lexists(socket_path)
