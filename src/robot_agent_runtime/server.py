@@ -1,6 +1,7 @@
 import asyncio
 import os
 import stat
+import sys
 from contextlib import suppress
 from typing import Any
 
@@ -9,7 +10,7 @@ from pydantic import ValidationError
 from robot_agent_runtime.core import RuntimeCore
 from robot_agent_runtime.errors import AgentRuntimeError, InvalidRequest
 from robot_agent_runtime.models import TaskRequest
-from robot_agent_runtime.protocol import (
+from robot_agent_runtime.wire import (
     MAX_MESSAGE_BYTES,
     SERVICE_NAME,
     SERVICE_VERSION,
@@ -52,7 +53,7 @@ class RuntimeServer:
                     self._client_connected,
                     path=self._socket_path,
                     limit=MAX_MESSAGE_BYTES + 1,
-                    cleanup_socket=False,
+                    **({"cleanup_socket": False} if sys.version_info >= (3, 13) else {}),
                 )
                 socket_stat = os.lstat(self._socket_path)
                 self._owned_socket = (socket_stat.st_dev, socket_stat.st_ino)

@@ -2,7 +2,12 @@ from collections.abc import AsyncIterator, Mapping
 
 from robot_agent_runtime.core import RuntimeCore
 from robot_agent_runtime.models import Event, SkillDefinition, Task, TaskRequest
-from robot_agent_runtime.ports import Reconciler, Skill, TaskRepository
+from robot_agent_runtime.ports import (
+    Reconciler,
+    RobotStateProvider,
+    Skill,
+    TaskRepository,
+)
 
 
 class RobotRuntime:
@@ -12,8 +17,11 @@ class RobotRuntime:
         skills: Mapping[str, Skill],
         reconciler: Reconciler | None = None,
         allowed_permissions: set[str] | None = None,
+        robot_state: RobotStateProvider | None = None,
     ) -> None:
-        self._core = RuntimeCore(repository, skills, reconciler, allowed_permissions)
+        self._core = RuntimeCore(
+            repository, skills, reconciler, allowed_permissions, robot_state
+        )
 
     async def start(self) -> None:
         await self._core.start()

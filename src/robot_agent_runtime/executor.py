@@ -4,13 +4,14 @@ from typing import Any
 from robot_agent_runtime.errors import (
     AgentRuntimeError,
     InternalError,
+    PreconditionFailed,
     SkillTimeout,
     TaskCancelled,
 )
 from robot_agent_runtime.models import ErrorInfo, SkillContext, Task, TaskState
-from robot_agent_runtime.ports import Skill
+from robot_agent_runtime.ports import RobotStateProvider, Skill
 from robot_agent_runtime.registry import SkillRegistry
-from robot_agent_runtime.resources import ResourceManager
+from robot_agent_runtime.resources import ResourceLocks
 from robot_agent_runtime.task_state import TaskStateStore
 
 
@@ -27,11 +28,13 @@ class WorkflowExecutor:
         self,
         state: TaskStateStore,
         registry: SkillRegistry,
-        resources: ResourceManager,
+        resources: ResourceLocks,
+        robot_state: RobotStateProvider | None = None,
     ) -> None:
         self._state = state
         self._registry = registry
         self._resources = resources
+        self._robot_state = robot_state
 
     async def run(self, task: Task) -> None:
         cancel_event = self._state.cancel_events[task.id]
@@ -66,6 +69,11 @@ class WorkflowExecutor:
                 async with self._resources.acquire(resources, cancel_event):
                     if cancel_event.is_set():
                         raise TaskCancelled("Task cancelled while waiting for resources")
+                    # Read the robot only once the hardware this step needs is
+                    # ours, and before SKILL_STARTED is published: a reading
+                    # taken before the lock can already be stale, and no event
+                    # may claim a step began that is about to be refused.
+                    await self._require_preconditions(skill, index)
                     if resources:
                         await self._state.execution_transition(
                             task, "TASK_RUNNING", {"state": TaskState.RUNNING}
@@ -163,6 +171,22 @@ class WorkflowExecutor:
             )
             await self._fail_skill(
                 task, current_step, mapped.info.details["skill"], mapped.info
+            )
+
+    async def _require_preconditions(self, skill: Skill, step: int) -> None:
+        name = skill.definition.name
+        declared = skill.definition.preconditions
+        if self._robot_state is None or not declared:
+            return
+        blocked = declared & frozenset(await self._robot_state.unsatisfied())
+        if blocked:
+            raise PreconditionFailed(
+                f"Robot preconditions not met for skill {name}",
+                details={
+                    "step": step,
+                    "skill": name,
+                    "unsatisfied": sorted(blocked),
+                },
             )
 
     async def _execute_with_timeout(

@@ -8,7 +8,7 @@ from pydantic import ValidationError
 
 from robot_agent_runtime.errors import AgentRuntimeError, InvalidRequest
 from robot_agent_runtime.models import Event, SkillDefinition, Task, TaskRequest
-from robot_agent_runtime.protocol import read_message, write_message
+from robot_agent_runtime.wire import read_message, write_message
 
 
 class RemoteRuntimeError(AgentRuntimeError):

@@ -30,6 +30,10 @@ class PermissionDenied(AgentRuntimeError):
     code = "PERMISSION_DENIED"
 
 
+class PreconditionFailed(AgentRuntimeError):
+    code = "PRECONDITION_FAILED"
+
+
 class TaskNotFound(AgentRuntimeError):
     code = "TASK_NOT_FOUND"
 
@@ -56,3 +60,19 @@ class TaskCancelled(AgentRuntimeError):
 
 class ReconciliationRequired(AgentRuntimeError):
     code = "RECONCILIATION_REQUIRED"
+
+
+class RobotConnectionError(AgentRuntimeError):
+    code = "ROBOT_CONNECTION_ERROR"
+
+
+class RobotRequestError(AgentRuntimeError):
+    code = "ROBOT_REQUEST_FAILED"
+
+
+class RobotResponseError(AgentRuntimeError):
+    code = "ROBOT_RESPONSE_INVALID"
+
+
+class RobotStopError(AgentRuntimeError):
+    code = "ROBOT_STOP_UNCONFIRMED"

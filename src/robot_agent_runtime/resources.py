@@ -5,7 +5,22 @@ from contextlib import asynccontextmanager
 from robot_agent_runtime.errors import TaskCancelled
 
 
-class ResourceManager:
+class ResourceLocks:
+    """Mutual exclusion over named hardware, and nothing else.
+
+    A robot has one chassis and one speaker, so two tasks must not drive the
+    base at once. A skill declares the names it needs in
+    :attr:`SkillDefinition.resources` and the runtime takes the locks; the
+    names are opaque, and nothing here allocates, pools or meters anything.
+
+    :meth:`acquire` takes a step's whole set in sorted order, so callers can
+    never disagree about ordering, and races the acquisition against
+    ``cancel_event``: a plain ``await lock.acquire()`` would leave a task
+    queued behind a long navigation unable to answer a cancel request. When
+    both finish together the lock is held and still has to be released, which
+    is what the bookkeeping in the ``finally`` block is for.
+    """
+
     def __init__(self) -> None:
         self._locks: dict[str, asyncio.Lock] = {}
 

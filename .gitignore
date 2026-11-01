@@ -28,3 +28,6 @@ venv/
 .claude/settings.local.json
 .claude/.cc-writes/
 .workbuddy/
+
+# Local verification scratch (dependency shims; see memory notes)
+.verify/

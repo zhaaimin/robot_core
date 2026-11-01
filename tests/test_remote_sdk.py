@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-import robot_agent_runtime.protocol as protocol_module
+import robot_agent_runtime.wire as wire_module
 import robot_agent_runtime.sdk as sdk_module
 import robot_agent_runtime.server as server_module
 from robot_agent_runtime.adapters.simulator import Simulator
@@ -360,8 +360,8 @@ async def test_protocol_maps_json_recursion_error_to_invalid_request() -> None:
     def raise_recursion(_: bytes) -> None:
         raise RecursionError("injected recursion")
 
-    original_json = protocol_module.json
-    protocol_module.json = SimpleNamespace(
+    original_json = wire_module.json
+    wire_module.json = SimpleNamespace(
         loads=raise_recursion,
         dumps=json.dumps,
         JSONDecodeError=json.JSONDecodeError,
@@ -371,14 +371,14 @@ async def test_protocol_maps_json_recursion_error_to_invalid_request() -> None:
         reader.feed_data(b'{"id":"deep","method":"health"}\n')
         reader.feed_eof()
         try:
-            await protocol_module.read_message(reader)
+            await wire_module.read_message(reader)
         except InvalidRequest as error:
             mapped = error.info.code == "INVALID_REQUEST"
         except RecursionError:
             mapped = False
         assert mapped, "RecursionError was not mapped to InvalidRequest"
     finally:
-        protocol_module.json = original_json
+        wire_module.json = original_json
 
 
 async def test_protocol_rejects_oversized_message() -> None:
@@ -811,8 +811,12 @@ async def test_remote_rejects_invalid_stream_envelopes(message: dict[str, Any]) 
         async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             request_message = json.loads(await reader.readline())
             response = {**message, "id": request_message["id"]}
-            writer.write(json.dumps(response).encode() + b"\n")
-            await writer.drain()
+            try:
+                writer.write(json.dumps(response).encode() + b"\n")
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
 
         fake = await asyncio.start_unix_server(handle, path=socket_path)
         remote = RemoteRuntime(socket_path)

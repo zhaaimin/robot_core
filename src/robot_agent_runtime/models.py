@@ -62,6 +62,7 @@ class SkillDefinition(BaseModel):
     input_schema: dict[str, Any]
     resources: set[str] = Field(default_factory=set)
     permissions: set[str] = Field(default_factory=set)
+    preconditions: set[str] = Field(default_factory=set)
     timeout_s: float = Field(default=30, gt=0)
     supports_cancel: bool = False
 

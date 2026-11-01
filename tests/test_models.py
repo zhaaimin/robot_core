@@ -116,6 +116,7 @@ def test_skill_definition_defaults_and_json_serialization() -> None:
 
     assert definition.resources == set()
     assert definition.permissions == set()
+    assert definition.preconditions == set()
     assert definition.timeout_s == 30
     assert definition.supports_cancel is False
     assert json.loads(definition.model_dump_json()) == {
@@ -124,6 +125,7 @@ def test_skill_definition_defaults_and_json_serialization() -> None:
         "input_schema": {},
         "resources": [],
         "permissions": [],
+        "preconditions": [],
         "timeout_s": 30.0,
         "supports_cancel": False,
     }

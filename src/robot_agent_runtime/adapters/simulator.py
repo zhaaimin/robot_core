@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 from robot_agent_runtime.errors import SkillExecutionError, TaskCancelled
@@ -10,6 +10,12 @@ from robot_agent_runtime.models import (
     Task,
     TaskState,
 )
+
+#: Condition labels shared by the simulated skills and the simulated robot.
+#: A skill declaring a label the provider never reports is a silent no-op, so
+#: both sides spell them once, here.
+ESTOP_CLEAR = "estop.clear"
+BATTERY_SUFFICIENT = "battery.sufficient"
 
 
 class SimulatedSkill:
@@ -88,6 +94,7 @@ class NavigateSkill(SimulatedSkill):
                 },
                 resources={"base"},
                 permissions={"navigation"},
+                preconditions={ESTOP_CLEAR, BATTERY_SUFFICIENT},
                 supports_cancel=True,
             ),
             **kwargs,
@@ -179,6 +186,144 @@ class SimulatorReconciler:
 
     async def reconcile(self, task: Task) -> TaskState | None:
         return self._authoritative_states.get(task.id)
+
+
+class _LabelSource:
+    """Push plumbing shared by the simulated condition sources.
+
+    Each :meth:`watch` call gets its own unbounded queue, so a slow consumer
+    delays only itself, and ``_publish`` never blocks the caller that changed
+    the robot.
+    """
+
+    def __init__(self, unsatisfied: frozenset[str]) -> None:
+        self._unsatisfied = unsatisfied
+        self._watchers: list[asyncio.Queue[frozenset[str]]] = []
+
+    async def unsatisfied(self) -> frozenset[str]:
+        return self._unsatisfied
+
+    async def watch(self) -> AsyncIterator[frozenset[str]]:
+        queue: asyncio.Queue[frozenset[str]] = asyncio.Queue()
+        self._watchers.append(queue)
+        try:
+            while True:
+                yield await queue.get()
+        finally:
+            self._watchers.remove(queue)
+
+    def _publish(self, unsatisfied: frozenset[str]) -> None:
+        self._unsatisfied = unsatisfied
+        for queue in self._watchers:
+            queue.put_nowait(unsatisfied)
+
+
+class SimulatedRobotState(_LabelSource):
+    """A robot state source driven by the caller instead of by hardware.
+
+    :meth:`set_unsatisfied` is the driver: it replaces the set of conditions
+    that do not hold and pushes the new set to every live :meth:`watch`
+    iterator, which is how a simulated emergency stop or battery drop reaches
+    tasks that are already running.
+
+    This is the blunt instrument — the caller names the labels directly. Use
+    :class:`SimulatedRobot` when you want the labels *derived* from readings
+    the way a real adapter derives them.
+    """
+
+    def __init__(self, unsatisfied: set[str] | None = None) -> None:
+        super().__init__(frozenset(unsatisfied or ()))
+
+    def set_unsatisfied(self, unsatisfied: set[str]) -> None:
+        self._publish(frozenset(unsatisfied))
+
+
+class SimulatedRobot(_LabelSource):
+    """A robot whose condition labels are computed from simulated readings.
+
+    Where :class:`SimulatedRobotState` lets the caller state which labels are
+    broken, this one models the hardware: press :meth:`set_estop`, move the
+    battery with :meth:`set_voltage` or :meth:`drain`, and the labels follow.
+    That makes it the honest stand-in for a real adapter, because it also
+    carries the two behaviours a real adapter needs and a test double does not:
+
+    * **Hysteresis.** ``battery.sufficient`` breaks below ``low_voltage`` but
+      only recovers above ``recovery_voltage``. Without the gap, a battery
+      resting on the threshold flaps and every push cancels fresh work.
+    * **Silence when nothing changed.** A reading that recomputes to the same
+      set is not published, so a 10 Hz sensor does not wake the runtime 10
+      times a second to re-derive the same answer.
+
+    The opening voltage is read against ``low_voltage``, so constructing a
+    robot already below it starts out with the label broken.
+    """
+
+    def __init__(
+        self,
+        *,
+        voltage: float = 24.0,
+        low_voltage: float = 22.5,
+        recovery_voltage: float = 23.5,
+        estop_engaged: bool = False,
+    ) -> None:
+        if low_voltage >= recovery_voltage:
+            raise ValueError("recovery_voltage must be above low_voltage")
+        self._low_voltage = low_voltage
+        self._recovery_voltage = recovery_voltage
+        self._voltage = voltage
+        self._estop_engaged = estop_engaged
+        super().__init__(frozenset())
+        self._unsatisfied = self._derive()
+
+    @property
+    def voltage(self) -> float:
+        return self._voltage
+
+    @property
+    def estop_engaged(self) -> bool:
+        return self._estop_engaged
+
+    def set_estop(self, engaged: bool) -> None:
+        self._estop_engaged = engaged
+        self._refresh()
+
+    def set_voltage(self, volts: float) -> None:
+        self._voltage = volts
+        self._refresh()
+
+    async def drain(
+        self,
+        *,
+        volts_per_second: float,
+        interval_s: float = 0.02,
+        floor: float = 0.0,
+    ) -> None:
+        """Lower the voltage until it reaches ``floor``.
+
+        A coroutine rather than a managed background task: the caller decides
+        its lifetime with :func:`asyncio.create_task` and cancels it on the way
+        out, so this class owns no task it would have to clean up.
+        """
+        if volts_per_second <= 0:
+            raise ValueError("volts_per_second must be positive")
+        while self._voltage > floor:
+            await asyncio.sleep(interval_s)
+            self.set_voltage(max(floor, self._voltage - volts_per_second * interval_s))
+
+    def _refresh(self) -> None:
+        unsatisfied = self._derive()
+        if unsatisfied != self._unsatisfied:
+            self._publish(unsatisfied)
+
+    def _derive(self) -> frozenset[str]:
+        unsatisfied = set()
+        if self._estop_engaged:
+            unsatisfied.add(ESTOP_CLEAR)
+        was_low = BATTERY_SUFFICIENT in self._unsatisfied
+        threshold = self._recovery_voltage if was_low else self._low_voltage
+        if self._voltage < threshold:
+            unsatisfied.add(BATTERY_SUFFICIENT)
+        return frozenset(unsatisfied)
 
 
 class Simulator:

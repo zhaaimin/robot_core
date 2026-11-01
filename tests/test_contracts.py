@@ -1,9 +1,12 @@
 import asyncio
+from collections.abc import Callable
+from dataclasses import dataclass
 import json
 import os
 import signal
 import sys
 from pathlib import Path
+from typing import Any
 
 import jsonschema
 import pytest
@@ -11,6 +14,7 @@ import pytest
 from robot_agent_runtime.adapters.simulator import Simulator
 from robot_agent_runtime.models import SkillCall, SkillContext, TaskRequest, TaskState
 from robot_agent_runtime.sdk import RemoteRuntime
+from robot_agent_runtime.ports import CallbackApiResponse, CallbackRobotApi, Skill
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -63,6 +67,72 @@ class TestSimulatorSkillContract(SkillAdapterContract):
             "robot.get_state": {},
             "wait.delay": {"delay_s": 0},
         }
+
+
+@dataclass
+class ContractApiResponse:
+    is_success: bool = True
+    result: Any = None
+    error_code: int = 0
+    error_message: str = ""
+
+
+class ContractCallbackApi:
+    """A structural callback port implementation without a vendor SDK."""
+
+    def __init__(self) -> None:
+        self.services: dict[str, Callable[[Any, Any], None]] = {}
+        self.notifications: list[str] = []
+        self.disconnect: Callable[[], None] = lambda: None
+
+    def request(
+        self, method: str, params: dict[str, Any],
+        callback: Callable[[CallbackApiResponse], None],
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        loop.call_soon(callback, ContractApiResponse(result={"workId": "contract"}))
+        loop.call_soon(self.services["cc.api.work.finished"], "event", {"workId": "contract"})
+
+    def notify(self, method: str) -> None:
+        self.notifications.append(method)
+
+    def add_service(self, name: str, callback: Callable[[Any, Any], None]) -> None:
+        self.services[name] = callback
+
+    def remove_service(self, name: str) -> None:
+        self.services.pop(name)
+
+    def set_disconnect_callback(self, callback: Callable[[], None]) -> None:
+        self.disconnect = callback
+
+
+async def check_callback_api_speech_contract(api: CallbackRobotApi) -> None:
+    from robot_agent_runtime.adapters.cc_api import CcApiSpeechSkill
+
+    adapter = CcApiSpeechSkill(api)
+    skill: Skill = adapter
+    definition = skill.definition
+    assert definition.resources == {"speaker"}
+    assert definition.permissions == {"audio"}
+    assert definition.preconditions == set()
+    assert definition.supports_cancel is True
+    jsonschema.validators.validator_for(definition.input_schema).check_schema(definition.input_schema)
+    await adapter.start()
+    try:
+        result = await asyncio.wait_for(skill.execute(
+            SkillContext("contract", "contract", asyncio.Event()), {"message": "contract"},
+        ), 1)
+        assert result.success
+        json.dumps(result.model_dump())
+    finally:
+        await adapter.close()
+
+
+async def test_cc_api_callback_port_and_speech_skill_contract() -> None:
+    api = ContractCallbackApi()
+    await check_callback_api_speech_contract(api)
+    assert not api.services
+    assert api.notifications == ["cc.api.work.subscribe", "cc.api.work.unsubscribe"]
 
 
 @pytest.mark.parametrize("example_name", ["embedded_demo.py", "remote_demo.py"])
