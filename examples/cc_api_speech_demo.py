@@ -8,35 +8,47 @@ from collections.abc import Sequence
 
 from robot_agent_runtime.adapters.cc_api import CcApiSpeechSkill
 from robot_agent_runtime.errors import RobotConnectionError, SkillExecutionError
-from robot_agent_runtime.models import SkillCall, TaskRequest, TaskState
+from robot_agent_runtime.models import Event, SkillCall, Task, TaskRequest, TaskState
 from robot_agent_runtime.ports import CallbackRobotApi
 from robot_agent_runtime.repository import InMemoryTaskRepository
 from robot_agent_runtime.sdk import RobotRuntime
 
 
-async def speak(api: CallbackRobotApi, message: str) -> None:
+async def speak(api: CallbackRobotApi, message: str) -> Task:
+    """Return the final snapshot after releasing runtime and adapter resources.
+
+    Task failures are returned in state/error so callers can inspect vendor
+    errors as well as successful output. Startup and cleanup failures still
+    propagate as exceptions. The caller continues to own the SDK connection.
+    """
     skill = CcApiSpeechSkill(api)
     runtime = RobotRuntime(
         InMemoryTaskRepository(), {skill.definition.name: skill},
         allowed_permissions={"audio"},
     )
+    completed: asyncio.Future[Task] = asyncio.get_running_loop().create_future()
+
+    def on_event(event: Event) -> None:
+        print(event.model_dump_json(), flush=True)
+
+    def on_done(task: Task) -> None:
+        if not completed.done():
+            completed.set_result(task)
+
+    def on_error(task_id: str, error: Exception) -> None:
+        if not completed.done():
+            completed.set_exception(error)
+
+    runtime.add_task_listener(on_event=on_event, on_done=on_done, on_error=on_error)
     await skill.start()
     try:
         await runtime.start()
         try:
-            task = await runtime.submit_task(TaskRequest(
+            await runtime.submit_task(TaskRequest(
                 task_type="announcement",
                 steps=[SkillCall(skill="audio.speak", params={"message": message})],
             ))
-            async for event in runtime.subscribe_task_events(task.id):
-                print(event.model_dump_json(), flush=True)
-            final = await runtime.get_task_status(task.id)
-            if final.state != TaskState.SUCCEEDED:
-                raise SkillExecutionError(
-                    "Speech task did not succeed",
-                    details={"task_id": task.id, "error": final.error.to_dict() if final.error else None},
-                )
-            print(json.dumps(final.result, ensure_ascii=False))
+            return await completed
         finally:
             await runtime.close()
     finally:
@@ -68,7 +80,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         api.start()
         if not api.wait_until_connected(5000):
             raise RobotConnectionError("CC API did not connect within 5 seconds")
-        asyncio.run(speak(api, args.message))
+        final = asyncio.run(speak(api, args.message))
+        if final.state != TaskState.SUCCEEDED:
+            raise SkillExecutionError(
+                "Speech task did not succeed",
+                details={"task_id": final.id, "error": final.error.to_dict() if final.error else None},
+            )
+        print(json.dumps(final.result, ensure_ascii=False))
     finally:
         api.stop()
 

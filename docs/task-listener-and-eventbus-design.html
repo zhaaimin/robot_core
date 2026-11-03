@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>任务监听与事件总线设计文档</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --bg-soft: #f6f7f9;
+    --surface: #ffffff;
+    --text: #1a1d24;
+    --text-muted: #5f6570;
+    --border: #e4e7ec;
+    --accent: #185fa5;
+    --accent-soft: #e6f1fb;
+    --code-bg: #f1f3f6;
+    --teal: #0f6e56;
+    --teal-soft: #e1f5ee;
+    --coral: #993c1d;
+    --coral-soft: #faece7;
+    --amber: #854f0b;
+    --amber-soft: #faeeda;
+    --purple: #3c3489;
+    --purple-soft: #eeedfe;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    line-height: 1.7;
+    font-size: 15px;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 48px 28px 96px; }
+  header.doc { border-bottom: 1px solid var(--border); padding-bottom: 24px; margin-bottom: 8px; }
+  h1 { font-size: 28px; font-weight: 600; margin: 0 0 8px; letter-spacing: -0.01em; }
+  .subtitle { color: var(--text-muted); font-size: 15px; margin: 0; }
+  .meta { color: var(--text-muted); font-size: 13px; margin-top: 12px; }
+  nav.toc {
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 22px;
+    margin: 28px 0;
+  }
+  nav.toc h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); margin: 0 0 10px; }
+  nav.toc ol { margin: 0; padding-left: 20px; }
+  nav.toc li { margin: 4px 0; }
+  nav.toc a { color: var(--accent); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  h2 { font-size: 21px; font-weight: 600; margin: 48px 0 14px; padding-top: 24px; border-top: 1px solid var(--border); }
+  h3 { font-size: 17px; font-weight: 600; margin: 28px 0 10px; }
+  p { margin: 12px 0; }
+  code {
+    font-family: var(--mono);
+    font-size: 0.9em;
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 14px; }
+  th, td { border: 1px solid var(--border); padding: 9px 12px; text-align: left; vertical-align: top; }
+  th { background: var(--bg-soft); font-weight: 600; }
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-soft);
+    padding: 12px 16px;
+    border-radius: 0 8px 8px 0;
+    margin: 18px 0;
+  }
+  .callout.teal { border-color: var(--teal); background: var(--teal-soft); }
+  .callout.coral { border-color: var(--coral); background: var(--coral-soft); }
+  .callout.amber { border-color: var(--amber); background: var(--amber-soft); }
+  .callout strong { display: block; margin-bottom: 4px; }
+  figure { margin: 24px 0; }
+  figcaption { color: var(--text-muted); font-size: 13px; margin-top: 8px; text-align: center; }
+  svg.diagram { width: 100%; height: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+  .file-ref { color: var(--text-muted); font-size: 13px; font-family: var(--mono); }
+  .kw { font-weight: 600; color: var(--accent); }
+  .arrow-marker { color: #888780; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="doc">
+  <h1>任务监听与事件总线设计文档</h1>
+  <p class="subtitle">robot-agent-runtime — 从状态变更到用户回调的完整链路解析</p>
+  <p class="meta">讲解现有实现 · 对应代码 <span class="file-ref">src/robot_agent_runtime/</span> · 生成于 2026-11-03</p>
+</header>
+
+<nav class="toc">
+  <h2>目录</h2>
+  <ol>
+    <li><a href="#overview">整体定位与核心结论</a></li>
+    <li><a href="#birth">事件如何诞生：唯一写入点</a></li>
+    <li><a href="#eventbus">EventBus：先回放、后实时、水位去重</a></li>
+    <li><a href="#callback">回调分发：_observe 状态机</a></li>
+    <li><a href="#yield">让出点与唤醒机制</a></li>
+    <li><a href="#sequence">端到端时序</a></li>
+    <li><a href="#invariants">不变量与设计取舍</a></li>
+  </ol>
+</nav>
+
+<h2 id="overview">1. 整体定位与核心结论</h2>
+
+<p>这套系统实现了「任务状态变更 → 事件 → 用户回调」的通知能力。它的本质是<strong>异步事件流</strong>（async event stream），而非经典的观察者（Observer）模式。</p>
+
+<div class="callout teal">
+  <strong>核心结论</strong>
+  没有"观察者对象"，也没有"发布者遍历调用回调"。发布者只把事件 <code>put_nowait</code> 进队列就立即返回；真正调用用户回调的，是订阅方自己的协程在消费事件流的过程中执行的那一行 <code>_invoke(...)</code>。回调责任从"发布者"移到了"订阅者"。
+</div>
+
+<table>
+  <tr><th>维度</th><th>经典观察者模式</th><th>本项目实现</th></tr>
+  <tr><td>订阅者形态</td><td>观察者对象，持有回调引用</td><td>一个 <code>asyncio.Queue</code> + 一个监听协程</td></tr>
+  <tr><td>通知方式</td><td>发布者遍历观察者，逐个调用</td><td>发布者入队即返回，不碰回调</td></tr>
+  <tr><td>谁触发回调</td><td>发布者（push）</td><td>事件循环 + 订阅协程自己（pull）</td></tr>
+  <tr><td>慢订阅者</td><td>阻塞发布者</td><td>发布零阻塞；慢订阅者只积压自己的队列</td></tr>
+</table>
+
+<p>这套设计的"绕"，源自三个必须满足的硬约束（详见 <a href="#invariants">第 7 节</a>）：发布者零阻塞、事件可回放、订阅者可控挂起。它在不引入线程、不引入消息队列、不加任何依赖的前提下，用纯 asyncio 原语满足了这四个需求。</p>
+
+<figure>
+  <svg class="diagram" viewBox="0 0 720 300" role="img" aria-label="系统分层概览">
+    <defs>
+      <marker id="m1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/>
+      </marker>
+    </defs>
+    <rect x="30" y="30" width="660" height="240" rx="16" fill="#f6f7f9" stroke="#e4e7ec" stroke-width="0.5"/>
+    <g>
+      <rect x="60" y="60" width="280" height="56" rx="8" fill="#e6f1fb" stroke="#185fa5" stroke-width="0.5"/>
+      <text x="200" y="82" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#0c447c">TaskStateStore.transition()</text>
+      <text x="200" y="100" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185fa5">唯一写入点 · 原子落库 · 发布事件</text>
+    </g>
+    <g>
+      <rect x="60" y="140" width="280" height="56" rx="8" fill="#eeedfe" stroke="#534ab7" stroke-width="0.5"/>
+      <text x="200" y="162" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#26215c">EventBus</text>
+      <text x="200" y="180" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#534ab7">回放 + 实时 · 水位去重 · 背压</text>
+    </g>
+    <g>
+      <rect x="60" y="220" width="280" height="56" rx="8" fill="#e1f5ee" stroke="#0f6e56" stroke-width="0.5"/>
+      <text x="200" y="242" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#085041">TaskListener._observe</text>
+      <text x="200" y="260" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0f6e56">逐事件消费 · 分发回调</text>
+    </g>
+    <g>
+      <rect x="400" y="60" width="250" height="56" rx="8" fill="#f1f3f6" stroke="#5f5e5a" stroke-width="0.5"/>
+      <text x="525" y="82" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#2c2c2a">TaskRepository</text>
+      <text x="525" y="100" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5f5e5a">事件持久化 · 支持回放</text>
+    </g>
+    <g>
+      <rect x="400" y="220" width="250" height="56" rx="8" fill="#f1f3f6" stroke="#5f5e5a" stroke-width="0.5"/>
+      <text x="525" y="242" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#2c2c2a">用户回调</text>
+      <text x="525" y="260" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5f5e5a">on_event / on_done / on_error</text>
+    </g>
+    <line x1="200" y1="116" x2="200" y2="140" stroke="#888780" stroke-width="1.5" marker-end="url(#m1)"/>
+    <line x1="200" y1="196" x2="200" y2="220" stroke="#888780" stroke-width="1.5" marker-end="url(#m1)"/>
+    <line x1="340" y1="88" x2="400" y2="88" stroke="#888780" stroke-width="1" stroke-dasharray="3 3"/>
+    <line x1="340" y1="168" x2="400" y2="168" stroke="#888780" stroke-width="1" stroke-dasharray="3 3"/>
+    <line x1="525" y1="116" x2="525" y2="220" stroke="#888780" stroke-width="1.5" marker-end="url(#m1)"/>
+  </svg>
+  <figcaption>图 1 · 系统四层：状态写入 → 事件总线 → 监听分发 → 用户回调</figcaption>
+</figure>
+
+<h2 id="birth">2. 事件如何诞生：唯一写入点</h2>
+
+<p>所有事件只有一个产出点——<span class="file-ref">task_state.py</span> 的 <code>TaskStateStore.transition()</code>（内核不变量 1：任务状态唯一写入点）。它在<strong>持有该任务锁</strong>的前提下，按固定四步顺序执行：</p>
+
+<ol>
+  <li><strong>快照</strong>：深拷贝当前 <code>Task</code>，套用变更得到新快照；</li>
+  <li><strong>原子持久化</strong>：<code>repository.apply_transition(snapshot, Event(...))</code> 一次调用同时写入任务快照和事件（序号 = 计数器 + 1）；</li>
+  <li><strong>回填</strong>：把权威结果逐字段写回活对象，让执行中的代码立即看到新状态；</li>
+  <li><strong>最后才发布</strong>：<code>self._events.publish(stored_event)</code>。</li>
+</ol>
+
+<p>顺序的意义：<code>publish</code> 在锁内、持久化之后，因此<strong>事件的发布顺序严格等于状态迁移顺序</strong>，且订阅者读到的事件一定已经落盘。</p>
+
+<pre><code># task_state.py:104-133（精简）
+async def transition(self, task, event_type, changes=None, data=None, guard=None):
+    async with self.task_locks[task.id]:
+        snapshot = self.snapshot(task)
+        if changes:
+            snapshot = snapshot.model_copy(update=changes)
+        if event_type is not None:
+            sequence = self.sequences[task.id] + 1
+            persisted, stored_event = await self._repository.apply_transition(
+                snapshot, Event(task_id=task.id, sequence=sequence, ...))
+            self.sequences[task.id] = sequence
+        self.adopt_snapshot(task, persisted)
+        if stored_event is not None:
+            self._events.publish(stored_event)   # ← 锁内、持久化后发布
+        return True</code></pre>
+
+<p>事件类型的产出点分布如下：</p>
+
+<table>
+  <tr><th>事件类型</th><th>产出位置</th></tr>
+  <tr><td>TASK_CREATED</td><td><code>core.py:280</code></td></tr>
+  <tr><td>SKILL_STARTED / SKILL_SUCCEEDED / SKILL_FAILED / SKILL_PROGRESS</td><td><code>executor.py</code></td></tr>
+  <tr><td>TASK_SUCCEEDED / TASK_FAILED / TASK_CANCEL_REQUESTED</td><td><code>task_state.py</code></td></tr>
+  <tr><td>TASK_CANCELED</td><td><code>executor.py</code></td></tr>
+  <tr><td>TASK_RECONCILED</td><td><code>recovery.py</code></td></tr>
+</table>
+
+<h2 id="eventbus">3. EventBus：先回放、后实时、水位去重</h2>
+
+<p><span class="file-ref">events.py</span> 的 <code>EventBus</code> 是事件的唯一分发组件。它自身不存事件——持久化在 <code>TaskRepository</code>，总线只维护「谁在等」和「发到哪了」。</p>
+
+<h3>3.1 四份内部状态</h3>
+<table>
+  <tr><th>字段</th><th>类型</th><th>作用</th></tr>
+  <tr><td><code>_repository</code></td><td><code>TaskRepository</code></td><td>回放的历史数据源</td></tr>
+  <tr><td><code>_queue_size</code></td><td><code>int = 1000</code></td><td>每条订阅队列的容量阈值</td></tr>
+  <tr><td><code>_subscribers</code></td><td><code>dict[task_id, set[Queue]]</code></td><td>每任务挂若干订阅队列</td></tr>
+  <tr><td><code>_watermarks</code></td><td><code>dict[Queue, int]</code></td><td>每条队列已交付的最大序号（去重依据）</td></tr>
+  <tr><td><code>_overflowed</code> / <code>_closed</code></td><td><code>set / bool</code></td><td>溢出集合 / 关闭标记</td></tr>
+</table>
+
+<h3>3.2 subscribe()：三阶段流水</h3>
+
+<figure>
+  <svg class="diagram" viewBox="0 0 720 330" role="img" aria-label="subscribe 三阶段">
+    <defs>
+      <marker id="m2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/>
+      </marker>
+    </defs>
+    <g>
+      <rect x="40" y="40" width="200" height="64" rx="8" fill="#e1f5ee" stroke="#0f6e56" stroke-width="0.5"/>
+      <text x="140" y="62" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#085041">① 注册队列</text>
+      <text x="140" y="82" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0f6e56">先于回放，堵竞态窗口</text>
+    </g>
+    <g>
+      <rect x="270" y="40" width="200" height="64" rx="8" fill="#e1f5ee" stroke="#0f6e56" stroke-width="0.5"/>
+      <text x="370" y="62" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#085041">② 回放历史</text>
+      <text x="370" y="82" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0f6e56">list_events 按序 yield</text>
+    </g>
+    <g>
+      <rect x="500" y="40" width="180" height="64" rx="8" fill="#e1f5ee" stroke="#0f6e56" stroke-width="0.5"/>
+      <text x="590" y="62" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#085041">③ 实时等待</text>
+      <text x="590" y="82" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0f6e56">queue.get 挂起</text>
+    </g>
+    <line x1="240" y1="72" x2="270" y2="72" stroke="#888780" stroke-width="1.5" marker-end="url(#m2)"/>
+    <line x1="470" y1="72" x2="500" y2="72" stroke="#888780" stroke-width="1.5" marker-end="url(#m2)"/>
+
+    <g>
+      <rect x="40" y="150" width="640" height="52" rx="8" fill="#faece7" stroke="#993c1d" stroke-width="0.5"/>
+      <text x="360" y="170" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#712b13">回放与实时都可能提前 return：观察到终态事件即结束（_is_terminal）</text>
+      <text x="360" y="190" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#993c1d">TASK_SUCCEEDED / TASK_FAILED / TASK_CANCELED</text>
+    </g>
+    <g>
+      <rect x="40" y="220" width="640" height="52" rx="8" fill="#eeedfe" stroke="#534ab7" stroke-width="0.5"/>
+      <text x="360" y="240" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#26215c">finally 统一清理：删水位、摘队列、空则删 key —— 不留悬挂订阅</text>
+      <text x="360" y="260" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#534ab7">无论 return / 异常 / 取消，都汇到这一段</text>
+    </g>
+    <line x1="360" y1="104" x2="360" y2="150" stroke="#888780" stroke-width="1.5" marker-end="url(#m2)"/>
+    <line x1="360" y1="202" x2="360" y2="220" stroke="#888780" stroke-width="1.5" marker-end="url(#m2)"/>
+  </svg>
+  <figcaption>图 2 · subscribe 的三阶段与收尾</figcaption>
+</figure>
+
+<h3>3.3 关键顺序与竞态解法</h3>
+
+<p><strong>「先注册队列、再回放」</strong>是全局最关键的顺序决定。读仓库是异步 I/O，回放期间内核可能继续 <code>publish</code> 新事件；若先回放再注册，这个窗口内的事件会永久丢失。先注册后，新事件落进队列，由<strong>水位</strong>（watermark）裁决它是「回放已覆盖」还是「新事件」。</p>
+
+<div class="callout amber">
+  <strong>水位去重的两个方向</strong>
+  回放阶段 <code>yield</code> 前抬水位 → 重订阅不重复；实时阶段 <code>sequence &lt;= watermark</code> 直接丢弃 → 回放期间入队的新事件不重复投递。两条防线配合，做到「不丢、不重」。
+</div>
+
+<h3>3.4 背压与关闭</h3>
+<ul>
+  <li><strong>发布零阻塞</strong>：<code>publish</code> 是纯同步函数，<code>put_nowait</code> 即返回，内核状态机永不被订阅者拖住。</li>
+  <li><strong>背压有界</strong>：队列满 1000 触发 <code>_overflow</code>，清空队列并注入一条 <code>EventStreamOverflow</code>（携带当前水位 = 断点续传位置），订阅方抛错后可凭 <code>after_sequence</code> 无损重订。</li>
+  <li><strong>关闭</strong>：<code>close()</code> 置标记并给所有队列 <code>put_nowait(None)</code>，正在 <code>get</code> 的订阅者收到哨兵退出。</li>
+</ul>
+
+<h2 id="callback">4. 回调分发：_observe 状态机</h2>
+
+<p><span class="file-ref">listeners.py</span> 的 <code>TaskListener._observe</code> 是回调分发的核心。它是在 <code>submit_task</code> 返回后，由 <code>_track</code> 用 <code>asyncio.create_task</code> 启动的<strong>每任务一个</strong>监听协程。</p>
+
+<figure>
+  <svg class="diagram" viewBox="0 0 720 360" role="img" aria-label="_observe 循环体">
+    <defs>
+      <marker id="m3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/>
+      </marker>
+    </defs>
+    <g>
+      <rect x="250" y="30" width="220" height="52" rx="8" fill="#e6f1fb" stroke="#185fa5" stroke-width="0.5"/>
+      <text x="360" y="50" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#0c447c">async for event in stream</text>
+      <text x="360" y="68" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185fa5">逐事件推进</text>
+    </g>
+    <g>
+      <rect x="250" y="105" width="220" height="52" rx="8" fill="#f1f3f6" stroke="#5f5e5a" stroke-width="0.5"/>
+      <text x="360" y="125" text-anchor="middle" dominant-baseline="central" font-size="14" fill="#2c2c2a">_closed? → return</text>
+      <text x="360" y="143" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5f5e5a">监听器已关闭，作废退出</text>
+    </g>
+    <g>
+      <rect x="250" y="180" width="220" height="52" rx="8" fill="#f1f3f6" stroke="#5f5e5a" stroke-width="0.5"/>
+      <text x="360" y="200" text-anchor="middle" dominant-baseline="central" font-size="14" fill="#2c2c2a">解析 state → is_terminal</text>
+      <text x="360" y="218" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5f5e5a">事件携带状态，非感知状态</text>
+    </g>
+    <g>
+      <rect x="250" y="255" width="220" height="52" rx="8" fill="#e1f5ee" stroke="#0f6e56" stroke-width="0.5"/>
+      <text x="360" y="275" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#085041">_invoke(on_event, 深拷贝)</text>
+      <text x="360" y="293" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0f6e56">回调 on_event</text>
+    </g>
+    <g>
+      <rect x="250" y="330" width="220" height="52" rx="8" fill="#e1f5ee" stroke="#0f6e56" stroke-width="0.5"/>
+      <text x="360" y="350" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="600" fill="#085041">terminal → break</text>
+      <text x="360" y="368" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0f6e56">进入结果阶段</text>
+    </g>
+    <line x1="360" y1="82" x2="360" y2="105" stroke="#888780" stroke-width="1.5" marker-end="url(#m3)"/>
+    <line x1="360" y1="157" x2="360" y2="180" stroke="#888780" stroke-width="1.5" marker-end="url(#m3)"/>
+    <line x1="360" y1="232" x2="360" y2="255" stroke="#888780" stroke-width="1.5" marker-end="url(#m3)"/>
+    <line x1="360" y1="307" x2="360" y2="330" stroke="#888780" stroke-width="1.5" marker-end="url(#m3)"/>
+    <path d="M470 350 H520 V130 H474" fill="none" stroke="#888780" stroke-width="1" stroke-dasharray="3 3" marker-end="url(#m3)"/>
+    <text x="530" y="250" font-size="12" fill="#5f5e5a">非终态则回到循环头</text>
+
+    <g>
+      <rect x="40" y="255" width="180" height="52" rx="8" fill="#faece7" stroke="#993c1d" stroke-width="0.5"/>
+      <text x="130" y="275" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#712b13">get_task → 二次校验</text>
+      <text x="130" y="293" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#993c1d">break 后拉权威快照</text>
+    </g>
+    <line x1="250" y1="356" x2="220" y2="281" stroke="#888780" stroke-width="1.5" marker-end="url(#m3)"/>
+    <g>
+      <rect x="40" y="330" width="180" height="52" rx="8" fill="#faece7" stroke="#993c1d" stroke-width="0.5"/>
+      <text x="130" y="350" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#712b13">_invoke(on_done, 快照)</text>
+      <text x="130" y="368" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#993c1d">终态结果回调</text>
+    </g>
+    <line x1="130" y1="307" x2="130" y2="330" stroke="#888780" stroke-width="1.5" marker-end="url(#m3)"/>
+  </svg>
+  <figcaption>图 3 · _observe 循环体与结果阶段</figcaption>
+</figure>
+
+<p>循环体里两个 <code>if self._closed: return</code> 是<strong>防御性检查</strong>，分别在回调前与回调后——因为回调本身可能耗时，期间监听器可能被 <code>close()</code>。注意 <code>return</code> 与 <code>break</code> 语义不同：<code>return</code> 是「不玩了」整个监听作废，<code>break</code> 是「玩完了」进入结果阶段。</p>
+
+<h3>4.1 回调统一入口 _invoke</h3>
+<pre><code># listeners.py:123-133
+@staticmethod
+async def _invoke(callback, *args):
+    try:
+        result = callback(*args)            # 同步调用用户函数
+        if inspect.isawaitable(result):     # 返回协程？
+            await result                    # 异步回调：挂起直到跑完
+    except asyncio.CancelledError as error:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise
+        raise ListenerCallbackError("Task callback cancelled itself") from error</code></pre>
+<p>同步/异步回调统一由这一处处理，靠返回值是否 awaitable 分流。回调拿到的是 <code>model_copy(deep=True)</code> 快照，改不坏总线与其他订阅者。</p>
+
+<h3>4.2 错误上报 _report_error</h3>
+<p>订阅、查询或回调的任何异常，只结束<strong>该任务</strong>的监听协程：有 <code>on_error</code> 则调它（传 <code>task_id</code> + 异常）；<code>on_error</code> 缺失或自身再抛，则交 <code>asyncio</code> 事件循环异常处理器，<strong>不静默吞错</strong>。业务任务与内核状态机零感知。</p>
+
+<h2 id="yield">5. 让出点与唤醒机制</h2>
+
+<p>订阅者<strong>不轮询</strong>。没有事件时，它完全挂起在 <code>await queue.get()</code>，不占用 CPU。这是事件驱动（event-driven）而非轮询（polling）。</p>
+
+<table>
+  <tr><th></th><th>轮询</th><th>本实现</th></tr>
+  <tr><td>无事件时</td><td>反复醒来空查</td><td>冻结在 <code>await queue.get()</code></td></tr>
+  <tr><td>CPU 开销</td><td>有（空转 + 定时器）</td><td>无</td></tr>
+  <tr><td>响应延迟</td><td>≈ 轮询间隔</td><td>入队后下一个调度点，近乎即时</td></tr>
+  <tr><td>谁驱动</td><td>订阅者自己的循环</td><td>发布者的 <code>put_nowait</code></td></tr>
+</table>
+
+<h3>5.1 唯一常驻让出点</h3>
+<p>让出控制权的位置在 <span class="file-ref">events.py:81</span> 的 <code>queued = await queue.get()</code>。更精确地说，是它驱动到的 <code>asyncio.Queue.get</code> 内部 <code>await getter</code>（future 未完成）那一刻。</p>
+
+<div class="callout">
+  <strong>yield 与 await 的区分（关键）</strong>
+  <code>yield</code>（async generator 里）不是让出事件循环，而是「向消费者交一个值」，消费者帧原地继续——这是生成器协议，不是调度。<code>await 未完成的 future</code> 才是把控制权交还事件循环的调度动作。第 81 行是后者，所以是让出点。
+</div>
+
+<h3>5.2 唤醒路径</h3>
+<pre><code>publish(event)                 # 状态变更时被调用
+  queue.put_nowait(event)      # ① 值进队列
+                               # ② 同时把挂在 get 上的 future 置完成
+                               # ③ 事件循环下一轮恢复订阅协程</code></pre>
+<p><code>asyncio.Queue</code> 内部：<code>get()</code> 队列空时创建 future 存进 <code>_getters</code> 并 <code>await</code>；<code>put_nowait</code> 时有等待中的 getter 就 <code>set_result(值)</code>。所以<strong>入队和唤醒是同一次调用完成的</strong>，订阅者是被「顶」醒的，不是自己「问」醒的。</p>
+
+<h3>5.3 唤醒后的微指令序列</h3>
+<figure>
+  <svg class="diagram" viewBox="0 0 720 240" role="img" aria-label="唤醒微指令序列">
+    <defs>
+      <marker id="m4" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/>
+      </marker>
+    </defs>
+    <g>
+      <rect x="30" y="40" width="150" height="60" rx="8" fill="#e6f1fb" stroke="#185fa5" stroke-width="0.5"/>
+      <text x="105" y="62" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="600" fill="#0c447c">get() 返回</text>
+      <text x="105" y="80" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#185fa5">水位过滤后 yield</text>
+    </g>
+    <g>
+      <rect x="210" y="40" width="150" height="60" rx="8" fill="#e1f5ee" stroke="#0f6e56" stroke-width="0.5"/>
+      <text x="285" y="62" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="600" fill="#085041">循环体处理</text>
+      <text x="285" y="80" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#0f6e56">终态判断 + 深拷贝</text>
+    </g>
+    <g>
+      <rect x="390" y="40" width="150" height="60" rx="8" fill="#e1f5ee" stroke="#0f6e56" stroke-width="0.5"/>
+      <text x="465" y="62" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="600" fill="#085041">_invoke 调用</text>
+      <text x="465" y="80" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#0f6e56">callback(*args)</text>
+    </g>
+    <g>
+      <rect x="570" y="40" width="120" height="60" rx="8" fill="#faece7" stroke="#993c1d" stroke-width="0.5"/>
+      <text x="630" y="62" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="600" fill="#712b13">await result</text>
+      <text x="630" y="80" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#993c1d">仅异步回调</text>
+    </g>
+    <line x1="180" y1="70" x2="210" y2="70" stroke="#888780" stroke-width="1.5" marker-end="url(#m4)"/>
+    <line x1="360" y1="70" x2="390" y2="70" stroke="#888780" stroke-width="1.5" marker-end="url(#m4)"/>
+    <line x1="540" y1="70" x2="570" y2="70" stroke="#888780" stroke-width="1.5" marker-end="url(#m4)"/>
+    <text x="30" y="140" font-size="13" fill="#5f5e5a">同步回调：从唤醒到回调完成<strong>零让出</strong>，事件处理是原子的</text>
+    <text x="30" y="165" font-size="13" fill="#5f5e5a">异步回调：让出点精确落在 <code>_invoke</code> 帧内的 <code>await result</code></text>
+    <text x="30" y="205" font-size="13" fill="#5f5e5a">取消落点：close() 的 CancelledError 恰好投放在异步回调的挂起点，沿帧弹出路径传播</text>
+  </svg>
+  <figcaption>图 4 · 唤醒后的微指令序列与让出点</figcaption>
+</figure>
+
+<h2 id="sequence">6. 端到端时序</h2>
+
+<figure>
+  <svg class="diagram" viewBox="0 0 720 500" role="img" aria-label="端到端时序">
+    <defs>
+      <marker id="m5" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/>
+      </marker>
+    </defs>
+    <g>
+      <rect x="40" y="30" width="640" height="40" rx="8" fill="#eeedfe" stroke="#534ab7" stroke-width="0.5"/>
+      <text x="360" y="50" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="600" fill="#26215c">add_task_listener → 建句柄（无订阅）</text>
+    </g>
+    <line x1="360" y1="70" x2="360" y2="90" stroke="#888780" stroke-width="1.5" marker-end="url(#m5)"/>
+    <g>
+      <rect x="40" y="90" width="640" height="40" rx="8" fill="#e6f1fb" stroke="#185fa5" stroke-width="0.5"/>
+      <text x="360" y="110" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="600" fill="#0c447c">submit_task → 内核落库发 TASK_CREATED → track → create_task(_observe)</text>
+    </g>
+    <line x1="360" y1="130" x2="360" y2="150" stroke="#888780" stroke-width="1.5" marker-end="url(#m5)"/>
+    <g>
+      <rect x="40" y="150" width="640" height="40" rx="8" fill="#f1f3f6" stroke="#5f5e5a" stroke-width="0.5"/>
+      <text x="360" y="170" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#2c2c2a">_observe → subscribe 回放 TASK_CREATED → await queue.get() 挂起</text>
+    </g>
+    <line x1="360" y1="190" x2="360" y2="210" stroke="#888780" stroke-width="1.5" marker-end="url(#m5)"/>
+    <g>
+      <rect x="40" y="210" width="640" height="40" rx="8" fill="#e1f5ee" stroke="#0f6e56" stroke-width="0.5"/>
+      <text x="360" y="230" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="600" fill="#085041">内核执行：SKILL_STARTED → SKILL_SUCCEEDED → TASK_RESULT（逐事件唤醒）</text>
+    </g>
+    <line x1="360" y1="250" x2="360" y2="270" stroke="#888780" stroke-width="1.5" marker-end="url(#m5)"/>
+    <g>
+      <rect x="40" y="270" width="640" height="40" rx="8" fill="#f1f3f6" stroke="#5f5e5a" stroke-width="0.5"/>
+      <text x="360" y="290" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#2c2c2a">每事件 → async for 拿到 → _invoke(on_event, 深拷贝)</text>
+    </g>
+    <line x1="360" y1="310" x2="360" y2="330" stroke="#888780" stroke-width="1.5" marker-end="url(#m5)"/>
+    <g>
+      <rect x="40" y="330" width="640" height="40" rx="8" fill="#e1f5ee" stroke="#0f6e56" stroke-width="0.5"/>
+      <text x="360" y="350" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="600" fill="#085041">内核发 TASK_SUCCEEDED（终态）→ 唤醒 → terminal=True → break</text>
+    </g>
+    <line x1="360" y1="370" x2="360" y2="390" stroke="#888780" stroke-width="1.5" marker-end="url(#m5)"/>
+    <g>
+      <rect x="40" y="390" width="640" height="40" rx="8" fill="#faece7" stroke="#993c1d" stroke-width="0.5"/>
+      <text x="360" y="410" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="600" fill="#712b13">aclose 清理队列 → get_task 拉终态快照 → 二次校验</text>
+    </g>
+    <line x1="360" y1="430" x2="360" y2="450" stroke="#888780" stroke-width="1.5" marker-end="url(#m5)"/>
+    <g>
+      <rect x="40" y="450" width="640" height="40" rx="8" fill="#faece7" stroke="#993c1d" stroke-width="0.5"/>
+      <text x="360" y="470" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="600" fill="#712b13">_invoke(on_done, 快照) → 监听协程收尾</text>
+    </g>
+  </svg>
+  <figcaption>图 5 · 从提交到结果回调的端到端时序</figcaption>
+</figure>
+
+<h2 id="invariants">7. 不变量与设计取舍</h2>
+
+<h3>7.1 四条核心不变量</h3>
+<table>
+  <tr><th>不变量</th><th>实现保障</th></tr>
+  <tr><td>事件序号单调递增</td><td>唯一写入点在锁内自增序号</td></tr>
+  <tr><td>发布零阻塞</td><td><code>publish</code> 同步 <code>put_nowait</code></td></tr>
+  <tr><td>订阅不重不漏</td><td>先注册后回放 + 水位去重</td></tr>
+  <tr><td>不留悬挂订阅</td><td>生成器 <code>finally</code> + <code>aclosing</code></td></tr>
+</table>
+
+<h3>7.2 为什么"绕"，是否值得</h3>
+<p>三个硬约束决定了这套写法：<strong>发布者不能阻塞</strong>（状态机唯一写入点必须同步返回）、<strong>事件可回放</strong>（重启后能补发）、<strong>订阅者可控挂起</strong>（没事件就睡着）。这是纯 asyncio 下解耦生产者/消费者、且要求可回放、可断点续传时，最接近标准答案的写法。</p>
+
+<p>代价是认知门槛高：要求读者同时掌握 async generator、<code>yield</code>/<code>await</code> 的区别、<code>aclosing</code>、协程让出点四件事。但这是<strong>理解成本</strong>，不是<strong>正确性问题</strong>。</p>
+
+<div class="callout coral">
+  <strong>结论</strong>
+  这套设计是正确且克制的：在不引入线程、消息队列、任何依赖的前提下，用纯 asyncio 原语精确满足了「零阻塞发布 + 可回放 + 可取消 + 异常隔离」四个硬需求。测试（23 个监听用例）将语义钉得很死。若只是理解成本问题而非正确性问题，不建议重写内核逻辑；可在调用侧加一层语义更直白的薄封装。
+</div>
+
+</div>
+</body>
+</html>

@@ -5,6 +5,7 @@
 import asyncio  # noqa: F401
 
 from robot_agent_runtime.sdk.embedded import RobotRuntime
+from robot_agent_runtime.sdk.listeners import TaskListener
 from robot_agent_runtime.sdk.remote import (
     RemoteRuntime,
     RemoteRuntimeError,
@@ -16,4 +17,5 @@ __all__ = [
     "RemoteRuntimeError",
     "RemoteTransportError",
     "RobotRuntime",
+    "TaskListener",
 ]

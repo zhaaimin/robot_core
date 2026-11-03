@@ -76,3 +76,11 @@ class RobotResponseError(AgentRuntimeError):
 
 class RobotStopError(AgentRuntimeError):
     code = "ROBOT_STOP_UNCONFIRMED"
+
+
+class TaskEventStreamEnded(AgentRuntimeError):
+    code = "TASK_EVENT_STREAM_ENDED"
+
+
+class ListenerCallbackError(AgentRuntimeError):
+    code = "LISTENER_CALLBACK_FAILED"

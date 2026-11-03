@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import suppress
 from typing import Any
 from uuid import uuid4
@@ -8,6 +8,13 @@ from pydantic import ValidationError
 
 from robot_agent_runtime.errors import AgentRuntimeError, InvalidRequest
 from robot_agent_runtime.models import Event, SkillDefinition, Task, TaskRequest
+from robot_agent_runtime.sdk.listeners import (
+    DoneCallback,
+    ErrorCallback,
+    EventCallback,
+    TaskListener,
+    TaskListeners,
+)
 from robot_agent_runtime.wire import read_message, write_message
 
 
@@ -35,6 +42,16 @@ class RemoteRuntime:
         self._lifecycle_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._close_task: asyncio.Task[None] | None = None
+        self._listeners = TaskListeners(self.subscribe_task_events, self.get_task_status)
+
+    def add_task_listener(
+        self,
+        *,
+        on_event: EventCallback | None = None,
+        on_done: DoneCallback | None = None,
+        on_error: ErrorCallback | None = None,
+    ) -> TaskListener:
+        return self._listeners.add(on_event=on_event, on_done=on_done, on_error=on_error)
 
     async def start(self) -> None:
         health = await self._request("health")
@@ -54,6 +71,7 @@ class RemoteRuntime:
         await asyncio.shield(close_task)
 
     async def _close_impl(self) -> None:
+        await self._listeners.close()
         async with self._lifecycle_lock:
             self._closed = True
             writers = list(self._writers)
@@ -67,7 +85,9 @@ class RemoteRuntime:
         result = await self._request(
             "submit_task", {"request": request.model_dump(mode="json")}
         )
-        return self._validate(Task, result)
+        task = self._validate(Task, result)
+        self._listeners.track(task)
+        return task
 
     async def get_task_status(self, task_id: str) -> Task:
         result = await self._request("get_task_status", {"task_id": task_id})
@@ -85,7 +105,7 @@ class RemoteRuntime:
 
     async def subscribe_task_events(
         self, task_id: str, after_sequence: int = 0
-    ) -> AsyncIterator[Event]:
+    ) -> AsyncGenerator[Event, None]:
         writer: asyncio.StreamWriter | None = None
         try:
             reader, writer = await self._open_connection()

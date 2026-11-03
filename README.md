@@ -5,6 +5,9 @@
 运行时内核不依赖任何机器人厂商 SDK、ROS 2 或云端服务：硬件接入通过 `ports.py` 中的
 Protocol 以适配器形式注入。
 
+完整流程与能力边界见 [任务执行、结果获取、持久化与重启状态核对](docs/task-execution-and-recovery.md)，
+包含 CC API 语音示例、SQLite 与 InMemory 的区别，以及 Reconciler 当前能处理的范围。
+
 ## 安装
 
 ```bash
@@ -80,10 +83,62 @@ finally:
 | `cancel_task(task_id)` | 请求取消并等待任务进入终态 |
 | `list_skills()` | 列出已注册技能定义 |
 | `subscribe_task_events(task_id, after_sequence=0)` | 订阅事件，先回放历史再接续实时事件 |
+| `add_task_listener(on_event=..., on_done=..., on_error=...)` | 统一注册回调，自动监听本 SDK 实例后续提交的任务，返回 `TaskListener` |
 | `close()` | 关闭运行时并释放其持有的资源；外部 SDK 连接由应用随后关闭 |
 
 接入 CC API 语音时，应用先调用 `CcApiSpeechSkill.start()` 注册回调，再启动运行时；
 退出时先关闭运行时，再关闭技能适配器，最后停止 SDK 连接。
+
+### 统一注册任务监听
+
+`RobotRuntime` 与 `RemoteRuntime` 使用同样的接口。在提交任务之前注册一次，回调通过
+`event.task_id` / `task.id` 区分任务；不扫描旧任务，也不接收其他 SDK 实例提交的任务。
+
+```python
+from robot_agent_runtime.models import Event, Task
+
+def on_event(event: Event) -> None:
+    print("执行过程", event.task_id, event.event_type, event.data)
+
+def on_done(task: Task) -> None:
+    print("最终结果", task.id, task.state, task.result, task.error)
+
+def on_error(task_id: str, error: Exception) -> None:
+    print("监听异常", task_id, error)
+
+listener = runtime.add_task_listener(
+    on_event=on_event, on_done=on_done, on_error=on_error,
+)
+await runtime.start()
+try:
+    first = await runtime.submit_task(request_a)
+    second = await runtime.submit_task(request_b)
+    # 此处可以继续做其他异步工作。
+    await listener.wait()
+finally:
+    await runtime.close()
+```
+
+回调支持普通函数和 `async def` 函数，至少提供一个。每个任务内部按事件顺序调用，
+终态事件的 `on_event` 完成后，查询最终快照并调用一次 `on_done`。不同任务各自监听，
+异步回调等待不会阻塞其他任务；同步回调需要快速返回，不能做阻塞 I/O。
+
+任务成功、失败、取消都交给 `on_done`；订阅、查询、回调异常交给
+`on_error(task_id, exception)`，随后结束该任务的监听，不改变业务任务状态。
+没有错误回调或错误回调自身失败时，由 asyncio 事件循环异常处理器报告。
+事件流提前结束不会冒充任务完成。慢回调可能触发现有的事件队列溢出，不会自动重试；
+需要重放时仍可用 `subscribe_task_events` 及 `after_sequence`。
+
+| 监听句柄操作 | 行为 |
+| --- | --- |
+| `await listener.wait()` | 等待调用时已经登记的任务监听完成；以后仍可提交新任务并再次等待 |
+| `await listener.close()` | 注销这组回调并停止订阅，不取消业务任务；可以重复调用 |
+
+取消 `wait()` 的调用者不会取消后台监听。同一个注册对同一任务 ID 只监听一次，
+所以重复提交幂等请求不会重复通知；去重 ID 保留到注销。多次注册得到独立的监听句柄。
+SDK `close()` 会停止监听，不保证交付尚未完成的回调，要收齐结果应先 `wait()`。
+监听流关闭或失败后 `wait()` 也会返回，因此业务成功要以 `on_done` 的任务状态为准。
+回调内部不能 `wait()` 自己的监听句柄，也不要吞掉取消信号。
 
 ## 任务状态机
 
@@ -99,6 +154,9 @@ CREATED → VALIDATING → QUEUED → RUNNING → SUCCEEDED
 ```
 
 终态为 `SUCCEEDED`、`FAILED`、`CANCELED`、`UNKNOWN`、`RECONCILIATION_REQUIRED`。
+
+注册式监听只观察这些状态，不增加新的状态或写入状态。`on_done` 包含所有终态，
+表示本次任务已结束，不等于成功；`on_error` 也不代表机器人任务执行失败。
 
 CC API 的 `audio.speak` 在启动受理后保持 `RUNNING`，收到匹配 `workId` 的
 `cc.api.work.finished` 才成功。首版按约定不解析 finished 的结束原因，外部停止/失败
@@ -136,7 +194,8 @@ src/robot_agent_runtime/
 ├── server.py              RuntimeServer：UDS 守护进程
 ├── sdk/
 │   ├── embedded.py        RobotRuntime
-│   └── remote.py          RemoteRuntime
+│   ├── remote.py          RemoteRuntime
+│   └── listeners.py       TaskListener：统一回调注册、按任务订阅与清理
 └── adapters/
     ├── cc_api.py          CcApiSpeechSkill：CC API 语音播报、结束事件与停止确认
     └── simulator.py       模拟技能、Reconciler 与两个模拟机器人状态源（无硬件自测用）
@@ -200,6 +259,27 @@ runtime = RobotRuntime(
 python3 examples/cc_api_speech_demo.py \
   --api-id YOUR_API_ID --address ROBOT_IP:48159 --message '你好，我是机器人'
 ```
+
+在项目根目录的 Python 调用方中，可以直接取得最终 `Task` 快照（`api` 须已连接）：
+
+```python
+from examples.cc_api_speech_demo import speak
+from robot_agent_runtime.models import TaskState
+
+final = await speak(api, "你好，我是机器人")
+print(final.id, final.state)
+if final.state == TaskState.SUCCEEDED:
+    output = final.result["steps"][0]["output"]
+    print(output["message"], output["spoken"], output["work_id"])
+elif final.error is not None:
+    print(final.error.code, final.error.message, final.error.details)
+```
+
+`speak()` 等待任务终态并清理运行时和适配器后返回；任务执行或参数校验失败也会返回
+`Task`，通过 `state` 和 `error` 判断原因，连接初始化与清理异常仍向调用方抛出。
+SDK 连接继续由调用方管理。函数通过统一注册的 `on_event` 打印过程，`on_done` 将最终
+快照交给等待中的 Future，`on_error` 将监听异常交给调用方；命令行入口保留最终结果输出，
+任务失败时以异常退出。返回值为运行时整理后的结果，不包含 CC API 的完整原始响应。
 
 运行在机器人本机时可省略 `--address`。SDK 不属于内核依赖，宿主常规导入不需要它。
 容器中的自动测试使用假回调 API，不连接机器人；真实发声和机器人结束事件仍需现场验证。
@@ -287,12 +367,13 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
 测试按关注点组织：`test_models` 契约、`test_core` 执行路径、`test_faults` 故障注入、
 `test_recovery` 重启恢复、`test_preconditions` 机器人状态前置条件、`test_sqlite_repository`
 持久化、`test_embedded_sdk` / `test_remote_sdk` 两种接入形态、`test_contracts` 供后续适配器
-复用的契约测试、`test_cc_api` 语音事件匹配与取消/断连边界。
+复用的契约测试、`test_cc_api` 语音事件匹配与取消/断连边界、`test_task_listeners`
+统一回调注册、任务隔离与监听生命周期。
 
 ## 当前范围
 
 已实现：运行时内核、技能层框架、Python SDK（嵌入式 + 远程）、UDS 守护进程、SQLite
-持久化、模拟适配器、CC API 语音播报适配器（已做离线验证，待真机联调）。
+持久化、模拟适配器、CC API 语音播报适配器、SDK 统一注册式任务监听（仅本客户端后续提交）。
 
 尚未实现：Agent 集成层（计划生成与重规划）、调度器（`priority` 字段已持久化但不参与
 排序，无并发上限与抢占）、有限重试、结构化日志、其他真实机器人能力适配（导航、

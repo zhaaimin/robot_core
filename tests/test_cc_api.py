@@ -1,12 +1,14 @@
 import asyncio
+import runpy
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from robot_agent_runtime.models import SkillCall, SkillContext, TaskRequest, TaskState
+from robot_agent_runtime.models import SkillCall, SkillContext, Task, TaskRequest, TaskState
 from robot_agent_runtime.repository import InMemoryTaskRepository
 from robot_agent_runtime.sdk import RobotRuntime
 
@@ -367,3 +369,61 @@ async def test_cc_api_runtime_invalid_message_does_not_dispatch() -> None:
             assert api.requests.empty()
         finally:
             await runtime.close()
+
+
+async def test_speech_demo_returns_completed_task_after_finished() -> None:
+    demo = runpy.run_path(str(Path(__file__).resolve().parents[1] / "examples/cc_api_speech_demo.py"))
+    api = FakeApi()
+    execution = asyncio.create_task(demo["speak"](api, "你好"))
+    try:
+        _, _, respond = await api.next_request()
+        respond(Response(result={"workId": "demo-speech"}))
+        await checkpoint()
+        assert not execution.done()
+        api.finish("demo-speech")
+        final = await asyncio.wait_for(execution, 1)
+        assert isinstance(final, Task)
+        assert final.id
+        assert final.state == TaskState.SUCCEEDED
+        assert final.error is None
+        assert final.result["steps"][0]["output"] == {
+            "message": "你好", "spoken": True, "work_id": "demo-speech",
+        }
+        assert not api.services
+        assert api.notifications[-1] == "cc.api.work.unsubscribe"
+    finally:
+        if not execution.done():
+            execution.cancel()
+        await asyncio.gather(execution, return_exceptions=True)
+
+
+async def test_speech_demo_returns_failed_task_with_vendor_error() -> None:
+    demo = runpy.run_path(str(Path(__file__).resolve().parents[1] / "examples/cc_api_speech_demo.py"))
+    api = FakeApi()
+    execution = asyncio.create_task(demo["speak"](api, "你好"))
+    try:
+        _, _, respond = await api.next_request()
+        respond(Response(False, error_code=10003, error_message="not_in_work_mode"))
+        final = await asyncio.wait_for(execution, 1)
+        assert isinstance(final, Task)
+        assert final.state == TaskState.FAILED
+        assert final.result is None
+        assert final.error.code == "ROBOT_REQUEST_FAILED"
+        assert final.error.message == "not_in_work_mode"
+        assert final.error.details["vendor_code"] == 10003
+        assert not api.services
+    finally:
+        if not execution.done():
+            execution.cancel()
+        await asyncio.gather(execution, return_exceptions=True)
+
+
+async def test_speech_demo_returns_validation_failure_without_dispatch() -> None:
+    demo = runpy.run_path(str(Path(__file__).resolve().parents[1] / "examples/cc_api_speech_demo.py"))
+    api = FakeApi()
+    final = await asyncio.wait_for(demo["speak"](api, ""), 1)
+    assert isinstance(final, Task)
+    assert final.state == TaskState.FAILED
+    assert final.error.code == "SCHEMA_VALIDATION_FAILED"
+    assert api.requests.empty()
+    assert not api.services
