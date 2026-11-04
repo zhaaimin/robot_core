@@ -4,6 +4,7 @@ import os
 import stat
 import tempfile
 from collections.abc import AsyncIterator
+from concurrent.futures import Future
 from contextlib import asynccontextmanager
 from datetime import UTC
 from pathlib import Path
@@ -18,10 +19,27 @@ import robot_agent_runtime.server as server_module
 from robot_agent_runtime.adapters.simulator import Simulator
 from robot_agent_runtime.errors import InvalidRequest
 from robot_agent_runtime.core import RuntimeCore
+from robot_agent_runtime.kernel_host import KernelHost
 from robot_agent_runtime.models import Event, SkillCall, Task, TaskRequest, TaskState
 from robot_agent_runtime.repository import InMemoryTaskRepository
 from robot_agent_runtime.sdk import RemoteRuntime, RemoteRuntimeError, RemoteTransportError, RobotRuntime
 from robot_agent_runtime.server import RuntimeServer
+
+
+class HostedCoreClient:
+    """Keep integration tests on the server's actual kernel owner loop."""
+
+    def __init__(self, host: KernelHost) -> None:
+        self._host = host
+
+    async def submit_task(self, value: TaskRequest) -> Task:
+        return await self._host.call("submit_task", value)
+
+    async def get_task_status(self, task_id: str) -> Task:
+        return await self._host.call("get_task_status", task_id)
+
+    def subscribe_task_events(self, task_id: str) -> AsyncIterator[Event]:
+        return self._host.subscribe_task_events(task_id)
 
 
 def request(task_type: str = "state", skill: str = "robot.get_state") -> TaskRequest:
@@ -29,7 +47,9 @@ def request(task_type: str = "state", skill: str = "robot.get_state") -> TaskReq
     return TaskRequest(task_type=task_type, steps=[SkillCall(skill=skill, params=params)])
 
 
-async def wait_for_terminal(runtime: RobotRuntime | RemoteRuntime, task_id: str) -> Task:
+async def wait_for_terminal(
+    runtime: RobotRuntime | RemoteRuntime | HostedCoreClient, task_id: str
+) -> Task:
     async with asyncio.timeout(1):
         while True:
             task = await runtime.get_task_status(task_id)
@@ -51,7 +71,7 @@ async def collect_through_terminal(
 @asynccontextmanager
 async def running_server(
     repository: InMemoryTaskRepository | None = None,
-) -> AsyncIterator[tuple[RuntimeServer, RuntimeCore, str, Simulator]]:
+) -> AsyncIterator[tuple[RuntimeServer, HostedCoreClient, str, Simulator]]:
     with tempfile.TemporaryDirectory(prefix="rar-", dir="/tmp") as directory:
         socket_path = str(Path(directory) / "s.sock")
         simulator = Simulator()
@@ -59,7 +79,7 @@ async def running_server(
         server = RuntimeServer(core, socket_path)
         await server.start()
         try:
-            yield server, core, socket_path, simulator
+            yield server, HostedCoreClient(server._host), socket_path, simulator
         finally:
             await server.close()
 
@@ -735,41 +755,50 @@ async def test_remote_subscription_overflow_preserves_business_error() -> None:
     class PausedReplayRepository(InMemoryTaskRepository):
         def __init__(self) -> None:
             super().__init__()
-            self.replay_started = asyncio.Event()
-            self.release_replay = asyncio.Event()
+            self.replay_started: Future[None] = Future()
+            self.release_replay: Future[None] = Future()
 
-        async def list_events(
-            self, task_id: str, after_sequence: int = 0
+        async def list_events_page(
+            self, task_id: str, after_sequence: int = 0, limit: int = 128,
         ) -> list[Event]:
-            self.replay_started.set()
-            await self.release_replay.wait()
-            return await super().list_events(task_id, after_sequence)
+            if not self.replay_started.done():
+                self.replay_started.set_result(None)
+            await asyncio.wrap_future(self.release_replay)
+            return await super().list_events_page(task_id, after_sequence, limit)
 
     repository = PausedReplayRepository()
-    async with running_server(repository) as (_, core, socket_path, _):
-        core._events._queue_size = 1
+    async with running_server(repository) as (server, _, socket_path, _):
+        async def set_queue_size() -> None:
+            server._core._events._queue_size = 1
+
+        await server._host._loop.call(set_queue_size)
         remote = RemoteRuntime(socket_path)
         subscription = remote.subscribe_task_events("overflow")
         pending = asyncio.create_task(anext(subscription))
-        await asyncio.wait_for(repository.replay_started.wait(), timeout=1)
-        for sequence in (1, 2):
-            core._events.publish(
-                Event(
-                    event_id=f"overflow-{sequence}",
-                    task_id="overflow",
-                    sequence=sequence,
-                    event_type="SKILL_PROGRESS",
-                    data={"state": TaskState.RUNNING.value},
+        await asyncio.wait_for(asyncio.wrap_future(repository.replay_started), timeout=1)
+
+        async def publish() -> None:
+            for sequence in (1, 2):
+                server._core._events.publish(
+                    Event(
+                        event_id=f"overflow-{sequence}",
+                        task_id="overflow",
+                        sequence=sequence,
+                        event_type="SKILL_PROGRESS",
+                        data={"state": TaskState.RUNNING.value},
+                    )
                 )
-            )
-        repository.release_replay.set()
+
+        await server._host._loop.call(publish)
+        repository.release_replay.set_result(None)
         try:
             with pytest.raises(RemoteRuntimeError) as caught:
                 await asyncio.wait_for(pending, timeout=1)
             assert caught.value.info.code == "EVENT_STREAM_OVERFLOW"
             assert caught.value.info.details["after_sequence"] == 0
         finally:
-            repository.release_replay.set()
+            if not repository.release_replay.done():
+                repository.release_replay.set_result(None)
             await subscription.aclose()
             await remote.close()
 

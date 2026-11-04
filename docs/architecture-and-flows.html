@@ -1,0 +1,1138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Robot Agent Runtime 总体设计：主框架与主流程</title>
+<style>
+:root {
+  --bg: #ffffff; --bg-soft: #f6f7f9; --surface: #ffffff; --text: #1a1d24;
+  --text-muted: #5f6570; --border: #e4e7ec; --accent: #185fa5; --accent-soft: #e6f1fb;
+  --code-bg: #f1f3f6; --teal: #0f6e56; --teal-soft: #e1f5ee; --coral: #993c1d;
+  --coral-soft: #faece7; --amber: #854f0b; --amber-soft: #faeeda; --purple: #3c3489;
+  --purple-soft: #eeedfe;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans);
+       line-height: 1.75; font-size: 15px; }
+.wrap { max-width: 940px; margin: 0 auto; padding: 48px 28px 96px; }
+header.doc { border-bottom: 1px solid var(--border); padding-bottom: 22px; margin-bottom: 8px; }
+h1 { font-size: 28px; font-weight: 600; margin: 0 0 8px; letter-spacing: -0.01em; }
+.subtitle { color: var(--text-muted); font-size: 15px; margin: 0; }
+.meta { color: var(--text-muted); font-size: 13px; margin-top: 12px; font-family: var(--mono); }
+nav.toc { background: var(--bg-soft); border: 1px solid var(--border); border-radius: 10px;
+          padding: 18px 22px; margin: 28px 0; }
+nav.toc h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+             color: var(--text-muted); margin: 0 0 10px; border: 0; padding: 0; }
+nav.toc ol { margin: 0; padding-left: 20px; list-style: none; }
+nav.toc ol ol { padding-left: 22px; }
+nav.toc li { margin: 4px 0; }
+nav.toc ol ol { padding-left: 18px; margin: 3px 0; font-size: 14px; color: var(--text-muted); }
+nav.toc a { color: var(--accent); text-decoration: none; }
+nav.toc a:hover { text-decoration: underline; }
+h2 { font-size: 21px; font-weight: 600; margin: 46px 0 14px; padding-top: 24px;
+     border-top: 1px solid var(--border); scroll-margin-top: 20px; }
+h3 { font-size: 17px; font-weight: 600; margin: 28px 0 10px; scroll-margin-top: 20px; }
+h4 { font-size: 15px; font-weight: 600; margin: 20px 0 8px; }
+p { margin: 12px 0; }
+ul, ol { margin: 10px 0; padding-left: 24px; }
+li { margin: 5px 0; }
+code { font-family: var(--mono); font-size: .88em; background: var(--code-bg);
+       padding: 1px 5px; border-radius: 4px; }
+pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+      padding: 15px 18px; overflow-x: auto; font-family: var(--mono); font-size: 12.5px;
+      line-height: 1.6; }
+pre code { background: none; padding: 0; font-size: inherit; }
+table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 13.5px; }
+th, td { border: 1px solid var(--border); padding: 8px 11px; text-align: left; vertical-align: top; }
+th { background: var(--bg-soft); font-weight: 600; }
+td code { font-size: .86em; }
+blockquote { margin: 16px 0; padding: 10px 16px; border-left: 3px solid var(--amber);
+             background: var(--amber-soft); border-radius: 0 8px 8px 0; color: #4a3208; }
+blockquote p { margin: 4px 0; }
+hr { border: 0; border-top: 1px solid var(--border); margin: 40px 0; }
+a { color: var(--accent); }
+a.ref { font-family: var(--mono); font-size: .84em; color: #0c447c;
+        background: var(--accent-soft); padding: 0 5px; border-radius: 4px;
+        text-decoration: none; white-space: nowrap; }
+a.ref:hover { text-decoration: underline; }
+.layers { display: flex; flex-direction: column; gap: 10px; margin: 18px 0 12px; }
+.layer { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;
+         background: var(--surface); }
+.layer:nth-child(1) { background: var(--accent-soft); border-color: #c8ddf0; }
+.layer:nth-child(2) { background: var(--purple-soft); border-color: #d6d3f5; }
+.layer:nth-child(3) { background: var(--teal-soft); border-color: #bfe6d8; }
+.layer:nth-child(4) { background: var(--code-bg); }
+.layer-title { font-size: 13px; font-weight: 600; color: var(--text-muted);
+               text-transform: none; margin-bottom: 8px; font-family: var(--mono); }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { display: inline-flex; align-items: baseline; gap: 7px; background: var(--surface);
+        border: 1px solid var(--border); border-radius: 7px; padding: 5px 9px; }
+.chip-name { font-weight: 600; font-size: 13.5px; }
+.chip-sub { font-family: var(--mono); font-size: 11.5px; color: var(--text-muted); }
+.edges { display: flex; flex-wrap: wrap; gap: 6px 10px; margin: 12px 0 20px;
+         font-size: 12.5px; }
+.edge { display: inline-flex; align-items: baseline; gap: 5px; background: var(--bg-soft);
+        border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px; }
+.edge b { font-weight: 600; }
+.edge-arrow { color: #8a8f99; font-style: normal; margin: 0 5px; }
+.edge-note { color: var(--text-muted); font-family: var(--mono); font-size: 11.5px; }
+.state-chip { display: inline-block; font-family: var(--mono); font-size: 12px;
+              background: var(--bg-soft); border: 1px solid var(--border);
+              border-radius: 5px; padding: 2px 7px; }
+.state-row { margin: 10px 0 14px; }
+.diagram-lead { color: var(--text-muted); font-size: 13.5px; }
+table.seq td.who { white-space: nowrap; font-size: 13px; }
+table.seq td.who b { font-weight: 600; }
+table.seq td.step { width: 34px; color: var(--text-muted); font-family: var(--mono); }
+table.seq tr.grp td { background: var(--purple-soft); font-family: var(--mono);
+                      font-size: 12.5px; color: #26215c; }
+table.seq tr.note td { background: var(--amber-soft); font-size: 13px; color: #4a3208; }
+figcaption { color: var(--text-muted); font-size: 13px; margin-top: 6px; }
+svg.diagram { width: 100%; height: auto; border: 1px solid var(--border);
+              border-radius: 10px; background: var(--surface); display: block; }
+@media (max-width: 680px) { .wrap { padding: 32px 16px 72px; } table { font-size: 12.5px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="doc"><h1>Robot Agent Runtime 总体设计：主框架与主流程</h1><p class="subtitle">robot-agent-runtime — 分层框架、七条主流程与四条横切不变量</p><p class="meta">代码导读 · 对应工作树 src/robot_agent_runtime/ · 2026-11-04 · 同步源文件 docs/architecture-and-flows.md</p></header>
+<nav class='toc'><h2>目录</h2><ol><li><a href="#s-1">1. 定位与设计目标</a></li><li><a href="#s-2">2. 主框架</a><ol><li><a href="#s-2-1">2.1 四层</a></li><li><a href="#s-2-2">2.2 线程拓扑</a></li><li><a href="#s-2-3">2.3 容量与预留位</a></li><li><a href="#s-2-4">2.4 文件清单</a></li><li><a href="#s-2-5">2.5 打包与依赖</a></li></ol></li><li><a href="#s-3">3. 数据模型与状态机</a><ol><li><a href="#s-3-1">3.1 模型</a></li><li><a href="#s-3-2">3.2 状态机</a></li></ol></li><li><a href="#s-4">4. 端口契约：外部要实现什么</a></li><li><a href="#s-5">5. 主流程</a><ol><li><a href="#h-13">流程 1：启动与重启恢复</a></li><li><a href="#h-14">流程 2：提交任务（准入）</a></li><li><a href="#h-15">流程 3：单步执行</a></li><li><a href="#h-16">流程 4：取消、超时与&quot;停止确认&quot;</a></li><li><a href="#h-17">流程 5：事件订阅与回放</a></li><li><a href="#h-18">流程 6：SDK 统一任务监听</a></li><li><a href="#h-19">流程 7：远程模式（UDS）</a></li></ol></li><li><a href="#s-6">6. 横切机制（四条不能改坏的不变量）</a><ol><li><a href="#s-6-1">6.1 状态唯一写入点：TaskStateStore.transition()</a></li><li><a href="#s-6-2">6.2 原子持久化：两种实现，同一种语义</a></li><li><a href="#s-6-3">6.3 边界净化：bounded_snapshot</a></li><li><a href="#s-6-4">6.4 请求 / 真实完成分离：LoopJob</a></li></ol></li><li><a href="#s-7">7. 失败关闭矩阵</a></li><li><a href="#s-8">8. 配置：RuntimeOptions</a></li><li><a href="#s-9">9. 适配器层现状</a><ol><li><a href="#h-28">simulator.py（无硬件自测）</a></li><li><a href="#h-29">cc_api.py（真实硬件，第一个厂商适配）</a></li><li><a href="#h-30">新增适配器的检查清单</a></li></ol></li><li><a href="#s-10">10. 验证体系</a></li><li><a href="#s-11">11. 已知缺口</a></li><li><a href="#s-12">12. 建议阅读路线</a></li></ol></nav>
+<h1>Robot Agent Runtime 总体设计：主框架与主流程</h1>
+<p>本文是<strong>代码导读</strong>：把整个项目拆成"分层框架 + 七条主流程 + 四条横切不变量"，每条结论都带
+<code>file:line</code>，可以点开对照。</p>
+<p>与其他文档的分工：</p>
+<table>
+<thead>
+<tr>
+<th>文档</th>
+<th>回答什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>README.md</code></td>
+<td>对外契约：怎么调用、API 表、状态机、配置项、当前范围</td>
+</tr>
+<tr>
+<td>本文</td>
+<td>内部框架：谁拥有什么、一条任务如何流过各个模块、为什么这么切</td>
+</tr>
+<tr>
+<td><code>docs/task-execution-and-recovery.md</code></td>
+<td>端到端叙述：一次语音播报、持久化差异、Reconciler 能做什么</td>
+</tr>
+<tr>
+<td><code>docs/plans/*.md</code></td>
+<td>每次改造的决策记录与验收结果（含被否决的方案）</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>阅读前提：本文描述的是<strong>当前工作树</strong>（截至 2026-11-04，线程隔离改造已落地但未提交）。
+若某处与 <code>git HEAD</code> 不一致，以工作树为准。</p>
+</blockquote>
+<hr />
+<h2 id="s-1">1. 定位与设计目标</h2>
+<p><code>robot-agent-runtime</code> 是机器人<strong>本机</strong>任务执行运行时：接收"一串技能调用"构成的任务，
+负责准入、资源互斥、超时、取消、状态持久化、事件推送和重启后的状态核对。</p>
+<p>四条设计目标决定了整个架构的形状：</p>
+<ol>
+<li><strong>内核零领域知识</strong>。运行时不认识"急停""电量""导航"，只做集合求交
+   （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/ports.py#L88-L111">ports.py:88-111</a>）。
+   领域模型全在适配器里。这条决定了内核可以长期不换。</li>
+<li><strong>硬件/依赖可替换</strong>。内核不 import 任何厂商 SDK、ROS 2 或云 SDK；外部能力一律实现
+   <code>ports.py</code> 的 Protocol，靠结构匹配注入，不注册、不继承。</li>
+<li><strong>不确定就不重放</strong>。物理动作非幂等，所以"数据库里是 RUNNING"不构成继续执行的理由。
+   这条决定了恢复流程、<code>RECONCILIATION_REQUIRED</code> 状态和 quarantine 的存在。</li>
+<li><strong>内核循环不可被外部代码冻住</strong>。厂商 SDK 里的同步阻塞调用不能拖死状态机。
+   这条决定了 2026-11-03 的线程边界改造（本文第 6 节）。</li>
+</ol>
+<p>明确<strong>不是</strong>目标的：硬实时保证、功能安全（急停必须靠硬件回路）、进程级故障隔离、
+并发调度与抢占、重试。见 <a class="ref" href="file:///Users/zhazha/Documents/robot_core/README.md#L479-L484">README.md:479-484</a>。</p>
+<hr />
+<h2 id="s-2">2. 主框架</h2>
+<h3 id="s-2-1">2.1 四层</h3>
+<div class="layers">
+<div class="layer"><div class="layer-title">接入层 · 拥有应用侧事件循环</div><div class="chips">
+<span class="chip"><span class="chip-name">RobotRuntime</span><span class="chip-sub">sdk/embedded.py</span></span>
+<span class="chip"><span class="chip-name">RuntimeServer</span><span class="chip-sub">server.py</span></span>
+<span class="chip"><span class="chip-name">RemoteRuntime</span><span class="chip-sub">sdk/remote.py</span></span>
+<span class="chip"><span class="chip-name">TaskListener + CallbackExecutor</span><span class="chip-sub">sdk/listeners.py</span></span>
+</div></div>
+<div class="layer"><div class="layer-title">边界层 · 拥有线程与净化</div><div class="chips">
+<span class="chip"><span class="chip-name">KernelHost</span><span class="chip-sub">kernel_host.py</span></span>
+<span class="chip"><span class="chip-name">isolate_ports 代理</span><span class="chip-sub">isolation.py</span></span>
+<span class="chip"><span class="chip-name">bounded_snapshot</span><span class="chip-sub">boundary.py</span></span>
+<span class="chip"><span class="chip-name">LoopThread / LoopJob</span><span class="chip-sub">thread_runtime.py</span></span>
+</div></div>
+<div class="layer"><div class="layer-title">内核层 · 独占一条 loop</div><div class="chips">
+<span class="chip"><span class="chip-name">RuntimeCore</span><span class="chip-sub">core.py</span></span>
+<span class="chip"><span class="chip-name">TaskStateStore</span><span class="chip-sub">task_state.py</span></span>
+<span class="chip"><span class="chip-name">WorkflowExecutor</span><span class="chip-sub">executor.py</span></span>
+<span class="chip"><span class="chip-name">ResourceLocks</span><span class="chip-sub">resources.py</span></span>
+<span class="chip"><span class="chip-name">EventBus</span><span class="chip-sub">events.py</span></span>
+<span class="chip"><span class="chip-name">PolicyEnforcer + Registry</span></span>
+<span class="chip"><span class="chip-name">recovery.py</span></span>
+</div></div>
+<div class="layer"><div class="layer-title">外部实现层 · 各占一条 loop</div><div class="chips">
+<span class="chip"><span class="chip-name">Skill 实现</span><span class="chip-sub">adapters/</span></span>
+<span class="chip"><span class="chip-name">TaskRepository 实现</span></span>
+<span class="chip"><span class="chip-name">RobotStateProvider 实现</span></span>
+<span class="chip"><span class="chip-name">Reconciler 实现</span></span>
+</div></div>
+</div>
+<div class="edges">
+<span class="edge"><b>RemoteRuntime</b><i class="edge-arrow">⇢</i><b>RuntimeServer</b><span class="edge-note">NDJSON over UDS</span></span>
+<span class="edge"><b>RobotRuntime</b><i class="edge-arrow">⇢</i><b>KernelHost</b></span>
+<span class="edge"><b>RuntimeServer</b><i class="edge-arrow">⇢</i><b>KernelHost</b></span>
+<span class="edge"><b>RuntimeCore</b><i class="edge-arrow">⇢</i><b>PolicyEnforcer + Registry</b></span>
+<span class="edge"><b>RuntimeCore</b><i class="edge-arrow">⇢</i><b>recovery.py</b></span>
+<span class="edge"><b>TaskStateStore</b><i class="edge-arrow">⇢</i><b>isolate_ports 代理</b></span>
+<span class="edge"><b>WorkflowExecutor</b><i class="edge-arrow">⇢</i><b>isolate_ports 代理</b></span>
+<span class="edge"><b>PolicyEnforcer + Registry</b><i class="edge-arrow">⇢</i><b>isolate_ports 代理</b></span>
+<span class="edge"><b>isolate_ports 代理</b><i class="edge-arrow">⇢</i><b>LoopThread / LoopJob</b></span>
+<span class="edge"><b>LoopThread / LoopJob</b><i class="edge-arrow">⇢</i><b>D</b></span>
+<span class="edge"><b>RobotRuntime</b><i class="edge-arrow">⇢</i><b>TaskListener + CallbackExecutor</b></span>
+<span class="edge"><b>TaskListener + CallbackExecutor</b><i class="edge-arrow">⇢</i><b>RobotRuntime</b></span>
+</div>
+<p>依赖方向严格自上而下：内核层只认 <code>ports.py</code> 里的 Protocol，不知道边界层存在——
+<code>KernelHost</code> 和 <code>isolate_ports</code> 是<strong>从外面把内核包起来</strong>的，所以低层 <code>RuntimeCore</code>
+单独使用时没有隔离（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/core.py#L88-L127">core.py:88-127</a>
+的 <code>isolate()</code> 必须由宿主显式调用）。这一点很重要：<strong>隔离是宿主的属性，不是内核的属性</strong>。</p>
+<h3 id="s-2-2">2.2 线程拓扑</h3>
+<p>一个用 <code>RobotRuntime</code> + SQLite + 3 个技能 + 状态源 + 对账器的嵌入式进程，长这样：</p>
+<table>
+<thead>
+<tr>
+<th>线程</th>
+<th>谁创建</th>
+<th>上面跑什么</th>
+<th>数量</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>主线程（应用 loop）</td>
+<td>应用</td>
+<td>SDK 门面、<code>TaskListener</code> 协程、<strong>异步回调</strong></td>
+<td>应用自定</td>
+</tr>
+<tr>
+<td><code>robot-kernel</code></td>
+<td><code>KernelHost</code> <a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/kernel_host.py#L160-L164">kernel_host.py:160-164</a></td>
+<td><strong>整个 <code>RuntimeCore</code></strong>：状态机、资源锁、事件总线、<code>asyncio.Task</code></td>
+<td>1</td>
+</tr>
+<tr>
+<td><code>robot-extension-N</code></td>
+<td><code>IsolatedPorts</code> <a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/isolation.py#L514-L519">isolation.py:514-519</a></td>
+<td>该外部对象的<strong>全部方法</strong>（技能 <code>execute</code> / 仓储读写 / <code>watch</code> / <code>reconcile</code>）</td>
+<td>每个唯一对象 1 条</td>
+</tr>
+<tr>
+<td><code>robot-validation</code></td>
+<td><code>IsolatedPorts</code> <a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/isolation.py#L512-L513">isolation.py:512-513</a></td>
+<td>jsonschema 准入校验（外部可控的 CPU 工作）</td>
+<td>1</td>
+</tr>
+<tr>
+<td><code>rar-callback-N</code></td>
+<td><code>CallbackExecutor</code> <a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/callback_executor.py#L84-L86">callback_executor.py:84-86</a></td>
+<td>SDK 的<strong>同步</strong>监听回调（惰性创建，daemon）</td>
+<td>最多 4</td>
+</tr>
+</tbody>
+</table>
+<p>远程模式则在服务端进程重复整套拓扑，客户端只是普通应用线程 + UDS。</p>
+<p>三条关键规则：</p>
+<ul>
+<li><strong>粒度是"对象"不是"类别"</strong>：<code>IsolatedPorts</code> 按 <code>id(obj)</code> 去重
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/isolation.py#L502-L519">isolation.py:502-519</a>）。
+  同一个 <code>Skill</code> 实例注册成两个名字，共用一条线程；两个不同实例各一条。所以<strong>一个卡死的技能
+  只冻结它自己和它的别名</strong>，不会冻结别的技能。</li>
+<li><strong>线程永不替换</strong>：卡住的线程一直占着，不补建
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/thread_runtime.py#L70-L77">thread_runtime.py:70-77</a>）。
+  这是"无法杀死线程"的直接后果，也是当前设计的主要运维代价。</li>
+<li><strong>上限</strong>：唯一外部对象数 + 1 不得超过 <code>max_extension_threads</code>（默认 32，即最多 31 个外部对象），
+  超出在构造期直接失败 <a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/isolation.py#L504-L510">isolation.py:504-510</a>。</li>
+</ul>
+<h3 id="s-2-3">2.3 容量与预留位</h3>
+<p>每条 <code>LoopThread</code> 有两个独立名额：普通名额 <code>max_pending</code> 和控制名额 <code>control_capacity</code>。
+判断依据是 <code>CONTROL_OPERATION</code> 这个 <code>ContextVar</code>
+（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/execution_context.py#L4">execution_context.py:3</a>），
+在 <code>_execute</code> 里按 job 设置，因此<strong>控制属性会沿调用链传到端口线程</strong>
+（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/thread_runtime.py#L200">thread_runtime.py:200</a>）。</p>
+<p>目的只有一个：<code>get_task_status</code> / <code>cancel_task</code> / 生命周期清理不能被
+256 个空闲订阅或一堆慢请求挤出去。三档是<strong>分别记账</strong>的：请求档
+<code>max_pending_calls=256</code>、控制档 <code>max_control_calls=16</code> 在 <code>_submit_request</code> 里用两个
+<code>set</code> 各自限流（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/kernel_host.py#L294-L307">kernel_host.py:294-307</a>），
+订阅档 <code>max_subscriptions=256</code> 按 <code>self._streams</code> 数量限流
+（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/kernel_host.py#L358-L362">kernel_host.py:358-362</a>）。
+线程自身的队列容量比这三档更宽：<code>robot-kernel</code> 线程的普通名额是
+<code>max_pending_calls + max_subscriptions</code>，控制名额是 <code>max_control_calls + 3</code>
+（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/kernel_host.py#L160-L164">kernel_host.py:160-164</a>），
+<code>robot-validation</code> 与每条 <code>robot-extension-N</code> 同样多给 3 个控制位兜底
+（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/isolation.py#L512-L518">isolation.py:512-518</a>、
+理由写在 <a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/isolation.py#L490-L491">isolation.py:490-491</a>）。
+这 3 个位子专门留给"公开查询正在等外部代码时"仍要能挤进去的清理调用（如 <code>iterator.aclose()</code>）。
+容量耗尽统一报 <code>EXTENSION_CAPACITY_EXCEEDED</code>。</p>
+<h3 id="s-2-4">2.4 文件清单</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>LOC</th>
+<th>一句话职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>models.py</code></td>
+<td>116</td>
+<td>7 个 pydantic 模型 + <code>TaskState</code> 枚举 + <code>SkillContext</code> dataclass</td>
+</tr>
+<tr>
+<td><code>errors.py</code></td>
+<td>118</td>
+<td>每个失败模式一个异常子类 + 一个 <code>code</code> 字符串</td>
+</tr>
+<tr>
+<td><code>ports.py</code></td>
+<td>153</td>
+<td>6 个 Protocol：<code>Skill</code> / <code>TaskRepository</code> / <code>PagedEventRepository</code> / <code>Reconciler</code> / <code>RobotStateProvider</code> / <code>CallbackRobotApi</code></td>
+</tr>
+<tr>
+<td><code>core.py</code></td>
+<td>446</td>
+<td>生命周期、公开 API、提交准入、状态源打断</td>
+</tr>
+<tr>
+<td><code>task_state.py</code></td>
+<td>236</td>
+<td><strong>状态唯一写入点</strong> + 本机任务归属（6 个按 task id 的字典）</td>
+</tr>
+<tr>
+<td><code>executor.py</code></td>
+<td>350</td>
+<td>单任务步骤编排：锁资源 → 检查前置条件 → 带期限执行 → 恰好一次终态</td>
+</tr>
+<tr>
+<td><code>resources.py</code></td>
+<td>84</td>
+<td>按声明的资源互斥锁 + 失控资源隔离</td>
+</tr>
+<tr>
+<td><code>events.py</code></td>
+<td>132</td>
+<td>历史回放 + 实时推送 + watermark 去重 + 溢出报告</td>
+</tr>
+<tr>
+<td><code>policy.py</code></td>
+<td>85</td>
+<td>Schema 校验、权限 allowlist、前置条件求交</td>
+</tr>
+<tr>
+<td><code>recovery.py</code></td>
+<td>84</td>
+<td>重启时对每个非终态任务求权威终态</td>
+</tr>
+<tr>
+<td><code>repository.py</code> / <code>sqlite_repository.py</code></td>
+<td>134 / 348</td>
+<td>两种持久化，语义等价</td>
+</tr>
+<tr>
+<td><code>wire.py</code></td>
+<td>57</td>
+<td>NDJSON 成帧，1 MiB 上限</td>
+</tr>
+<tr>
+<td><code>server.py</code></td>
+<td>287</td>
+<td>UDS 守护进程：请求分发 + 订阅流</td>
+</tr>
+<tr>
+<td><code>kernel_host.py</code></td>
+<td>399</td>
+<td>内核线程托管 + 请求/事件跨线程交接 + 有序关闭</td>
+</tr>
+<tr>
+<td><code>thread_runtime.py</code></td>
+<td>269</td>
+<td><code>LoopThread</code> / <code>LoopJob</code>：固定 daemon 循环、容量、真实完成</td>
+</tr>
+<tr>
+<td><code>isolation.py</code></td>
+<td>575</td>
+<td>6 类端口的代理：线程归属、期限、取消/进度桥接、故障关闭</td>
+</tr>
+<tr>
+<td><code>boundary.py</code></td>
+<td>151</td>
+<td>有界快照：计量后构建，拒绝外部对象钩子</td>
+</tr>
+<tr>
+<td><code>options.py</code></td>
+<td>39</td>
+<td><code>RuntimeOptions</code> 10 个限额</td>
+</tr>
+<tr>
+<td><code>execution_context.py</code></td>
+<td>4</td>
+<td>控制操作 <code>ContextVar</code></td>
+</tr>
+<tr>
+<td><code>sdk/embedded.py</code> / <code>remote.py</code></td>
+<td>89 / 257</td>
+<td>两种同签名门面</td>
+</tr>
+<tr>
+<td><code>sdk/listeners.py</code> / <code>callback_executor.py</code></td>
+<td>283 / 212</td>
+<td>统一注册监听 + 同步回调的有界线程池</td>
+</tr>
+<tr>
+<td><code>adapters/simulator.py</code> / <code>cc_api.py</code></td>
+<td>373 / 420</td>
+<td>无硬件自测实现 + CC API 语音适配器</td>
+</tr>
+</tbody>
+</table>
+<h3 id="s-2-5">2.5 打包与依赖</h3>
+<p><code>pyproject.toml</code>：包名 <code>robot-agent-runtime</code> v0.1.0，<code>requires-python &gt;= 3.11</code>，src 布局 + <code>py.typed</code>，
+控制台入口 <code>robot-agent-runtime = robot_agent_runtime.__main__:main</code>。</p>
+<p><strong>运行时依赖只有三个</strong>：<code>pydantic&gt;=2</code>、<code>jsonschema&gt;=4</code>（<code>policy.py</code> 用）、<code>aiosqlite&gt;=0.20</code>
+（<code>sqlite_repository.py</code> 用）。测试依赖 <code>pytest&gt;=8</code> + <code>pytest-asyncio&gt;=0.24</code>（<code>asyncio_mode=auto</code>）。</p>
+<p>厂商包 <code>ubt_robot</code> <strong>不在依赖里</strong>——<code>adapters/cc_api.py</code> 只依赖 <code>ports.py</code> 的
+<code>CallbackRobotApi</code> 结构契约，所以宿主上常规导入不需要它（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/ports.py#L128-L153">ports.py:128-153</a>）。
+AGENTS.md 的"不加依赖"是硬约束：宿主 pip 装不上东西，加一个依赖就等于让所有人只能进容器干活。</p>
+<hr />
+<h2 id="s-3">3. 数据模型与状态机</h2>
+<h3 id="s-3-1">3.1 模型</h3>
+<pre><code>TaskRequest(task_type, steps[SkillCall], priority, timeout_s, idempotency_key, metadata)
+  └─ 落库为 → Task(id, task_type, state, steps, current_step, priority, timeout_s,
+                   idempotency_key, metadata, result, error, cancel_requested,
+                   created_at, updated_at)
+SkillCall(skill, params, timeout_s?)        一步
+SkillDefinition(name, version, input_schema, resources, permissions,
+                preconditions, timeout_s, supports_cancel)   技能的全部契约
+SkillContext(task_id, execution_id, cancel_event, progress)  内核交给技能的唯一对象
+SkillResult(success, output, error)
+Event(event_id, task_id, sequence, event_type, timestamp, data)
+</code></pre>
+<p>要点：</p>
+<ul>
+<li><strong><code>SkillDefinition</code> 是声明式的</strong>，校验/加锁/超时/取消全由运行时按声明统一执行，技能实现里
+  不许自己做（AGENTS.md 不变量 6）。</li>
+<li><code>TaskRequest.timeout_s</code> 现在是<strong>总期限</strong>，从接受请求那一刻起算，覆盖准入、排队、等资源、执行
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/core.py#L317-L318">core.py:317-318</a>）。</li>
+<li><code>SkillContext</code> 里的 <code>cancel_event</code> 是内核的 <code>asyncio.Event</code>，但技能在线程隔离下拿到的
+  是代理<strong>在自己线程里重建</strong>的等价 event（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/isolation.py#L396-L418">isolation.py:396-418</a>），
+  绝不跨线程共享 asyncio 对象。</li>
+<li>全部时间戳强制 timezone-aware UTC（<code>_as_utc</code> → <code>UTCDateTime</code>，<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/models.py#L70-L76">models.py:70-76</a>）。
+  技能进度<strong>不是</strong> <code>Task</code> 的字段，只以 <code>SKILL_PROGRESS</code> 事件形式存在——状态里没有可被覆盖的
+  progress，就不存在"进度写入和状态机抢同一个字段"的问题。</li>
+</ul>
+<h3 id="s-3-2">3.2 状态机</h3>
+<figure><svg class="diagram" viewBox="0 0 940 300" role="img" aria-label="任务状态主链">
+<defs><marker id="sp" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.6"/></marker></defs>
+<circle cx="22" cy="46" r="6" fill="#1a1d24"/>
+<line x1="28" y1="46" x2="54" y2="46" stroke="#8a8f99" stroke-width="1.6" marker-end="url(#sp)"/>
+<g font-family="ui-monospace, Menlo, monospace" font-size="12.5">
+<rect x="56" y="26" width="104" height="40" rx="8" fill="#e6f1fb" stroke="#185fa5" stroke-width=".6"/><text x="108" y="47" text-anchor="middle" dominant-baseline="central" font-weight="600" fill="#0c447c">CREATED</text>
+<rect x="210" y="26" width="114" height="40" rx="8" fill="#e6f1fb" stroke="#185fa5" stroke-width=".6"/><text x="267" y="47" text-anchor="middle" dominant-baseline="central" font-weight="600" fill="#0c447c">VALIDATING</text>
+<rect x="374" y="26" width="96" height="40" rx="8" fill="#e6f1fb" stroke="#185fa5" stroke-width=".6"/><text x="422" y="47" text-anchor="middle" dominant-baseline="central" font-weight="600" fill="#0c447c">QUEUED</text>
+<rect x="520" y="26" width="100" height="40" rx="8" fill="#e1f5ee" stroke="#0f6e56" stroke-width=".6"/><text x="570" y="47" text-anchor="middle" dominant-baseline="central" font-weight="600" fill="#085041">RUNNING</text>
+<rect x="790" y="26" width="112" height="40" rx="8" fill="#e1f5ee" stroke="#0f6e56" stroke-width=".6"/><text x="846" y="47" text-anchor="middle" dominant-baseline="central" font-weight="600" fill="#085041">SUCCEEDED</text>
+<line x1="160" y1="46" x2="210" y2="46" stroke="#185fa5" stroke-width="1.6" marker-end="url(#sp)"/>
+<line x1="324" y1="46" x2="374" y2="46" stroke="#185fa5" stroke-width="1.6" marker-end="url(#sp)"/>
+<line x1="470" y1="46" x2="520" y2="46" stroke="#185fa5" stroke-width="1.6" marker-end="url(#sp)"/>
+<line x1="620" y1="46" x2="790" y2="46" stroke="#0f6e56" stroke-width="1.6" marker-end="url(#sp)"/>
+<text x="495" y="22" text-anchor="middle" font-size="11" fill="#5f6570">TASK_RUNNING</text>
+<text x="705" y="22" text-anchor="middle" font-size="11" fill="#5f6570">try_succeed(guard)</text>
+<text x="185" y="22" text-anchor="middle" font-size="11" fill="#5f6570">VALIDATING</text>
+<text x="349" y="22" text-anchor="middle" font-size="11" fill="#5f6570">TASK_QUEUED</text>
+<rect x="520" y="118" width="100" height="38" rx="8" fill="#f6f7f9" stroke="#5f6570" stroke-width=".6"/><text x="570" y="137" text-anchor="middle" dominant-baseline="central" font-weight="600" fill="#1a1d24">WAITING</text>
+<line x1="556" y1="66" x2="556" y2="118" stroke="#8a8f99" stroke-width="1.5" marker-end="url(#sp)"/>
+<line x1="584" y1="118" x2="584" y2="66" stroke="#8a8f99" stroke-width="1.5" marker-end="url(#sp)"/>
+<text x="678" y="98" font-size="11" fill="#5f6570">等资源锁 ↓ / 拿到锁 ↑</text>
+<rect x="374" y="222" width="96" height="38" rx="8" fill="#faece7" stroke="#993c1d" stroke-width=".6"/><text x="422" y="241" text-anchor="middle" dominant-baseline="central" font-weight="600" fill="#7a2f16">FAILED</text>
+<line x1="267" y1="66" x2="400" y2="222" stroke="#993c1d" stroke-width="1.5" marker-end="url(#sp)"/>
+<line x1="560" y1="66" x2="450" y2="222" stroke="#993c1d" stroke-width="1.5" marker-end="url(#sp)"/>
+<text x="255" y="180" font-size="11" fill="#993c1d">校验失败 / 读状态失败 / 总期限</text>
+<text x="498" y="207" font-size="11" fill="#993c1d">技能失败 / 步骤超时</text>
+<rect x="690" y="150" width="104" height="38" rx="8" fill="#eeedfe" stroke="#3c3489" stroke-width=".6"/><text x="742" y="169" text-anchor="middle" dominant-baseline="central" font-weight="600" fill="#26215c">CANCELING</text>
+<rect x="820" y="222" width="96" height="38" rx="8" fill="#eeedfe" stroke="#3c3489" stroke-width=".6"/><text x="868" y="241" text-anchor="middle" dominant-baseline="central" font-weight="600" fill="#26215c">CANCELED</text>
+<line x1="620" y1="56" x2="690" y2="164" stroke="#3c3489" stroke-width="1.5" marker-end="url(#sp)"/>
+<line x1="770" y1="188" x2="852" y2="222" stroke="#3c3489" stroke-width="1.5" marker-end="url(#sp)"/>
+<text x="700" y="140" font-size="11" fill="#3c3489">request_cancel</text>
+<text x="790" y="212" font-size="11" fill="#3c3489">确认停止</text>
+<rect x="560" y="222" width="200" height="38" rx="8" fill="#faeeda" stroke="#854f0b" stroke-width=".6"/><text x="660" y="241" text-anchor="middle" dominant-baseline="central" font-weight="600" fill="#5c3808">RECONCILIATION_REQUIRED</text>
+<line x1="742" y1="188" x2="700" y2="222" stroke="#854f0b" stroke-width="1.5" marker-end="url(#sp)"/>
+<line x1="600" y1="66" x2="640" y2="222" stroke="#854f0b" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#sp)"/>
+<line x1="108" y1="66" x2="600" y2="234" stroke="#854f0b" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#sp)"/>
+<text x="470" y="286" font-size="11" fill="#854f0b">虚线 = 停止无法确认 / 重启遗留且无权威结论</text>
+<rect x="56" y="222" width="96" height="38" rx="8" fill="#f6f7f9" stroke="#5f6570" stroke-width=".6"/><text x="104" y="241" text-anchor="middle" dominant-baseline="central" font-weight="600" fill="#1a1d24">UNKNOWN</text>
+<line x1="90" y1="66" x2="100" y2="222" stroke="#5f6570" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#sp)"/>
+<text x="30" y="150" font-size="11" fill="#5f6570">重启</text>
+</g>
+</svg><figcaption>主链示意（全部 16 条迁移见下表）</figcaption></figure><p class="diagram-lead">全部状态与迁移（与上方状态图同源，逐条列出）：</p><div class="chips state-row"><span class="state-chip">CREATED</span> <span class="state-chip">VALIDATING</span> <span class="state-chip">FAILED</span> <span class="state-chip">QUEUED</span> <span class="state-chip">RUNNING</span> <span class="state-chip">WAITING</span> <span class="state-chip">SUCCEEDED</span> <span class="state-chip">CANCELING</span> <span class="state-chip">CANCELED</span> <span class="state-chip">RECONCILIATION_REQUIRED</span> <span class="state-chip">UNKNOWN</span></div><table><tr><th>当前状态</th><th>事件 / 条件</th><th>目标状态</th></tr><tr><td><code>入口</code></td><td>运行时首次接受任务</td><td><code>CREATED</code></td></tr><tr><td><code>CREATED</code></td><td>TASK_VALIDATING</td><td><code>VALIDATING</code></td></tr><tr><td><code>VALIDATING</code></td><td>Schema/权限/前置条件/读状态失败/总期限</td><td><code>FAILED</code></td></tr><tr><td><code>VALIDATING</code></td><td>TASK_QUEUED</td><td><code>QUEUED</code></td></tr><tr><td><code>QUEUED</code></td><td>TASK_RUNNING</td><td><code>RUNNING</code></td></tr><tr><td><code>RUNNING</code></td><td>等资源锁</td><td><code>WAITING</code></td></tr><tr><td><code>WAITING</code></td><td>拿到锁</td><td><code>RUNNING</code></td></tr><tr><td><code>RUNNING</code></td><td>try_succeed(guard)</td><td><code>SUCCEEDED</code></td></tr><tr><td><code>RUNNING</code></td><td>技能失败/超时/失控</td><td><code>FAILED</code></td></tr><tr><td><code>RUNNING</code></td><td>request_cancel</td><td><code>CANCELING</code></td></tr><tr><td><code>WAITING</code></td><td>—</td><td><code>CANCELING</code></td></tr><tr><td><code>CANCELING</code></td><td>确认停止</td><td><code>CANCELED</code></td></tr><tr><td><code>CANCELING</code></td><td>停止无法确认</td><td><code>RECONCILIATION_REQUIRED</code></td></tr><tr><td><code>RUNNING</code></td><td>总期限/失控且无法确认停止</td><td><code>RECONCILIATION_REQUIRED</code></td></tr><tr><td><code>CREATED</code></td><td>重启遗留且无权威结论</td><td><code>RECONCILIATION_REQUIRED</code></td></tr><tr><td><code>CREATED</code></td><td>重启遗留且对账给出 UNKNOWN</td><td><code>UNKNOWN</code></td></tr></table>
+<p>终态：<code>SUCCEEDED / FAILED / CANCELED / UNKNOWN / RECONCILIATION_REQUIRED</code>
+（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/models.py#L24-L32">models.py:24-32</a>）。</p>
+<p><code>RECONCILIATION_REQUIRED</code> 有<strong>两个来源</strong>，语义相同（"软件结束不等于物理停止，需要权威结论"）：</p>
+<ol>
+<li>重启遗留：<code>recovery.py</code> 拿不到权威终态（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/recovery.py#L34-L47">recovery.py:34-47</a>）；</li>
+<li>运行中失控：取消/超时后停止确认期内没结束（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/executor.py#L168-L176">executor.py:168-176</a>）。</li>
+</ol>
+<hr />
+<h2 id="s-4">4. 端口契约：外部要实现什么</h2>
+<table>
+<thead>
+<tr>
+<th>Protocol</th>
+<th>方法</th>
+<th>谁调用</th>
+<th>失败语义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Skill</code></td>
+<td><code>definition</code> / <code>async execute(context, params)</code></td>
+<td><code>WorkflowExecutor</code></td>
+<td>超时/取消不确定 → 该实例永久 poisoned</td>
+</tr>
+<tr>
+<td><code>TaskRepository</code></td>
+<td><code>start/close/create_task/get_task/update_task/append_event/apply_transition/list_events/get_nonterminal_tasks/find_by_idempotency_key</code></td>
+<td><code>TaskStateStore</code>、<code>EventBus</code>、<code>RuntimeCore</code></td>
+<td>任一超时 → 整个仓储 poisoned</td>
+</tr>
+<tr>
+<td><code>PagedEventRepository</code></td>
+<td><code>+ list_events_page(task_id, after, limit)</code></td>
+<td><code>EventBus.history</code></td>
+<td>可选；没有则代理在工作线程裁页兼容</td>
+</tr>
+<tr>
+<td><code>Reconciler</code></td>
+<td><code>async reconcile(task) -&gt; TaskState \| None</code></td>
+<td><code>recovery.py</code>（仅 <code>start()</code>）</td>
+<td>异常/不确定 → <code>RECONCILIATION_REQUIRED</code></td>
+</tr>
+<tr>
+<td><code>RobotStateProvider</code></td>
+<td><code>async unsatisfied()</code> / <code>watch()</code></td>
+<td><code>PolicyEnforcer</code>、<code>WorkflowExecutor</code>、<code>core._watch_robot_state</code></td>
+<td>读失败 → 提交 <code>INTERNAL_ERROR</code>（失败关闭）</td>
+</tr>
+<tr>
+<td><code>CallbackRobotApi</code></td>
+<td><code>request/notify/add_service/remove_service/set_disconnect_callback</code></td>
+<td><code>adapters/cc_api.py</code></td>
+<td>厂商回调可能在 SDK 自有线程</td>
+</tr>
+</tbody>
+</table>
+<p>定义见 <a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/ports.py#L14-L153">ports.py:14-153</a>。
+每个 Protocol 的 docstring 都写了宿主语义（在线程隔离下谁拥有它、什么算不确定），
+这些 docstring 是本项目最主要的"契约文档"，比 README 更精确。</p>
+<p>新端口必须配 <code>test_contracts.py</code> 里的契约测试，让后续真实适配器可复用。</p>
+<hr />
+<h2 id="s-5">5. 主流程</h2>
+<h3 id="h-13">流程 1：启动与重启恢复</h3>
+<table class="seq"><tr><th>#</th><th>谁调用谁</th><th>做什么</th></tr><tr><td class="step">1</td><td class="who"><b>App</b><i class="edge-arrow">→</i><b>RobotRuntime</b></td><td>await start()</td></tr><tr><td class="step">2</td><td class="who"><b>RobotRuntime</b><i class="edge-arrow">→</i><b>KernelHost</b></td><td>start()</td></tr><tr><td class="step">3</td><td class="who"><b>KernelHost</b><i class="edge-arrow">→</i><b>内核线程</b></td><td>起 robot-kernel 线程</td></tr><tr><td class="step">4</td><td class="who"><b>KernelHost</b><i class="edge-arrow">→</i><b>RuntimeCore</b></td><td>_start_core（内核生命周期锁）</td></tr><tr><td class="step">5</td><td class="who"><b>RuntimeCore</b><i class="edge-arrow">→</i><b>RuntimeCore</b></td><td>isolate(options)</td></tr><tr><td class="step">6</td><td class="who"><b>RuntimeCore</b><i class="edge-arrow">→</i><b>端口线程</b></td><td>建 N 条端口线程 + validation 线程</td></tr><tr><td class="step">7</td><td class="who"><b>端口线程</b><i class="edge-arrow">⇢</i><b>RuntimeCore</b></td><td>在各自线程读 Skill.definition（冻结声明）</td></tr><tr><td class="step">8</td><td class="who"><b>RuntimeCore</b><i class="edge-arrow">→</i><b>端口线程</b></td><td>repository.start()</td></tr><tr><td class="step">9</td><td class="who"><b>RuntimeCore</b><i class="edge-arrow">→</i><b>RuntimeCore</b></td><td>recover_nonterminal_tasks()</td></tr><tr class="grp"><td colspan="3"><b>loop</b> 每个非终态任务</td></tr><tr><td class="step">10</td><td class="who">&nbsp;<b>RuntimeCore</b><i class="edge-arrow">→</i><b>端口线程</b></td><td>reconciler.reconcile(detached snapshot)</td></tr><tr class="grp"><td colspan="3">&nbsp;<b>alt</b> 返回权威终态</td></tr><tr><td class="step">11</td><td class="who">&nbsp;&nbsp;<b>RuntimeCore</b><i class="edge-arrow">→</i><b>端口线程</b></td><td>apply_transition(TASK_RECONCILED)</td></tr><tr class="grp"><td colspan="3">&nbsp;<b>else</b> 无 reconciler / 抛异常 / 不确定</td></tr><tr><td class="step">12</td><td class="who">&nbsp;<b>RuntimeCore</b><i class="edge-arrow">→</i><b>端口线程</b></td><td>apply_transition(TASK_RECOVERY_REQUIRED → RECONCILIATION_REQUIRED)</td></tr><tr><td class="step">13</td><td class="who"><b>RuntimeCore</b><i class="edge-arrow">→</i><b>端口线程</b></td><td>起 robot-state-watch（消费代理转交的 watch()）</td></tr><tr><td class="step">14</td><td class="who"><b>RuntimeCore</b><i class="edge-arrow">⇢</i><b>App</b></td><td>返回快照（此后才接受提交）</td></tr></table>
+<p>关键点：</p>
+<ul>
+<li><strong>先恢复，后接受新任务</strong>：<code>_start_core</code> 持内核生命周期锁，<code>start()</code> 没完成时
+  <code>_require_running()</code> 会拒绝（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/core.py#L444-L446">core.py:444-446</a>）。</li>
+<li>恢复写事件时任务<strong>没有本机归属</strong>，所以用 <code>recovery_ownership()</code> 临时只挂锁和序号，
+  并且把序号<strong>接着重启前继续</strong>（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/task_state.py#L48-L64">task_state.py:48-64</a>）——
+  否则事件序号会撞车。</li>
+<li>技能声明在启动阶段就被冻结成快照，之后准入校验不再触碰外部对象的可变状态。</li>
+<li>这条流程是<strong>不重放</strong>的实现处（AGENTS.md 不变量 2）。</li>
+</ul>
+<h3 id="h-14">流程 2：提交任务（准入）</h3>
+<p><code>core.py:316-397</code>。顺序是有意为之的：</p>
+<ol>
+<li><code>submit_task</code> 先用<strong>内核循环的单调时钟</strong>算出总期限 <code>deadline</code>（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/core.py#L317-L318">:317-318</a>），
+   然后 <code>_submit_owned</code> 包在 <code>asyncio.shield</code> 里——<strong>调用方取消不能把已登记的任务变成孤儿</strong>，
+   必须等本机归属登记完才允许逃逸（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/core.py#L319-L328">:319-328</a>）。</li>
+<li><code>idempotency_lock</code> 内查幂等键，命中直接返回既有任务；否则建 <code>Task</code>、<code>create_task</code> 落库、
+   <code>register()</code> 登记本机归属（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/core.py#L331-L350">:331-350</a>）。</li>
+<li>依次发 <code>TASK_CREATED</code>、<code>TASK_VALIDATING</code>。</li>
+<li>取一次 <code>unsatisfied()</code> 快照，<strong>整单所有步骤共用这一份读数</strong>（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/core.py#L363">:363</a>），
+   然后逐步 <code>validate</code>。隔离模式下校验被派到 <code>robot-validation</code> 线程（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/core.py#L368">:368</a>、
+   <a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/isolation.py#L546-L565">isolation.py:546-565</a>）。</li>
+<li>任何 <code>AgentRuntimeError</code> → 落 <code>FAILED</code> 并 <code>cleanup()</code>，<strong>返回任务而不是抛异常</strong>（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/core.py#L379-L390">:379-390</a>）。
+   这是"校验失败也是一次合法的任务生命周期"的体现。</li>
+<li>通过则发 <code>TASK_QUEUED</code>，<code>create_task(executor.run(task, deadline))</code> 并登记执行句柄。
+   <strong><code>submit_task</code> 不等执行</strong>——它返回的是 <code>QUEUED</code> 快照。</li>
+</ol>
+<p>注意：<code>priority</code> 落库了但<strong>不参与排序</strong>，也没有并发上限，提交即起协程。调度器还没做。</p>
+<h3 id="h-15">流程 3：单步执行</h3>
+<p><code>executor.py:49-224</code>，每一步的内层顺序是这套运行时最讲究的一段：</p>
+<table class="seq"><tr><th>#</th><th>谁调用谁</th><th>做什么</th></tr><tr><td class="step">1</td><td class="who"><b>WorkflowExecutor(内核线程)</b><i class="edge-arrow">→</i><b>TaskStateStore</b></td><td>TASK_WAITING（仅当声明了资源）</td></tr><tr><td class="step">2</td><td class="who"><b>WorkflowExecutor(内核线程)</b><i class="edge-arrow">→</i><b>ResourceLocks</b></td><td>acquire(resources, cancel_event) 按名字典序取锁</td></tr><tr class="note"><td colspan="3"><b>注意</b> · WorkflowExecutor(内核线程)：拿到锁后再查一次前置条件</td></tr><tr><td class="step">3</td><td class="who"><b>WorkflowExecutor(内核线程)</b><i class="edge-arrow">→</i><b>_Skill 代理</b></td><td>_require_preconditions(skill, step)</td></tr><tr><td class="step">4</td><td class="who"><b>_Skill 代理</b><i class="edge-arrow">→</i><b>技能线程</b></td><td>robot_state.unsatisfied()</td></tr><tr><td class="step">5</td><td class="who"><b>WorkflowExecutor(内核线程)</b><i class="edge-arrow">→</i><b>TaskStateStore</b></td><td>TASK_RUNNING</td></tr><tr><td class="step">6</td><td class="who"><b>WorkflowExecutor(内核线程)</b><i class="edge-arrow">→</i><b>TaskStateStore</b></td><td>SKILL_STARTED</td></tr><tr><td class="step">7</td><td class="who"><b>WorkflowExecutor(内核线程)</b><i class="edge-arrow">→</i><b>_Skill 代理</b></td><td>execute(context, params)</td></tr><tr><td class="step">8</td><td class="who"><b>_Skill 代理</b><i class="edge-arrow">→</i><b>技能线程</b></td><td>submit 到该技能固定线程<br>参数快照 + 重建 cancel_event + 进度桥</td></tr><tr><td class="step">9</td><td class="who"><b>技能线程</b><i class="edge-arrow">⇢</i><b>_Skill 代理</b></td><td>SkillResult 快照</td></tr><tr><td class="step">10</td><td class="who"><b>_Skill 代理</b><i class="edge-arrow">⇢</i><b>WorkflowExecutor(内核线程)</b></td><td>结果</td></tr><tr><td class="step">11</td><td class="who"><b>WorkflowExecutor(内核线程)</b><i class="edge-arrow">→</i><b>TaskStateStore</b></td><td>SKILL_SUCCEEDED / SKILL_FAILED / TASK_RESULT</td></tr></table>
+<p>为什么"拿锁之后、发 <code>SKILL_STARTED</code> 之前"才读机器人状态
+（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/executor.py#L86-L92">executor.py:86-92</a>）：
+拿锁前的读数可能已经过期，而 <code>SKILL_STARTED</code> 一旦发布就宣称这一步真的开始了——
+一个即将被拒的步骤不能先发开始事件。这条顺序是测试写死的。</p>
+<p><code>ResourceLocks</code> 按资源名<strong>字典序</strong>取锁（避免死锁），等锁期间可被 <code>cancel_event</code> 打断，
+<code>finally</code> 里把已获得的锁逆序全部释放（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/resources.py#L44-L84">resources.py:44-84</a>）。</p>
+<h3 id="h-16">流程 4：取消、超时与"停止确认"</h3>
+<p>这是整个项目最容易被误读的部分。<strong>三层，每层都不能证明物理停止</strong>：</p>
+<pre><code>第 1 层  cancel_event.set()           协作信号，技能自己轮询/等待
+第 2 层  task.cancel()                仅当 supports_cancel=True
+第 3 层  停止确认期 cancel_grace_s     等真实结束（默认 0.2s，可再来一轮）
+</code></pre>
+<ul>
+<li><code>cancel_task</code>：取本机任务 → <code>request_cancel</code>（发 <code>TASK_CANCEL_REQUESTED</code>，置状态 <code>CANCELING</code>）
+  → <code>cancel_event.set()</code> → <strong>释放生命周期锁后</strong>才 <code>await shield(execution)</code>
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/core.py#L413-L437">core.py:413-437</a>）。
+  锁内不做等待，否则取消会把整个内核的提交路径堵死。</li>
+<li><code>executor._confirm_stop</code>：等 <code>cancel_grace_s</code>；没结束且 <code>supports_cancel</code> 才 <code>task.cancel()</code> 再等一轮。
+  判定标准是"<strong>任务真的结束且结果可信</strong>"：<code>TaskCancelled</code> 或 <code>SkillResult.success</code> 才算确认；
+  协程 <code>CancelledError</code>、任何异常、返回失败结果都算不确定 → <code>ExecutionUnresponsive</code>
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/executor.py#L300-L328">executor.py:300-328</a>）。</li>
+<li>上面还叠了一层：<code>_Skill</code> 代理自己也有 <code>_CancelBridge</code> + <code>_poisoned</code>，
+  确认不了就<strong>永久拒绝该技能实例</strong>（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/isolation.py#L452-L481">isolation.py:452-481</a>）。</li>
+<li>后果链：<code>ExecutionUnresponsive</code> → <code>resources.quarantine(声明的资源)</code> →
+  任务落 <code>RECONCILIATION_REQUIRED</code> → 迟到结果不得把任务改回成功，终态后不再收进度。</li>
+<li><strong>隔离永不自动解除</strong>（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/resources.py#L23-L37">resources.py:23-37</a>）。
+  后续等待者拿到锁后还会<strong>再查一次</strong>隔离表（<code>resources.py</code> 里 yield 前的 <code>_require_available</code>），
+  所以"软件任务结束了"绝不等于"硬件可以复用了"。</li>
+</ul>
+<p>总期限到期走同一套：未派发或已确认停止 → <code>FAILED / TASK_TIMEOUT</code>；
+停止不明 → 待对账（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/executor.py#L160-L176">executor.py:160-176</a>）。</p>
+<h3 id="h-17">流程 5：事件订阅与回放</h3>
+<p><code>events.py</code> + <code>kernel_host.py</code> 两段，合起来保证"先历史后实时、顺序单调、不重不漏或明确报错"。</p>
+<p><strong>EventBus（内核线程内）</strong></p>
+<ul>
+<li><code>subscribe(task_id, after_sequence)</code> <strong>先注册队列，再回放历史</strong>
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/events.py#L68-L84">events.py:68-84</a>）。
+  注册必须在前，否则读库期间发布的事件会丢。</li>
+<li>回放和实时共用一个 <code>watermark</code>：历史里已交付的最大 <code>sequence</code>，
+  实时队列里 <code>sequence &lt;= watermark</code> 的一律丢弃（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/events.py#L80-L107">:80-107</a>）。
+  这就是"先回放后实时"的去重机制。</li>
+<li>历史按 <code>list_events_page</code> 分页（默认 128），旧仓储退化为 <code>list_events</code> 后切片；
+  页内出现 <code>sequence &lt;= watermark</code> 直接 <code>INTERNAL_ERROR</code>（仓储返回乱序历史是 bug，不是降级点），
+  每页之间 <code>await asyncio.sleep(0)</code> 让出循环，避免长历史独占内核
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/events.py#L53-L66">events.py:53-66</a>）。</li>
+<li><code>publish</code> 检查每个订阅队列，超过 <code>max_event_buffer</code>（默认 1000）就<strong>清空该队列并塞进一个
+  <code>EventStreamOverflow</code> 异常对象</strong>，附带"我最后交付到第几号"，调用方可以据此重放（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/events.py#L23-L51">:23-51</a>）。
+  已经溢出的队列进入 <code>_overflowed</code> 集合，之后不再往里投递，避免反复清空。
+  溢出只影响这一个订阅者，不影响别的订阅者，也不影响任务本身。
+  这两个容量默认值写在 <code>EventBus.__init__</code>，<code>RuntimeOptions</code> 的值是
+  <code>RuntimeCore.isolate()</code> 里<strong>直接赋值覆盖私有属性</strong>进去的（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/core.py#L120-L122">core.py:120-122</a>）——
+  改 <code>EventBus</code> 字段名要记得同步这里。</li>
+<li>看到终态事件就 return；<code>close()</code> 广播 <code>None</code> 哨兵，且哨兵排在所有已发布事件之后。</li>
+</ul>
+<p><strong>KernelHost（跨线程）</strong></p>
+<p>内核事件不能直接递到应用线程，所以是<strong>逐项拉取</strong>：</p>
+<ul>
+<li>应用侧的 async generator 每次 <code>offline_next()</code> 取不到就向内核线程 <code>submit(stream.pull)</code>，
+  <code>pull</code> 在内核线程 <code>anext</code> 源生成器并做<strong>快照</strong>，然后交给等待方（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/kernel_host.py#L95-L108">kernel_host.py:95-108</a>、<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/kernel_host.py#L363-L386">:363-386</a>）。</li>
+<li>关闭时 <code>_drain_streams</code> 把每个流剩余事件收进<strong>有界缓冲</strong>（<code>max_event_buffer</code>），
+  缓冲没排空就溢出，同样带 watermark（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/kernel_host.py#L110-L133">kernel_host.py:110-133</a>）。
+  这样"内核停了但客户端还没被唤醒"的窗口里的事件不丢。</li>
+</ul>
+<h3 id="h-18">流程 6：SDK 统一任务监听</h3>
+<p><code>add_task_listener</code> 是<strong>注册式</strong>的：只观察本 SDK 实例注册之后提交的任务，不扫历史、
+不收别的 SDK 实例的任务。</p>
+<table class="seq"><tr><th>#</th><th>谁调用谁</th><th>做什么</th></tr><tr><td class="step">1</td><td class="who"><b>App</b><i class="edge-arrow">→</i><b>TaskListener(应用循环)</b></td><td>add_task_listener(on_event,on_done,on_error)</td></tr><tr><td class="step">2</td><td class="who"><b>App</b><i class="edge-arrow">→</i><b>subscribe_task_events</b></td><td>submit_task → track(task.id)</td></tr><tr><td class="step">3</td><td class="who"><b>TaskListener(应用循环)</b><i class="edge-arrow">→</i><b>TaskListener(应用循环)</b></td><td>_track: 建 watcher 协程 + concurrent Future</td></tr><tr class="grp"><td colspan="3"><b>loop</b> 每个事件</td></tr><tr><td class="step">4</td><td class="who">&nbsp;<b>TaskListener(应用循环)</b><i class="edge-arrow">→</i><b>subscribe_task_events</b></td><td>取事件（经 KernelHost 快照）</td></tr><tr><td class="step">5</td><td class="who">&nbsp;<b>TaskListener(应用循环)</b><i class="edge-arrow">→</i><b>CallbackExecutor</b></td><td>同步回调 submit / 异步回调直接 await</td></tr><tr><td class="step">6</td><td class="who">&nbsp;<b>CallbackExecutor</b><i class="edge-arrow">⇢</i><b>App</b></td><td>工作线程 call_soon_threadsafe 投递结果</td></tr><tr><td class="step">7</td><td class="who"><b>TaskListener(应用循环)</b><i class="edge-arrow">→</i><b>TaskListener(应用循环)</b></td><td>见终态 → get_task_status → on_done(task) 恰好一次</td></tr><tr><td class="step">8</td><td class="who"><b>TaskListener(应用循环)</b><i class="edge-arrow">⇢</i><b>App</b></td><td>on_error(task_id, exc) 只结束该任务监听，不改业务状态</td></tr></table>
+<p>要点（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/listeners.py#L30-L222">listeners.py:30-222</a>）：</p>
+<ul>
+<li><strong>每个任务一个协程</strong>，慢回调只拖住那个任务；<code>_track</code> 里对同一 task id 去重，幂等重复提交不会重复通知。</li>
+<li>异步回调留在调用方循环（可协作取消）；<strong>普通函数交给 <code>CallbackExecutor</code></strong>：惰性创建
+  <code>rar-callback-{index}</code> 守护线程，4 个工作线程、64 个排队名额、5 秒排队期限，不可配置
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/callback_executor.py#L49-L51">callback_executor.py:49-51</a>、
+  <a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/callback_executor.py#L84-L86">:84-86</a>）。
+  <code>submit/cancel/close</code> 只在调用方循环上操作 Future 与定时器，工作线程只用
+  <code>call_soon_threadsafe</code> 投递结果——所以它没有 <code>ThreadPoolExecutor</code> 的退出钩子和私有字段依赖。</li>
+<li>队列满 → <code>LISTENER_CALLBACK_QUEUE_FULL</code>，排队过期 → <code>LISTENER_CALLBACK_TIMEOUT</code>；
+  两者都只结束该任务监听，业务任务照跑。<strong>已被线程认领的回调不可打断</strong>：
+  <code>cancel</code> 把它标成 abandoned 并清空 callback/args/result，完成后走 <code>discard_result</code>
+  遗弃（对协程调 <code>close()</code> 并吞掉清理异常，以免杀死工作线程）
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/callback_executor.py#L90-L115">callback_executor.py:90-115</a>、
+  <a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/callback_executor.py#L206-L212">:206-212</a>）。</li>
+<li><code>wait()</code> 只 join 调用时已登记的任务；<code>close()</code> 取消<strong>未被领取</strong>的排队回调，
+  <strong>遗弃在途回调的结果</strong>（不宣称副作用已停止）。所以要看最终回调必须先 <code>wait()</code> 再 <code>close()</code>。</li>
+<li><code>wait()</code> 等的是 <code>concurrent.futures.Future</code> 而非 watcher 协程，这样取消 <code>wait()</code> 不会误取消后台监听。</li>
+</ul>
+<h3 id="h-19">流程 7：远程模式（UDS）</h3>
+<ul>
+<li><strong>一个请求一条连接</strong>：<code>_request</code> 打开 → 写一帧 → 读一帧 → 关闭
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/remote.py#L160-L206">remote.py:160-206</a>）。
+  没有连接池，也没有请求超时；<code>start()</code> 只做一次 <code>health</code>。</li>
+<li><strong>订阅是一条长连接</strong>：客户端发 <code>subscribe_task_events</code>，服务端持续写
+  <code>{type:"event"}</code>，历史放完后发 <code>{type:"done"}</code>。</li>
+<li>服务端检测客户端离开的方式很巧：<code>reader.read(1)</code> 与事件迭代器竞速，
+  读到东西（EOF 或任何字节）就取消订阅并清理（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/server.py#L254-L264">server.py:254-264</a>）。</li>
+<li>帧格式：NDJSON，单条上限 <strong>1 MiB</strong>（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/wire.py#L9-L40">wire.py:9-40</a>）；
+  方法集 <code>health / submit_task / get_task_status / cancel_task / list_skills / subscribe_task_events</code>
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/server.py#L211-L228">server.py:211-228</a>）。</li>
+<li>服务端把 <code>AgentRuntimeError</code> 转成 <code>{ok:false, error:{code,message,details}}</code>
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/server.py#L192-L203">server.py:192-203</a>），
+  客户端统一还原成 <code>RemoteRuntimeError(code=...)</code>（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/remote.py#L243-L257">remote.py:243-257</a>）。
+  <strong>代价</strong>：远程拿不到类型化异常，只能按 <code>code</code> 字符串分支——这是目前"两形态 API 一致"这条
+  承诺上唯一的破口。</li>
+<li>服务端自己也是 <code>KernelHost</code> 的宿主（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/server.py#L26-L35">server.py:26-35</a>），
+  所以远程模式下内核同样独占线程；<code>RemoteRuntime(options=...)</code> 只用到本地 <code>cancel_grace_s</code>。</li>
+</ul>
+<hr />
+<h2 id="s-6">6. 横切机制（四条不能改坏的不变量）</h2>
+<h3 id="s-6-1">6.1 状态唯一写入点：<code>TaskStateStore.transition()</code></h3>
+<p><a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/task_state.py#L95-L133">task_state.py:95-133</a>。
+一次转换固定四步，顺序不可变：</p>
+<pre><code>持该任务的 asyncio.Lock
+  → 深拷贝活任务为快照，套用 changes
+  → apply_transition(快照, 事件)   ← 快照与事件在一次仓储调用里原子写入
+  → adopt_snapshot(活任务, 权威返回值)  ← 用仓储回填的值，不是用自己算的值
+  → 最后才 events.publish(事件)
+</code></pre>
+<p>三个设计后果值得记住：</p>
+<ul>
+<li><strong><code>sequences[task_id]</code> 只在这里 ++</strong>，所以事件序号单调（AGENTS.md 不变量 7）。</li>
+<li><strong>权威值来自仓储</strong>：<code>InMemory</code> 做深拷贝（<code>model_validate_json</code> 往返），
+  <code>SQLite</code> 用 <code>UPDATE</code> 后重新读；因此活对象不会带着一个"内存觉得成功但库里没落"的状态。</li>
+<li><strong>发布在写之后</strong>：订阅者永远不会看到一个库里还不存在的状态。</li>
+</ul>
+<p>所有带 guard 的转换（<code>execution_transition</code> / <code>try_succeed</code> / <code>request_cancel</code>）共用同一把锁，
+所以"取消"和"推进成功"是<strong>公平竞速</strong>，不存在已取消任务又被推进成功的窗口
+（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/task_state.py#L135-L169">task_state.py:135-169</a>）。
+<code>WorkflowExecutor</code> 自身无状态，只做顺序和"恰好一次终态"映射。</p>
+<p>进度上报是<strong>例外路径</strong>：每次 <code>progress(v)</code> 起一个后台 <code>transition</code> 协程，不阻塞技能；
+步骤结束/失败/终态前用 <code>drain_progress</code> 收干，终态后靠 guard 拒绝，
+关闭时靠 <code>_shutting_down</code> 丢弃（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/task_state.py#L180-L216">task_state.py:180-216</a>）。</p>
+<h3 id="s-6-2">6.2 原子持久化：两种实现，同一种语义</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><code>InMemoryTaskRepository</code></th>
+<th><code>SQLiteTaskRepository</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>apply_transition</code></td>
+<td>先记旧值，写失败<strong>手工回滚两份字典</strong>（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/repository.py#L61-L82">repository.py:61-82</a>）</td>
+<td><code>BEGIN</code> + <code>UPDATE tasks</code> + <code>INSERT events</code> + <code>COMMIT</code>，异常 <code>ROLLBACK</code>（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sqlite_repository.py#L174-L215">sqlite_repository.py:174-215</a>）</td>
+</tr>
+<tr>
+<td>表/索引</td>
+<td>—</td>
+<td><code>tasks(id PK, idempotency_key, is_terminal, created_at, payload)</code> + 幂等键<strong>部分唯一索引</strong>；<code>events(event_id, task_id, sequence CHECK&gt;0, payload)</code> + <code>UNIQUE(task_id, sequence)</code>（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sqlite_repository.py#L26-L46">sqlite_repository.py:26-46</a>）</td>
+</tr>
+<tr>
+<td>并发</td>
+<td>单事件循环，无锁</td>
+<td><strong>一条连接 + <code>asyncio.Lock</code> 串行化所有操作</strong>；没设 WAL、没设 busy_timeout</td>
+</tr>
+<tr>
+<td>投影列的意义</td>
+<td>—</td>
+<td><code>is_terminal</code> 让 <code>get_nonterminal_tasks()</code> 不用解 payload；冲突靠唯一约束而不是先查后写</td>
+</tr>
+</tbody>
+</table>
+<p>值得注意：<code>SQLite</code> 没有开 WAL。单连接串行化下这是安全的，但<strong>外部进程直接读同一个库文件</strong>
+时看不到未提交内容，而且写并发全压在这把 Python 锁上。这条限制了"云端管理平面直接读 DB"的设想。</p>
+<h3 id="s-6-3">6.3 边界净化：<code>bounded_snapshot</code></h3>
+<p><a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/boundary.py#L21-L151">boundary.py:21-151</a>。
+所有跨线程数据都过它，两趟：<strong>先只计量不构建</strong>，再构建。</p>
+<ul>
+<li>计费口径是紧凑 JSON 的字节数（含 UTF-8 多字节与转义），默认 1 MiB / 深度 64，超限提前抛
+  <code>SnapshotTooLarge</code>，<strong>不先复制再检查</strong>。</li>
+<li>只用内建遍历（<code>dict.__getitem__</code>、<code>str.__iter__</code>、<code>object.__getattribute__</code>），
+  因此外部对象的 <code>__deepcopy__</code> / <code>__iter__</code> / <code>__repr__</code> <strong>没有机会在内核线程上运行</strong>。</li>
+<li>允许的类型：JSON 标量、<code>list/tuple/set/frozenset/dict</code>、<code>datetime</code>（tzinfo 必须是裸
+  <code>timezone</code>）、以及 7 个规范模型（重建为基类，子类降级成普通容器）。引用环直接拒绝。</li>
+<li>异常也净化：丢弃外部 traceback 与异常链，按类名映射回 <code>errors.py</code> 里的类型，
+  非 <code>AgentRuntimeError</code> 统一压成 <code>InternalError("Extension operation failed")</code>
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/isolation.py#L44-L87">isolation.py:44-87</a>）。</li>
+</ul>
+<p><code>_Port.call</code> 的完整路径值得看一眼（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/isolation.py#L124-L166">isolation.py:124-166</a>）：
+参数先快照 → 提交到该对象的固定线程 → <code>job.wait(port_timeout_s)</code> →
+结果 <code>_unwrap</code>（把 <code>_Failure</code> 还原成本地抛出的干净异常）。
+<strong>写操作</strong>超时后不认账：它 <code>shield</code> 住真实完成的 job，一直等到真实结束或总 deadline，
+因为"超时"不等于"没提交"。</p>
+<h3 id="s-6-4">6.4 请求 / 真实完成分离：<code>LoopJob</code></h3>
+<p><a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/thread_runtime.py#L32-L67">thread_runtime.py:32-67</a>。
+<code>LoopJob</code> 的完成 Future 属于<strong>真实调用</strong>，等待方超时/取消都改不了它：</p>
+<ul>
+<li><code>wait()</code> 内部 <code>wrap_future</code> + <code>shield</code>，所以取消等待方不会取消远端工作。</li>
+<li><code>cancel()</code> <strong>只是请求</strong>：还没开始的工作可以立刻取消；已开始且 <code>cancellable=False</code>
+  （未声明 <code>supports_cancel</code> 的技能）直接忽略请求。</li>
+<li><code>started()</code> / <code>done()</code> / <code>result()</code> 让上层能区分"我放弃等待"和"它真的停了"。</li>
+</ul>
+<p>这条是整个"不谎报停止"语义的地基。所有需要"必须等到真实结束"的地方都是同一个写法：
+<code>while not done: await asyncio.shield(task)</code>（吞掉取消继续等），
+出现在 <a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/isolation.py#L151-L159">isolation.py:151-159</a>、
+<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/isolation.py#L445-L450">:445-450</a>、
+<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/executor.py#L281-L287">executor.py:281-287</a>。
+读代码时看到这种"怪写法"不要顺手改掉——那是防取消穿透的。</p>
+<hr />
+<h2 id="s-7">7. 失败关闭矩阵</h2>
+<p>"读不到机器人不等于机器人可用"这条原则贯穿全部失败路径：</p>
+<table>
+<thead>
+<tr>
+<th>失败点</th>
+<th>上报</th>
+<th>对当前任务</th>
+<th>对后续</th>
+<th>是否永久</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>unsatisfied()</code> 抛错/超时</td>
+<td><code>INTERNAL_ERROR</code></td>
+<td>提交失败</td>
+<td>无</td>
+<td>否</td>
+</tr>
+<tr>
+<td><code>reconcile()</code> 抛错/不确定/超时</td>
+<td><code>RECONCILIATION_REQUIRED</code></td>
+<td>落待对账</td>
+<td>无</td>
+<td>否</td>
+</tr>
+<tr>
+<td>仓储任一操作超时</td>
+<td><code>EXTENSION_TIMEOUT</code></td>
+<td>终态可能没落盘</td>
+<td>该仓储拒绝一切后续操作</td>
+<td><strong>是</strong></td>
+</tr>
+<tr>
+<td>技能执行超时且未确认停止</td>
+<td><code>EXECUTION_UNRESPONSIVE</code></td>
+<td><code>RECONCILIATION_REQUIRED</code></td>
+<td>该技能实例 + 其资源隔离</td>
+<td><strong>是</strong></td>
+</tr>
+<tr>
+<td>技能吞掉取消</td>
+<td>同上</td>
+<td>同上</td>
+<td>同上</td>
+<td><strong>是</strong></td>
+</tr>
+<tr>
+<td>技能返回非法值/超预算快照</td>
+<td><code>INTERNAL_ERROR</code> / <code>SNAPSHOT_TOO_LARGE</code></td>
+<td>失败</td>
+<td>无（实例保留线程）</td>
+<td>否</td>
+</tr>
+<tr>
+<td>端口线程名额耗尽</td>
+<td><code>EXTENSION_CAPACITY_EXCEEDED</code></td>
+<td>拒绝</td>
+<td>需腾出容量</td>
+<td>否</td>
+</tr>
+<tr>
+<td>事件订阅队列溢出</td>
+<td><code>EVENT_STREAM_OVERFLOW</code>（带 watermark）</td>
+<td>不影响</td>
+<td>调用方按序号重放</td>
+<td>否</td>
+</tr>
+<tr>
+<td>同步监听队列满/排队过期</td>
+<td><code>LISTENER_CALLBACK_QUEUE_FULL</code> / <code>_TIMEOUT</code></td>
+<td>不影响业务任务</td>
+<td>该任务监听结束</td>
+<td>否</td>
+</tr>
+<tr>
+<td>适配器停止未确认（CC API）</td>
+<td><code>ROBOT_STOP_UNCONFIRMED</code> → <code>EXECUTION_UNRESPONSIVE</code></td>
+<td><code>RECONCILIATION_REQUIRED</code></td>
+<td><code>speaker</code> 资源隔离</td>
+<td><strong>是</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>唯一的恢复出口是重启进程</strong>（重启后再走流程 1 的对账）。当前既没有诊断 API，也没有
+"人工确认硬件已停"后的显式解除入口——这是已知的最大运维缺口。</p>
+<hr />
+<h2 id="s-8">8. 配置：<code>RuntimeOptions</code></h2>
+<p>10 个字段，全部构造期校验（拒绝 <code>bool</code>、非有限、非正数）
+（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/options.py#L7-L39">options.py:7-39</a>）：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>默认</th>
+<th>管什么</th>
+<th>设小了会怎样</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>port_timeout_s</code></td>
+<td>5.0</td>
+<td>任一端口的<strong>单次</strong>操作期限</td>
+<td>慢一点的磁盘/网络就触发毒化</td>
+</tr>
+<tr>
+<td><code>cancel_grace_s</code></td>
+<td>0.2</td>
+<td>停止确认窗口；技能/监听清理都用它</td>
+<td>真实硬件停稳慢 → 大量误判待对账 + 隔离</td>
+</tr>
+<tr>
+<td><code>max_extension_threads</code></td>
+<td>32</td>
+<td>外部对象数 + 1 的上限</td>
+<td>技能装不下，构造期就失败</td>
+</tr>
+<tr>
+<td><code>max_pending_calls</code></td>
+<td>256</td>
+<td>普通请求并发</td>
+<td>正常提交被 <code>EXTENSION_CAPACITY_EXCEEDED</code></td>
+</tr>
+<tr>
+<td><code>max_control_calls</code></td>
+<td>16</td>
+<td>查询/取消/生命周期并发</td>
+<td>查状态会失败</td>
+</tr>
+<tr>
+<td><code>max_subscriptions</code></td>
+<td>256</td>
+<td>同时活动的事件订阅</td>
+<td>订阅报错</td>
+</tr>
+<tr>
+<td><code>max_snapshot_bytes</code></td>
+<td>1 MiB</td>
+<td>单个跨边界值</td>
+<td>大输出/大参数直接 <code>SNAPSHOT_TOO_LARGE</code></td>
+</tr>
+<tr>
+<td><code>max_snapshot_depth</code></td>
+<td>64</td>
+<td>嵌套深度</td>
+<td>深层结构被拒</td>
+</tr>
+<tr>
+<td><code>event_page_size</code></td>
+<td>128</td>
+<td>历史回放每页</td>
+<td>只是往返次数变多</td>
+</tr>
+<tr>
+<td><code>max_event_buffer</code></td>
+<td>1000</td>
+<td>实时队列 + 关闭缓冲</td>
+<td>慢订阅者更容易溢出</td>
+</tr>
+</tbody>
+</table>
+<p><code>cancel_grace_s</code> 与 <code>port_timeout_s</code> 是两个<strong>语义上属于每个端口/每个技能</strong>的值，现在被做成全局，
+这是配置模型里最别扭的地方（导航要 2s，TTS 只要 0.05s）。</p>
+<hr />
+<h2 id="s-9">9. 适配器层现状</h2>
+<p><code>adapters/</code> 是 <code>ports.py</code> 的两组参考实现，也是<strong>唯一</strong>内核之外的领域知识所在地。</p>
+<h3 id="h-28"><code>simulator.py</code>（无硬件自测）</h3>
+<ul>
+<li><code>SimulatedSkill</code> 为基类，<code>Simulator</code> 注册四个技能（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/simulator.py#L350-L373">simulator.py:350-373</a>），
+  共享同一个 <code>state</code> 字典（<code>position</code> / <code>last_message</code> / <code>navigation_count</code> / <code>speech_count</code>）：</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>技能名</th>
+<th>resources</th>
+<th>permissions</th>
+<th>preconditions</th>
+<th>supports_cancel</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>navigation.navigate_to</code></td>
+<td><code>{base}</code></td>
+<td><code>{navigation}</code></td>
+<td><code>{estop.clear, battery.sufficient}</code></td>
+<td>True</td>
+</tr>
+<tr>
+<td><code>audio.speak</code></td>
+<td><code>{speaker}</code></td>
+<td><code>{audio}</code></td>
+<td>空</td>
+<td>True</td>
+</tr>
+<tr>
+<td><code>robot.get_state</code></td>
+<td>空</td>
+<td>空</td>
+<td>空</td>
+<td><strong>False</strong></td>
+</tr>
+<tr>
+<td><code>wait.delay</code></td>
+<td>空</td>
+<td>空</td>
+<td>空</td>
+<td>True</td>
+</tr>
+</tbody>
+</table>
+<p><code>timeout_s</code> 一律用默认 30；取消用 <code>asyncio.wait</code> 与 <code>cancel_event</code> 竞速
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/simulator.py#L65-L83">simulator.py:65-83</a>）。
+  故障注入靠 <code>Simulator(fail_skills={...})</code> 让指定技能抛 <code>SkillExecutionError</code>，
+  技能对象自带 <code>calls / active / max_active</code> 计数供断言（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/simulator.py#L33-L49">:33-49</a>）。
+- <code>SimulatorReconciler</code>：查预置的 <code>{task_id: TaskState}</code> 表给权威终态，用来测流程 1（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/simulator.py#L186-L191">:186-191</a>）。
+- 两个状态源，区别是标签从哪来（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/simulator.py#L194-L348">:194-348</a>）：
+  <code>SimulatedRobotState</code> 由测试直接 <code>set_unsatisfied({...})</code>（精确控时序）；
+  <code>SimulatedRobot</code> 从电压/急停<strong>推导</strong>标签（<code>set_estop</code> / <code>set_voltage</code> / <code>drain</code>），
+  并额外做真实适配器必须做的两件事——
+  <strong>滞环</strong>：<code>battery.sufficient</code> 已破时恢复阈值改用 <code>recovery_voltage</code>(23.5)，未破时用
+  <code>low_voltage</code>(22.5)，构造期就校验 <code>low &lt; recovery</code>（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/simulator.py#L290-L291">:290-291</a>、
+  <a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/simulator.py#L339-L347">:339-347</a>）；
+  <strong>无变化不推送</strong>：<code>_refresh</code> 只在推导集合与当前集合不同时才 <code>_publish</code>
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/simulator.py#L334-L337">:334-337</a>），
+  否则一个 10 Hz 传感器会每秒唤醒内核 10 次重算同一个答案。
+- <code>__main__.py</code> 的 <code>serve</code> 是 <code>Simulator().skills</code> + <code>SQLiteTaskRepository</code> + <code>RuntimeServer</code>
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/__main__.py#L31-L38"><strong>main</strong>.py:31-38</a>）。</p>
+<h3 id="h-29"><code>cc_api.py</code>（真实硬件，第一个厂商适配）</h3>
+<ul>
+<li><code>CcApiSpeechSkill</code> 实现 <code>audio.speak</code>：<code>resources={"speaker"}</code>、<code>permissions={"audio"}</code>、
+  <code>preconditions=set()</code>、<code>timeout_s=30</code>、<code>supports_cancel=True</code>（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api.py#L60-L74">cc_api.py:60-74</a>）。
+  <strong>注意它故意不声明任何电量前置条件</strong>——AGENTS.md 不变量 5。</li>
+<li>端到端机制（值得单独读一遍，它是"回调式厂商 SDK 怎么变成 async 技能"的模板）：
+  <code>start()</code> 注册 <code>add_service("cc.api.work.finished")</code> + <code>notify("cc.api.work.subscribe")</code>
+  并记下<strong>当时的应用循环</strong>为 <code>_loop</code>（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api.py#L86-L104">cc_api.py:86-104</a>）；
+  每次播报发 <code>cc.api.work.start</code>（<code>skillCode="A000001"</code>，<code>speed/volume=50</code>，独立 <code>traceId</code>），
+  启动回调回填 <code>workId</code>，缺失即置 <code>_broken</code> 并抛 <code>RobotResponseError</code>
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api.py#L305-L318">:305-318</a>）；
+  <code>finished</code> 回调在厂商线程触发，先 marshal 回 <code>_loop</code>，按 <code>workId</code> 匹配才结算，
+  <strong>finished 早于启动回调到达</strong>时缓存进 <code>early_finished</code>（上限 128）等 <code>_launch</code> 回放
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api.py#L396-L411">:396-411</a>）；
+  取消/超时/关闭走 <code>_stop_work</code>：发 <code>cc.api.work.ctrl {workCtrl:"stop"}</code> 后
+  <strong>继续等 <code>finished</code></strong>，自身带 5 秒 <code>stop_timeout_s</code>，超时/异常置 <code>_broken</code> 并抛
+  <code>RobotStopError</code>（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api.py#L320-L342">:320-342</a>）；
+  断连时 <code>_abort</code> 给所有在途 future 注入 <code>RobotConnectionError</code>，此后实例拒绝再用
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api.py#L413-L420">:413-420</a>）。</li>
+<li><strong>它不感知隔离层</strong>：只比较"当前循环是不是 <code>_loop</code>"，不同就走 <code>_execute_on_owner</code>——
+  用 <code>concurrent.futures.Future</code> 交接、<code>deepcopy(params)</code> 跨循环、<code>call_soon_threadsafe</code>
+  在 owner 循环建 task、<code>asyncio.wrap_future</code> 包回工作线程，并转发取消信号
+  （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api.py#L140-L227">cc_api.py:140-227</a>）。
+  也就是说适配器<strong>自己实现了第二套线程桥</strong>，与 <code>isolation.py</code> 无关——这是回调型 SDK 的必要条件
+  （厂商回调只能回到它自己的循环），但也意味着新增回调型适配器要重复这段代码，
+  值得以后抽公共基类。</li>
+<li>内核只等 <code>cancel_grace_s</code>（默认 0.2 秒），适配器自己的清理期限是 5 秒，
+  所以<strong>内核通常先判待对账</strong>，此时 <code>speaker</code> 资源保持隔离；应用必须先确认旧播报已停，
+  再建新连接和新实例（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/README.md#L335-L340">README.md:335-340</a>）。</li>
+<li>不调用 <code>cc_api/</code> 里带阻塞等待的 <code>RobotClient</code>；SDK 连接生命周期归应用，适配器独占
+  <code>finished</code> 与 <code>disconnect</code> 回调，不允许别人在同一个 <code>Api</code> 实例上覆盖处理器。</li>
+</ul>
+<h3 id="h-30">新增适配器的检查清单</h3>
+<ol>
+<li>实现 <code>ports.py</code> 的 Protocol，<strong>不继承、不注册</strong>，结构匹配即可。</li>
+<li>显式声明完整 <code>SkillDefinition</code>（7 个字段），技能内部不做自己的校验/超时/取消。</li>
+<li>不配合取消就老实写 <code>supports_cancel=False</code>；确认不了停止时抛 <code>RobotStopError</code> 而不是
+   假装 <code>TaskCancelled</code>。</li>
+<li>输入输出必须能表示成 JSON；大负载要评估 <code>max_snapshot_bytes</code>。</li>
+<li>若内部有第三方线程的回调，一律 <code>call_soon_threadsafe</code> 转回自己的循环。</li>
+<li>在 <code>test_contracts.py</code> 加契约测试。</li>
+</ol>
+<hr />
+<h2 id="s-10">10. 验证体系</h2>
+<table>
+<thead>
+<tr>
+<th>手段</th>
+<th>命令</th>
+<th>覆盖</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>容器完整套件</strong>（主力）</td>
+<td><code>docker start robot_core_ubuntu24</code> 然后 <code>python3 -m pytest -q</code></td>
+<td>全部，含 SQLite 与 fixture 用例。2026-11-03 基线：<strong>332 passed</strong>，普通模式与 <code>PYTHONASYNCIODEBUG=1 -W error</code> 各一轮</td>
+</tr>
+<tr>
+<td>宿主离线回归</td>
+<td><code>PYTHONPATH=.verify:src python3.13 .verify/sweep.py</code></td>
+<td>免 fixture 用例；基线 95 passed / 2 failed(aiosqlite 被 stub) / 42 skipped</td>
+</tr>
+<tr>
+<td>语法体检</td>
+<td><code>python3.13 -m compileall -q src/robot_agent_runtime</code></td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p><code>.verify/</code> 只是宿主环境（pip 装不上、<code>/tmp</code> 不可写、<code>python3</code> 是 3.9.6）的变通，
+<strong>不属于发布包，<code>src/</code> 不许 import 它</strong>。</p>
+<p>测试按关注点分文件，不往 <code>test_core.py</code> 堆（AGENTS.md 测试约定）：
+契约 <code>test_models</code>、执行 <code>test_core</code>、故障 <code>test_faults</code>、重启 <code>test_recovery</code>、
+前置条件 <code>test_preconditions</code>、持久化 <code>test_sqlite_repository</code>、
+接入形态 <code>test_embedded_sdk</code> / <code>test_remote_sdk</code>、适配器复用 <code>test_contracts</code>、
+CC 语音 <code>test_cc_api</code>(528)、监听 <code>test_task_listeners</code>(968)、回调线程 <code>test_callback_executor</code>(263)、
+分页 <code>test_event_paging</code>(58)、线程隔离 <code>test_thread_runtime</code>(641) / <code>test_isolation</code>(1163) /
+<code>test_kernel_host</code>(667) / <code>test_execution_boundaries</code>(386) / <code>test_runtime_isolation</code>(193)。
+合计 9304 行，比内核实现（5815 行）还多——这个比例是刻意的：<strong>隔离语义只能靠故障注入来钉住</strong>。</p>
+<p>新测试尽量免 fixture（<code>tmp_path</code> / <code>monkeypatch</code> / <code>parametrize</code> 在宿主只能 skip），
+新增测试文件要加进 <code>.verify/sweep.py</code> 的 <code>FILES</code>。</p>
+<hr />
+<h2 id="s-11">11. 已知缺口</h2>
+<p>按"会不会咬人"排：</p>
+<ol>
+<li><strong>运维出口缺失</strong>。毒化与隔离永久，但没有诊断 API、没有人工解除入口，唯一办法是重启进程，
+   而"重启"在机器人上等于整机中断。这是第 7 节那张表的最后一列一直在说的代价。</li>
+<li><strong><code>cancel_grace_s</code> / <code>port_timeout_s</code> 全局化</strong>。应当是端口/技能级声明，误配一次的后果永久。</li>
+<li><strong>远程模式错误降级</strong>为字符串 code，两形态在失败路径上不同构。</li>
+<li><strong>边界约束的报错不可读</strong>。越界值 → <code>INTERNAL_ERROR("Extension returned an invalid snapshot")</code>，
+   真实原因被刻意丢弃；<code>SkillResult.output</code> 声明是 <code>dict[str, Any]</code>，看起来什么都能放。</li>
+<li><strong>内核线程上的快照遍历</strong>：<code>invoke()</code> 与 <code>pull()</code> 的结果快照在内核循环执行，两趟遍历。
+   有界，但并发大时是毫秒级排队（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/kernel_host.py#L333-L334">kernel_host.py:333-334</a>、
+   <a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/kernel_host.py#L105">:105</a>）。</li>
+<li><strong>宿主直接摸私有</strong>：<code>embedded.py:62</code> / <code>server.py:99</code> 调 <code>host._begin_close()</code>，
+   <code>kernel_host.py:258</code> 反向写 <code>core._event_drainer</code>。三层因此耦合，改动风险集中。</li>
+<li><strong>调度器</strong>：<code>priority</code> 已持久化但不排序，无并发上限、无抢占。
+   <strong>Agent 集成层</strong>（计划生成/重规划）、<strong>有限重试</strong>、<strong>结构化日志</strong>、<strong>其他真实能力适配</strong>
+   （导航/ROS 2）、<strong>CC API 结束原因解析与重启对账</strong>、<strong>云端管理平面</strong>均未做。</li>
+<li><strong>GIL 与原生代码不设防</strong>（明确排除）。厂商扩展长时间持 GIL、进程退出钩子、
+   系统资源耗尽仍会影响整个进程；已运行的线程不能强杀。真要防这一层只有子进程。</li>
+</ol>
+<hr />
+<h2 id="s-12">12. 建议阅读路线</h2>
+<p>想快速建立整体感，按这个顺序读，每步只需几分钟：</p>
+<ol>
+<li><a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/models.py">models.py</a> —— 116 行，读完就知道系统里流动的到底是什么。</li>
+<li><a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/ports.py">ports.py</a> —— 每个 Protocol 的 docstring 是本项目的契约总纲，
+   比其他任何文档都精确。</li>
+<li><a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/task_state.py#L95-L133">task_state.py:95-133</a> —— <code>transition()</code>，全系统唯一的状态写入点。
+   读懂它，状态机、序号、持久化原子性、事件顺序一次全通。</li>
+<li><a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/core.py#L316-L397">core.py:316-397</a> —— 提交准入，看总期限和失败路径怎么串。</li>
+<li><a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/executor.py#L49-L224">executor.py:49-224</a> —— 步骤编排，重点看"锁 → 前置条件 →
+   <code>SKILL_STARTED</code>"的顺序和异常映射。</li>
+<li><a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/executor.py#L289-L335">executor.py:289-335</a> —— 停止确认，本项目语义最难的一段。</li>
+<li><a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/events.py">events.py</a> —— watermark 去重与溢出。</li>
+<li><a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/thread_runtime.py">thread_runtime.py</a> + <a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/isolation.py">isolation.py</a> —— 线程边界，
+   先看 <code>LoopJob</code> 的"请求取消 ≠ 真实完成"，再看 <code>_Port.call</code> 和 <code>_Skill.execute</code>。</li>
+<li><a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/kernel_host.py">kernel_host.py</a> —— 宿主侧：容量分档、事件跨线程、有序关闭。</li>
+<li><a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/core.py#L154-L256">core.py:154-256</a> + <a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/recovery.py">recovery.py</a> —— 重启恢复与状态源打断。</li>
+<li><a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/listeners.py">sdk/listeners.py</a> + <a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/server.py#L237-L287">server.py:237-287</a> —— 两个接入面。</li>
+</ol>
+<p>跑一遍 <code>examples/embedded_demo.py</code>、<code>examples/precondition_demo.py</code>、<code>examples/remote_demo.py</code>
+（容器内），比读十页文档有用。</p>
+</div>
+</body>
+</html>

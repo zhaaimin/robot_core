@@ -56,9 +56,8 @@ class TaskStateStore:
         self.task_locks[task_id] = asyncio.Lock()
         self.sequences[task_id] = 0
         try:
-            events = await self._repository.list_events(task_id)
-            if events:
-                self.sequences[task_id] = max(event.sequence for event in events)
+            async for event in self._events.history(task_id):
+                self.sequences[task_id] = event.sequence
             yield
         finally:
             self.task_locks.pop(task_id, None)
@@ -184,7 +183,7 @@ class TaskStateStore:
                 return
             task = self.tasks.get(task_id)
             progress_group = self.progress_tasks.get(task_id)
-            if task is None or progress_group is None:
+            if task is None or progress_group is None or task.state.is_terminal:
                 return
             progress_task = asyncio.create_task(
                 self.transition(
@@ -195,6 +194,7 @@ class TaskStateStore:
                         "skill": task.steps[step - 1].skill,
                         "progress": progress,
                     },
+                    guard=lambda current: not current.state.is_terminal,
                 )
             )
             progress_group.add(progress_task)

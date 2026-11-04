@@ -259,6 +259,25 @@ class SQLiteTaskRepository:
                     await cursor.close()
             return [Event.model_validate_json(row["payload"]) for row in rows]
 
+    async def list_events_page(
+        self, task_id: str, after_sequence: int = 0, limit: int = 128,
+    ) -> list[Event]:
+        if type(limit) is not int or limit <= 0:
+            raise InvalidRequest("Event page limit must be a positive integer")
+        async with self._operation_lock:
+            connection = self._require_connection()
+            cursor: aiosqlite.Cursor | None = None
+            try:
+                cursor = await connection.execute(
+                    "SELECT payload FROM events WHERE task_id = ? AND sequence > ? "
+                    "ORDER BY sequence ASC LIMIT ?", (task_id, after_sequence, limit),
+                )
+                rows = await cursor.fetchall()
+            finally:
+                if cursor is not None:
+                    await cursor.close()
+            return [Event.model_validate_json(row["payload"]) for row in rows]
+
     async def get_nonterminal_tasks(self) -> list[Task]:
         async with self._operation_lock:
             connection = self._require_connection()

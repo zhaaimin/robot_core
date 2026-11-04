@@ -122,13 +122,13 @@ async def test_cc_api_start_rejection_preserves_vendor_error_and_allows_retry() 
 
 
 async def test_cc_api_missing_work_id_fails_and_blocks_more_speech() -> None:
-    from robot_agent_runtime.errors import RobotConnectionError, RobotResponseError
+    from robot_agent_runtime.errors import RobotConnectionError, RobotStopError
 
     async with running_skill() as (api, skill):
         execution = asyncio.create_task(skill.execute(make_context(), {"message": "hello"}))
         _, _, respond = await api.next_request()
         respond(Response(result={}))
-        with pytest.raises(RobotResponseError):
+        with pytest.raises(RobotStopError):
             await execution
         with pytest.raises(RobotConnectionError):
             await skill.execute(make_context(), {"message": "again"})
@@ -175,6 +175,7 @@ async def test_cc_api_cancel_during_launch_stops_late_started_work() -> None:
 
 
 async def test_cc_api_coroutine_cancellation_stops_before_propagating() -> None:
+    from robot_agent_runtime.errors import TaskCancelled
     async with running_skill() as (api, skill):
         execution = asyncio.create_task(skill.execute(make_context(), {"message": "hello"}))
         _, _, respond = await api.next_request()
@@ -186,7 +187,7 @@ async def test_cc_api_coroutine_cancellation_stops_before_propagating() -> None:
         await checkpoint()
         assert not execution.done()
         api.finish("timeout")
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(TaskCancelled):
             await asyncio.wait_for(execution, 1)
 
 
@@ -208,14 +209,14 @@ async def test_cc_api_unconfirmed_stop_fails_and_blocks_new_speech() -> None:
 
 
 async def test_cc_api_disconnect_fails_active_speech() -> None:
-    from robot_agent_runtime.errors import RobotConnectionError
+    from robot_agent_runtime.errors import RobotStopError
 
     async with running_skill() as (api, skill):
         execution = asyncio.create_task(skill.execute(make_context(), {"message": "hello"}))
         _, _, respond = await api.next_request()
         respond(Response(result={"workId": "lost"}))
         api.disconnect()
-        with pytest.raises(RobotConnectionError):
+        with pytest.raises(RobotStopError):
             await asyncio.wait_for(execution, 1)
 
 
@@ -338,19 +339,70 @@ async def test_cc_api_close_stops_active_work_before_unsubscribing() -> None:
         respond_stop(Response())
         api.finish("closing")
         await asyncio.wait_for(closing, 1)
-        assert execution.cancelled()
+        from robot_agent_runtime.errors import TaskCancelled
+        with pytest.raises(TaskCancelled):
+            await execution
         assert "cc.api.work.unsubscribe" in api.notifications
 
 
+async def test_cc_api_close_propagates_unconfirmed_stop_after_detaching() -> None:
+    from robot_agent_runtime.adapters.cc_api import CcApiSpeechSkill
+    from robot_agent_runtime.errors import RobotStopError
+
+    api = FakeApi()
+    skill = CcApiSpeechSkill(api, stop_timeout_s=0.01)
+    await skill.start()
+    execution = asyncio.create_task(skill.execute(make_context(), {"message": "hello"}))
+    _, _, respond = await api.next_request()
+    respond(Response(result={"workId": "uncertain-close"}))
+    closing = asyncio.create_task(skill.close())
+    _, _, respond_stop = await api.next_request()
+    respond_stop(Response())
+    with pytest.raises(RobotStopError):
+        await asyncio.wait_for(closing, 1)
+    with pytest.raises(RobotStopError):
+        await execution
+    assert "cc.api.work.unsubscribe" in api.notifications
+    assert not api.services
+
+
+async def test_cc_api_close_aggregates_stop_and_detach_errors() -> None:
+    from robot_agent_runtime.adapters.cc_api import CcApiSpeechSkill
+    from robot_agent_runtime.errors import RobotConnectionError, RobotStopError
+
+    class DetachFailure(FakeApi):
+        def notify(self, method: str) -> None:
+            if method == "cc.api.work.unsubscribe":
+                raise ValueError("Transport unavailable")
+            super().notify(method)
+
+    api = DetachFailure()
+    skill = CcApiSpeechSkill(api, stop_timeout_s=0.01)
+    await skill.start()
+    execution = asyncio.create_task(skill.execute(make_context(), {"message": "hello"}))
+    _, _, respond = await api.next_request()
+    respond(Response(result={"workId": "uncertain-detach"}))
+    closing = asyncio.create_task(skill.close())
+    _, _, respond_stop = await api.next_request()
+    respond_stop(Response())
+    with pytest.raises(ExceptionGroup) as caught:
+        await asyncio.wait_for(closing, 1)
+    assert any(isinstance(error, RobotStopError) for error in caught.value.exceptions)
+    assert any(isinstance(error, RobotConnectionError) for error in caught.value.exceptions)
+    with pytest.raises(RobotStopError):
+        await execution
+    assert not api.services
+
+
 async def test_cc_api_early_event_overflow_fails_closed() -> None:
-    from robot_agent_runtime.errors import RobotConnectionError, RobotResponseError
+    from robot_agent_runtime.errors import RobotConnectionError, RobotStopError
 
     async with running_skill() as (api, skill):
         execution = asyncio.create_task(skill.execute(make_context(), {"message": "hello"}))
         await api.next_request()
         for index in range(129):
             api.finish(str(index))
-        with pytest.raises(RobotResponseError):
+        with pytest.raises(RobotStopError):
             await asyncio.wait_for(execution, 1)
         with pytest.raises(RobotConnectionError):
             await skill.execute(make_context(), {"message": "again"})
@@ -427,3 +479,50 @@ async def test_speech_demo_returns_validation_failure_without_dispatch() -> None
     assert final.error.code == "SCHEMA_VALIDATION_FAILED"
     assert api.requests.empty()
     assert not api.services
+
+
+async def test_cc_api_disconnect_quarantines_speaker_for_another_skill() -> None:
+    from robot_agent_runtime.models import SkillDefinition, SkillResult
+
+    class OtherSpeakerSkill:
+        definition = SkillDefinition(
+            name="audio.other", version="1", input_schema={"type": "object"},
+            resources={"speaker"}, permissions=set(), preconditions=set(),
+            timeout_s=1, supports_cancel=True,
+        )
+        calls = 0
+
+        async def execute(self, context: SkillContext, params: dict[str, Any]) -> SkillResult:
+            self.calls += 1
+            return SkillResult(success=True)
+
+    async with running_skill() as (api, skill):
+        other = OtherSpeakerSkill()
+        runtime = RobotRuntime(InMemoryTaskRepository(), {
+            "audio.speak": skill, "audio.other": other,
+        })
+        await runtime.start()
+        try:
+            first = await runtime.submit_task(TaskRequest(task_type="speech", steps=[
+                SkillCall(skill="audio.speak", params={"message": "lost connection"}),
+            ]))
+            _, _, respond = await api.next_request()
+            respond(Response(result={"workId": "still-speaking"}))
+            api.disconnect()
+            async with asyncio.timeout(1):
+                async for _ in runtime.subscribe_task_events(first.id):
+                    pass
+            first_final = await runtime.get_task_status(first.id)
+            assert first_final.state == TaskState.RECONCILIATION_REQUIRED
+            second = await runtime.submit_task(TaskRequest(task_type="other", steps=[
+                SkillCall(skill="audio.other"),
+            ]))
+            async with asyncio.timeout(1):
+                async for _ in runtime.subscribe_task_events(second.id):
+                    pass
+            second_final = await runtime.get_task_status(second.id)
+            assert second_final.error is not None
+            assert second_final.error.code == "RESOURCE_QUARANTINED"
+            assert other.calls == 0
+        finally:
+            await runtime.close()

@@ -184,12 +184,14 @@ class PausedReplayRepository(InMemoryTaskRepository):
         self.release_replay = asyncio.Event()
         self.pause_next_replay = True
 
-    async def list_events(self, task_id: str, after_sequence: int = 0) -> list[Event]:
+    async def list_events_page(
+        self, task_id: str, after_sequence: int = 0, limit: int = 128,
+    ) -> list[Event]:
         if self.pause_next_replay:
             self.pause_next_replay = False
             self.replay_started.set()
             await self.release_replay.wait()
-        return await super().list_events(task_id, after_sequence)
+        return await super().list_events_page(task_id, after_sequence, limit)
 
 
 async def test_event_subscription_replays_then_streams_without_gaps_or_duplicates() -> None:

@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
@@ -50,6 +51,8 @@ class SimulatedSkill:
             if context.progress is not None:
                 context.progress(1.0)
             return SkillResult(success=True, output=output)
+        except asyncio.CancelledError:
+            raise TaskCancelled("Simulation stopped before returning") from None
         finally:
             self.active -= 1
 
@@ -198,24 +201,42 @@ class _LabelSource:
 
     def __init__(self, unsatisfied: frozenset[str]) -> None:
         self._unsatisfied = unsatisfied
-        self._watchers: list[asyncio.Queue[frozenset[str]]] = []
+        self._watchers: list[tuple[asyncio.AbstractEventLoop, asyncio.Queue[frozenset[str]]]] = []
+        self._watchers_lock = threading.Lock()
 
     async def unsatisfied(self) -> frozenset[str]:
         return self._unsatisfied
 
     async def watch(self) -> AsyncIterator[frozenset[str]]:
         queue: asyncio.Queue[frozenset[str]] = asyncio.Queue()
-        self._watchers.append(queue)
+        watcher = (asyncio.get_running_loop(), queue)
+        with self._watchers_lock:
+            self._watchers.append(watcher)
         try:
             while True:
                 yield await queue.get()
         finally:
-            self._watchers.remove(queue)
+            with self._watchers_lock:
+                self._watchers.remove(watcher)
 
     def _publish(self, unsatisfied: frozenset[str]) -> None:
-        self._unsatisfied = unsatisfied
-        for queue in self._watchers:
-            queue.put_nowait(unsatisfied)
+        with self._watchers_lock:
+            if unsatisfied == self._unsatisfied:
+                return
+            self._unsatisfied = unsatisfied
+            watchers = tuple(self._watchers)
+        for loop, queue in watchers:
+            try:
+                current = asyncio.get_running_loop()
+            except RuntimeError:
+                current = None
+            if current is loop:
+                queue.put_nowait(unsatisfied)
+            elif not loop.is_closed():
+                try:
+                    loop.call_soon_threadsafe(queue.put_nowait, unsatisfied)
+                except RuntimeError:
+                    pass
 
 
 class SimulatedRobotState(_LabelSource):

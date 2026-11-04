@@ -9,7 +9,9 @@ from pydantic import ValidationError
 
 from robot_agent_runtime.core import RuntimeCore
 from robot_agent_runtime.errors import AgentRuntimeError, InvalidRequest
+from robot_agent_runtime.kernel_host import KernelHost
 from robot_agent_runtime.models import TaskRequest
+from robot_agent_runtime.options import RuntimeOptions
 from robot_agent_runtime.wire import (
     MAX_MESSAGE_BYTES,
     SERVICE_NAME,
@@ -21,8 +23,12 @@ from robot_agent_runtime.wire import (
 
 
 class RuntimeServer:
-    def __init__(self, core: RuntimeCore, socket_path: str) -> None:
+    def __init__(
+        self, core: RuntimeCore, socket_path: str, *, options: RuntimeOptions | None = None
+    ) -> None:
         self._core = core
+        self._options = options or RuntimeOptions()
+        self._host = KernelHost(core, self._options)
         self._socket_path = socket_path
         self._server: asyncio.Server | None = None
         self._handlers: set[asyncio.Task[None]] = set()
@@ -45,7 +51,7 @@ class RuntimeServer:
                 if not stat.S_ISSOCK(mode):
                     raise RuntimeError(f"Socket path exists and is not a socket: {self._socket_path}")
                 raise OSError(f"Socket path already exists: {self._socket_path}")
-            await self._core.start()
+            await self._host.start()
             self._core_started = True
             server: asyncio.Server | None = None
             try:
@@ -67,12 +73,13 @@ class RuntimeServer:
                 self._remove_owned_socket()
                 if self._core_started:
                     with suppress(Exception):
-                        await self._core.close()
+                        await self._host.close()
                     self._core_started = False
                 raise
             self._server = server
 
     async def close(self) -> None:
+        self._closing = True
         async with self._close_lock:
             if self._close_task is None:
                 self._close_task = asyncio.create_task(self._close_impl())
@@ -89,18 +96,31 @@ class RuntimeServer:
         try:
             if server is not None:
                 server.close()
+            await self._host._begin_close()
             handlers = list(self._handlers)
             for handler in handlers:
                 handler.cancel()
-            await asyncio.gather(*handlers, return_exceptions=True)
+            if handlers:
+                _, pending = await asyncio.wait(
+                    handlers, timeout=self._options.cancel_grace_s,
+                )
+                for handler in handlers:
+                    if handler in pending:
+                        handler.add_done_callback(self._consume_handler)
+                    else:
+                        self._consume_handler(handler)
             if server is not None:
                 await server.wait_closed()
-            if self._core_started:
-                await self._core.close()
-                self._core_started = False
+            await self._host.close()
+            self._core_started = False
         finally:
             self._remove_owned_socket()
             self._closed = True
+
+    @staticmethod
+    def _consume_handler(handler: asyncio.Task[None]) -> None:
+        if not handler.cancelled():
+            handler.exception()
 
     def _assert_owned_socket(self) -> None:
         socket_stat = os.lstat(self._socket_path)
@@ -195,15 +215,15 @@ class RuntimeServer:
             if "request" not in params:
                 raise InvalidRequest("Missing required parameter: request")
             request = TaskRequest.model_validate(params["request"])
-            return (await self._core.submit_task(request)).model_dump(mode="json")
+            return (await self._host.call("submit_task", request)).model_dump(mode="json")
         if method == "get_task_status":
-            task = await self._core.get_task_status(self._task_id(params))
+            task = await self._host.call("get_task_status", self._task_id(params))
             return task.model_dump(mode="json")
         if method == "cancel_task":
-            task = await self._core.cancel_task(self._task_id(params))
+            task = await self._host.call("cancel_task", self._task_id(params))
             return task.model_dump(mode="json")
         if method == "list_skills":
-            skills = await self._core.list_skills()
+            skills = await self._host.call("list_skills")
             return [skill.model_dump(mode="json") for skill in skills]
         raise InvalidRequest("Unknown method", details={"method": method})
 
@@ -229,7 +249,7 @@ class RuntimeServer:
             or after_sequence < 0
         ):
             raise InvalidRequest("after_sequence must be a non-negative integer")
-        subscription = self._core.subscribe_task_events(task_id, after_sequence)
+        subscription = self._host.subscribe_task_events(task_id, after_sequence)
         iterator = subscription.__aiter__()
         next_event = asyncio.create_task(anext(iterator))
         disconnected = asyncio.create_task(reader.read(1))

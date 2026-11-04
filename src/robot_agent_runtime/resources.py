@@ -2,7 +2,7 @@ import asyncio
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 
-from robot_agent_runtime.errors import TaskCancelled
+from robot_agent_runtime.errors import ResourceQuarantined, TaskCancelled
 
 
 class ResourceLocks:
@@ -19,10 +19,26 @@ class ResourceLocks:
     queued behind a long navigation unable to answer a cancel request. When
     both finish together the lock is held and still has to be released, which
     is what the bookkeeping in the ``finally`` block is for.
+
+    Unconfirmed termination quarantines names before releasing locks. Waiters
+    check again after acquiring, so ending a software waiter cannot release
+    uncertain physical ownership. Quarantine never resets automatically.
     """
 
     def __init__(self) -> None:
         self._locks: dict[str, asyncio.Lock] = {}
+        self._quarantined: set[str] = set()
+
+    def quarantine(self, resources: Iterable[str]) -> None:
+        self._quarantined.update(resources)
+
+    def _require_available(self, resources: Iterable[str]) -> None:
+        blocked = self._quarantined.intersection(resources)
+        if blocked:
+            raise ResourceQuarantined(
+                "Resource ownership requires reconciliation before reuse",
+                details={"resources": sorted(blocked)},
+            )
 
     @asynccontextmanager
     async def acquire(
@@ -30,9 +46,11 @@ class ResourceLocks:
         resources: Iterable[str],
         cancel_event: asyncio.Event | None = None,
     ) -> AsyncIterator[None]:
+        names = sorted(set(resources))
         acquired: list[asyncio.Lock] = []
         try:
-            for name in sorted(set(resources)):
+            self._require_available(names)
+            for name in names:
                 lock = self._locks.setdefault(name, asyncio.Lock())
                 if cancel_event is None:
                     await lock.acquire()
@@ -59,6 +77,7 @@ class ResourceLocks:
                     await asyncio.gather(
                         acquire_task, cancel_waiter, return_exceptions=True
                     )
+            self._require_available(names)
             yield
         finally:
             for lock in reversed(acquired):

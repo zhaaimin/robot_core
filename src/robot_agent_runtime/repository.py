@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from heapq import nsmallest
 
 from robot_agent_runtime.errors import InvalidRequest, TaskNotFound
 from robot_agent_runtime.models import Event, Task
@@ -97,6 +98,15 @@ class InMemoryTaskRepository:
             key=lambda task: task.created_at,
         )
         return [self._copy_task(task) for task in tasks]
+
+    async def list_events_page(
+        self, task_id: str, after_sequence: int = 0, limit: int = 128,
+    ) -> list[Event]:
+        if type(limit) is not int or limit <= 0:
+            raise InvalidRequest("Event page limit must be a positive integer")
+        events = self._events.get(task_id, {})
+        sequences = nsmallest(limit, (sequence for sequence in events if sequence > after_sequence))
+        return [Event.model_validate_json(events[sequence].model_dump_json()) for sequence in sequences]
 
     async def find_by_idempotency_key(self, key: str) -> Task | None:
         if not key:

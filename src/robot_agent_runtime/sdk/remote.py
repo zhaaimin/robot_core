@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from robot_agent_runtime.errors import AgentRuntimeError, InvalidRequest
 from robot_agent_runtime.models import Event, SkillDefinition, Task, TaskRequest
+from robot_agent_runtime.options import RuntimeOptions
 from robot_agent_runtime.sdk.listeners import (
     DoneCallback,
     ErrorCallback,
@@ -35,14 +36,18 @@ class RemoteTransportError(RuntimeError):
 
 
 class RemoteRuntime:
-    def __init__(self, socket_path: str) -> None:
+    def __init__(self, socket_path: str, *, options: RuntimeOptions | None = None) -> None:
         self._socket_path = socket_path
         self._writers: set[asyncio.StreamWriter] = set()
         self._closed = False
+        self._options = options or RuntimeOptions()
         self._lifecycle_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._close_task: asyncio.Task[None] | None = None
-        self._listeners = TaskListeners(self.subscribe_task_events, self.get_task_status)
+        self._listeners = TaskListeners(
+            self.subscribe_task_events, self.get_task_status,
+            cancel_grace_s=self._options.cancel_grace_s,
+        )
 
     def add_task_listener(
         self,
@@ -64,6 +69,7 @@ class RemoteRuntime:
             raise RemoteTransportError("Invalid health response from runtime server")
 
     async def close(self) -> None:
+        self._closed = True
         async with self._close_lock:
             if self._close_task is None:
                 self._close_task = asyncio.create_task(self._close_impl())
@@ -71,15 +77,18 @@ class RemoteRuntime:
         await asyncio.shield(close_task)
 
     async def _close_impl(self) -> None:
-        await self._listeners.close()
         async with self._lifecycle_lock:
             self._closed = True
             writers = list(self._writers)
+            self._writers.clear()
         for writer in writers:
             writer.close()
-        await asyncio.gather(
-            *(self._wait_closed(writer) for writer in writers), return_exceptions=True
-        )
+        try:
+            await self._listeners.close()
+        finally:
+            await asyncio.gather(
+                *(self._wait_closed(writer) for writer in writers), return_exceptions=True
+            )
 
     async def submit_task(self, request: TaskRequest) -> Task:
         result = await self._request(

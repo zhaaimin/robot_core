@@ -46,6 +46,14 @@ class SkillTimeout(AgentRuntimeError):
     code = "SKILL_TIMEOUT"
 
 
+class TaskTimeout(AgentRuntimeError):
+    code = "TASK_TIMEOUT"
+
+
+class SnapshotTooLarge(AgentRuntimeError):
+    code = "SNAPSHOT_TOO_LARGE"
+
+
 class SkillExecutionError(AgentRuntimeError):
     code = "SKILL_EXECUTION_FAILED"
 
@@ -84,3 +92,27 @@ class TaskEventStreamEnded(AgentRuntimeError):
 
 class ListenerCallbackError(AgentRuntimeError):
     code = "LISTENER_CALLBACK_FAILED"
+
+
+class ListenerCallbackQueueFull(AgentRuntimeError):
+    code = "LISTENER_CALLBACK_QUEUE_FULL"
+
+
+class ListenerCallbackTimeout(AgentRuntimeError):
+    code = "LISTENER_CALLBACK_TIMEOUT"
+
+
+class ExtensionCapacityExceeded(AgentRuntimeError):
+    code = "EXTENSION_CAPACITY_EXCEEDED"
+
+
+class ExtensionTimeout(AgentRuntimeError):
+    code = "EXTENSION_TIMEOUT"
+
+
+class ExecutionUnresponsive(AgentRuntimeError):
+    code = "EXECUTION_UNRESPONSIVE"
+
+
+class ResourceQuarantined(AgentRuntimeError):
+    code = "RESOURCE_QUARANTINED"

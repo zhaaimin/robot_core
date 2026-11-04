@@ -1,7 +1,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 
-from robot_agent_runtime.errors import EventStreamOverflow
+from robot_agent_runtime.errors import EventStreamOverflow, InternalError
 from robot_agent_runtime.models import Event, TaskState
 from robot_agent_runtime.ports import TaskRepository
 
@@ -9,9 +9,10 @@ from robot_agent_runtime.ports import TaskRepository
 class EventBus:
     """Persistent replay followed by live, per-task event delivery."""
 
-    def __init__(self, repository: TaskRepository) -> None:
+    def __init__(self, repository: TaskRepository, *, page_size: int = 128) -> None:
         self._repository = repository
         self._queue_size = 1000
+        self._page_size = page_size
         self._subscribers: dict[
             str, set[asyncio.Queue[Event | EventStreamOverflow | None]]
         ] = {}
@@ -49,6 +50,21 @@ class EventBus:
             )
         )
 
+    async def history(self, task_id: str, after_sequence: int = 0) -> AsyncIterator[Event]:
+        page_method = getattr(self._repository, "list_events_page", None)
+        watermark = after_sequence
+        while True:
+            page = (await page_method(task_id, watermark, self._page_size) if page_method is not None
+                    else (await self._repository.list_events(task_id, watermark))[:self._page_size])
+            for event in page:
+                if event.sequence <= watermark:
+                    raise InternalError("Repository returned an unordered event page")
+                watermark = event.sequence
+                yield event
+            if len(page) < self._page_size:
+                return
+            await asyncio.sleep(0)
+
     async def subscribe(
         self, task_id: str, after_sequence: int = 0
     ) -> AsyncIterator[Event]:
@@ -66,8 +82,7 @@ class EventBus:
         try:
             # Registration deliberately precedes replay. Events published while the
             # repository read is in flight are queued and removed by the watermark.
-            replay = await self._repository.list_events(task_id, after_sequence)
-            for event in replay:
+            async for event in self.history(task_id, after_sequence):
                 if event.sequence > watermark:
                     watermark = event.sequence
                     self._watermarks[queue] = watermark

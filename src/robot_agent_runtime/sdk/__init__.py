@@ -4,6 +4,7 @@
 # point for tests that intercept the client's socket calls.
 import asyncio  # noqa: F401
 
+from robot_agent_runtime.options import RuntimeOptions
 from robot_agent_runtime.sdk.embedded import RobotRuntime
 from robot_agent_runtime.sdk.listeners import TaskListener
 from robot_agent_runtime.sdk.remote import (
@@ -17,5 +18,6 @@ __all__ = [
     "RemoteRuntimeError",
     "RemoteTransportError",
     "RobotRuntime",
+    "RuntimeOptions",
     "TaskListener",
 ]

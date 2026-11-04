@@ -20,6 +20,10 @@ pip install -e '.[test]'
 
 同一个 `RuntimeCore` 支撑两种接入方式，公开方法签名一致。
 
+`RobotRuntime` 和 `RuntimeServer` 都把内核托管在专用 daemon 线程的 asyncio 循环上。
+应用、SDK 监听、技能和厂商接口的循环不与内核共用。状态机、资源锁和事件总线仍只在
+内核循环操作，线程交接由边界模块负责；本方案不使用子进程。
+
 ### 嵌入式（同进程）
 
 ```python
@@ -77,14 +81,59 @@ finally:
 
 | 方法 | 说明 |
 | --- | --- |
-| `start()` | 启动运行时；先完成重启恢复，再接受新任务 |
+| `start()` | 嵌入式启动线程并完成重启恢复；远程模式确认服务可用 |
 | `submit_task(request)` | 提交任务，返回快照；校验失败直接返回 `FAILED` 任务 |
 | `get_task_status(task_id)` | 读取持久化的任务状态 |
-| `cancel_task(task_id)` | 请求取消并等待任务进入终态 |
+| `cancel_task(task_id)` | 请求取消并在有限停止确认期后返回终态；无法确认时进入待对账状态 |
 | `list_skills()` | 列出已注册技能定义 |
-| `subscribe_task_events(task_id, after_sequence=0)` | 订阅事件，先回放历史再接续实时事件 |
-| `add_task_listener(on_event=..., on_done=..., on_error=...)` | 统一注册回调，自动监听本 SDK 实例后续提交的任务，返回 `TaskListener` |
-| `close()` | 关闭运行时并释放其持有的资源；外部 SDK 连接由应用随后关闭 |
+| `subscribe_task_events(task_id, after_sequence=0)` | 分页回放历史后接续实时事件；订阅容量独立于查询和取消 |
+| `add_task_listener(on_event=..., on_done=..., on_error=...)` | 监听本 SDK 后续提交的任务，返回 `TaskListener`；异步回调在事件循环，同步回调在有界守护线程池 |
+| `close()` | 嵌入式停止内核并限时清理监听；远程模式清理本客户端监听和连接 |
+
+`RobotRuntime(..., options=RuntimeOptions(...))` 与
+`RuntimeServer(core, socket_path, options=RuntimeOptions(...))` 可以配置隔离边界：
+
+```python
+from robot_agent_runtime.sdk import RuntimeOptions
+
+options = RuntimeOptions(
+    port_timeout_s=5.0,
+    cancel_grace_s=0.2,
+    max_extension_threads=32,
+    max_pending_calls=256,
+    max_control_calls=16,
+    max_subscriptions=256,
+    max_snapshot_bytes=1_048_576,
+    max_snapshot_depth=64,
+    event_page_size=128,
+    max_event_buffer=1000,
+)
+```
+
+端口操作默认期限 5 秒。`TaskRequest.timeout_s` 从接受请求开始计算总期限，覆盖准入校验、
+排队、资源等待与执行；每步受技能声明或单步覆盖和剩余总预算共同限制。
+停止确认与持久化各自有界，不计入执行预算。技能收到取消信号后有 0.2 秒协作退出，
+声明支持取消时才进一步请求协程取消，并再等待最多 0.2 秒。
+需要更长硬件停止确认时间的部署须相应增加 `cancel_grace_s`。
+普通调用、订阅与控制操作分别限额，查询、取消和关闭不被空闲订阅挤出；外部线程
+数量（含声明校验线程）有上限，卡住的线程不会补建。容量耗尽报告
+`EXTENSION_CAPACITY_EXCEEDED`。`RemoteRuntime(socket_path, options=...)` 仅使用本地
+监听的停止确认期限，不配置服务端限额。
+
+单个跨边界快照默认最多 1 MiB、嵌套深度 64，结果与错误在工作线程规范化后交接，
+超限报告 `SNAPSHOT_TOO_LARGE`。事件历史默认每页 128 条；内存和 SQLite 仓储提供
+可选 `PagedEventRepository.list_events_page()`，旧仓储在工作线程内裁页兼容。
+实时队列与关闭后事件缓冲默认各限 1000 条，溢出显式报告 `EVENT_STREAM_OVERFLOW`，
+附带最后交付的序号，调用方可据此恢复回放。
+
+技能、仓储、状态源和对账器各有稳定的外部线程归属，运行期间不要在应用中直接调用或修改
+这些对象中的 asyncio 状态。技能取消信号、进度、参数和结果由代理交接；事件仍先回放后
+接实时。输入和结果须能表示为 JSON 数据。低层 `RuntimeCore` 单独使用时是受信任的
+asyncio 引擎，不自动提供线程隔离；面向业务的入口应使用 SDK 或 `RuntimeServer`。
+
+端口截止后按失败关闭：状态读取失败仍以 `INTERNAL_ERROR` 拒绝提交；对账超时不猜测
+终态；仓储操作超时后报告 `EXTENSION_TIMEOUT` 并禁止继续使用该仓储，避免不确定提交
+之后继续写入。仓储不可用时，任务最终状态可能无法落盘，应在恢复仓储后对账。
 
 接入 CC API 语音时，应用先调用 `CcApiSpeechSkill.start()` 注册回调，再启动运行时；
 退出时先关闭运行时，再关闭技能适配器，最后停止 SDK 连接。
@@ -121,18 +170,42 @@ finally:
 
 回调支持普通函数和 `async def` 函数，至少提供一个。每个任务内部按事件顺序调用，
 终态事件的 `on_event` 完成后，查询最终快照并调用一次 `on_done`。不同任务各自监听，
-异步回调等待不会阻塞其他任务；同步回调需要快速返回，不能做阻塞 I/O。
+异步回调（包括 `async __call__`）在调用方事件循环运行、可协作取消，函数内仍须避免同步
+阻塞代码。普通函数在 daemon 工作线程运行；若返回 awaitable，运行时会回到事件循环
+等待它。回调收到独立的深拷贝快照。
+
+异步回调即使阻塞调用方循环，也不在内核循环执行；该调用方自己的请求和 `close()` 仍可能
+无法继续。可以从其他正常运行的调用方查询内核，不能把调用方循环停住等同于内核停住。
+
+同步回调不能直接操作 asyncio Future、Event 或 Queue，也不能直接调用 SDK 的异步方法；
+需要这些操作时使用 `async def` 回调，或通过 `loop.call_soon_threadsafe()` 通知事件循环。
+同一任务按事件顺序执行；不同任务或不同注册的同步回调可能并发，调用方共享的数据须自行同步。
+
+每个 SDK 实例共享 4 个工作线程，最多排队 64 个同步回调，排队期限 5 秒。队列满时报告
+`LISTENER_CALLBACK_QUEUE_FULL`，排队过期报告 `LISTENER_CALLBACK_TIMEOUT`，结束对应任务
+的监听，不影响业务任务。同步 `on_error` 同样受容量与期限约束，无法执行时交给事件循环
+异常处理器；异步 `on_error` 不占线程槽位。这些是 SDK 内部限额，目前不提供公开配置。
+
+嵌入式 `close()` 先启动内核关闭；两种 SDK 均限时注销监听、取消尚未被线程领取的工作，
+不等待已经领取的同步回调。
+异步监听即使吞掉取消，也只能占用 `cancel_grace_s` 的清理等待；副作用可能继续，
+运行时会停止后续交付并遗弃迟到结果。
+已领取的回调视为在途：其外部副作用可能继续，运行时丢弃完成结果和异常，进程退出不会
+等待这些守护线程。永久阻塞的线程一直占用槽位，不会被超时终止或补建；所有槽位阻塞后，
+后续同步回调只能排队过期或因队列满而失败。需要观察最终回调须先 `wait()` 再 `close()`，
+但 `wait()` 本身不会为正在运行的回调设置执行期限。
 
 任务成功、失败、取消都交给 `on_done`；订阅、查询、回调异常交给
 `on_error(task_id, exception)`，随后结束该任务的监听，不改变业务任务状态。
-没有错误回调或错误回调自身失败时，由 asyncio 事件循环异常处理器报告。
+没有错误回调或错误回调自身失败时，由 asyncio 事件循环异常处理器报告。回调自行抛出
+`CancelledError` 按 `LISTENER_CALLBACK_FAILED` 上报；真正关闭监听时的取消仍正常传播。
 事件流提前结束不会冒充任务完成。慢回调可能触发现有的事件队列溢出，不会自动重试；
 需要重放时仍可用 `subscribe_task_events` 及 `after_sequence`。
 
 | 监听句柄操作 | 行为 |
 | --- | --- |
 | `await listener.wait()` | 等待调用时已经登记的任务监听完成；以后仍可提交新任务并再次等待 |
-| `await listener.close()` | 注销这组回调并停止订阅，不取消业务任务；可以重复调用 |
+| `await listener.close()` | 注销并取消排队回调，遗弃在途同步回调结果；不取消业务任务，可以重复调用 |
 
 取消 `wait()` 的调用者不会取消后台监听。同一个注册对同一任务 ID 只监听一次，
 所以重复提交幂等请求不会重复通知；去重 ID 保留到注销。多次注册得到独立的监听句柄。
@@ -151,17 +224,27 @@ CREATED → VALIDATING → QUEUED → RUNNING → SUCCEEDED
                            └→ FAILED（校验未通过）
 
 重启恢复：UNKNOWN / RECONCILIATION_REQUIRED
+执行或取消无法确认停止：RUNNING / CANCELING → RECONCILIATION_REQUIRED
 ```
 
 终态为 `SUCCEEDED`、`FAILED`、`CANCELED`、`UNKNOWN`、`RECONCILIATION_REQUIRED`。
 
 注册式监听只观察这些状态，不增加新的状态或写入状态。`on_done` 包含所有终态，
-表示本次任务已结束，不等于成功；`on_error` 也不代表机器人任务执行失败。
+表示本次任务已结束，不等于成功；`on_error` 及回调队列满、排队超时也不改变机器人任务状态。
 
 CC API 的 `audio.speak` 在启动受理后保持 `RUNNING`，收到匹配 `workId` 的
 `cc.api.work.finished` 才成功。首版按约定不解析 finished 的结束原因，外部停止/失败
 如果也发出该事件，同样被视为成功。运行时主动取消仍等待停止确认后进入 `CANCELED`；
-停止未确认则报告失败。技能超时仍为 `FAILED / SKILL_TIMEOUT`。
+停止未确认进入 `RECONCILIATION_REQUIRED / EXECUTION_UNRESPONSIVE`。
+不支持取消的真实调用不会被强制取消；支持取消的调用也须正常成功返回或显式抛
+`TaskCancelled` 确认停止，仅 `CancelledError` 不足以证明物理动作已停止。只有执行已结束的
+超时技能才报告 `FAILED / SKILL_TIMEOUT`。总期限到期且未派发或确认已停止时报告
+`FAILED / TASK_TIMEOUT`；停止不明仍进入待对账。
+
+无法确认停止时，该技能实例与它声明的资源在当前运行时内被隔离，等待者和新任务都不能
+因为软件任务已结束而复用资源，报告 `RESOURCE_QUARANTINED`。迟到结果不会把任务改回
+成功，也不会在终态后追加进度。隔离不会因线程后来返回而自动解除；重新创建运行时或
+适配器前必须先确认旧动作已停止，重启不等于硬件停止确认。
 
 ## 重启恢复语义
 
@@ -181,6 +264,12 @@ src/robot_agent_runtime/
 ├── errors.py              结构化错误码
 ├── ports.py               技能、仓储、对账、状态源与回调型机器人 API 的 Protocol
 ├── core.py                RuntimeCore：运行时生命周期与公开任务 API
+├── kernel_host.py         KernelHost：专用内核线程、请求/事件快照交接与关闭
+├── thread_runtime.py      LoopThread / LoopJob：固定 daemon 循环、容量与实际完成
+├── isolation.py           外部端口代理：线程归属、期限、取消/进度桥接与故障关闭
+├── boundary.py            有界快照：规范模型与普通数据，拒绝外部对象钩子
+├── execution_context.py   控制操作上下文，传递预留容量权限
+├── options.py             RuntimeOptions：容量、快照与事件限额、端口期限和停止确认期
 ├── task_state.py          TaskStateStore：本机任务归属与状态机唯一写入点
 ├── executor.py            WorkflowExecutor：单任务步骤编排
 ├── registry.py            SkillRegistry：技能注册与查找
@@ -195,7 +284,8 @@ src/robot_agent_runtime/
 ├── sdk/
 │   ├── embedded.py        RobotRuntime
 │   ├── remote.py          RemoteRuntime
-│   └── listeners.py       TaskListener：统一回调注册、按任务订阅与清理
+│   ├── listeners.py       TaskListener：统一回调注册、按任务订阅与清理
+│   └── callback_executor.py  CallbackExecutor：有界 daemon 线程池、排队期限与取消/遗弃结果
 └── adapters/
     ├── cc_api.py          CcApiSpeechSkill：CC API 语音播报、结束事件与停止确认
     └── simulator.py       模拟技能、Reconciler 与两个模拟机器人状态源（无硬件自测用）
@@ -245,8 +335,12 @@ runtime = RobotRuntime(
 启动回调提供 `workId`，适配器按它匹配 finished，允许 finished 早于启动回调到达。
 取消、超时和关闭时只停止当前 work，停止请求受理不等于停止完成，还需要 finished。
 停止清理最多等待 5 秒；断连、缺失 workId 或停止未确认后，该实例拒绝继续播报。
-应用需要先确认旧播报已经结束，再建立新连接和适配器。超时/关闭时的状态沿用运行时
-语义，不代表硬件停止已获确认。首版不提供重启对账，也不自动重试播报。
+运行时只等待配置的停止确认期，可能先于适配器的 5 秒清理期限进入待对账状态；此时
+speaker 资源保持隔离。应用需要先确认旧播报已经结束，再建立新连接和适配器。
+首版不提供重启对账，也不自动重试播报。
+
+CC API 适配器保留 `start()` 时所属的应用循环，跨线程执行会交回该循环；厂商请求与
+回调不会在内核循环执行。应用循环阻塞也可能拖住适配器的停止确认，此时按上述规则隔离。
 
 运行示例使用底层异步回调接口，将回调转回 asyncio；不调用 `cc_api/` 中包含阻塞等待的
 `RobotClient`。SDK 的连接启动和停止放在事件循环之外。适配器独占该连接的 finished
@@ -304,7 +398,7 @@ blocked = skill.definition.preconditions & await provider.unsatisfied()
 | --- | --- | --- |
 | 提交准入 | `PolicyEnforcer`，整单取一次快照 | 整单 `FAILED` + `PRECONDITION_FAILED` |
 | 每步启动前 | `WorkflowExecutor`，取到资源锁之后、`SKILL_STARTED` 之前 | `FAILED` + `PRECONDITION_FAILED`，该步未执行 |
-| 执行中条件变化 | `RuntimeCore` 消费 `provider.watch()` 的推送 | 先置 `cancel_event`，再记 `TASK_PRECONDITION_LOST` 事件，最终 `CANCELED` |
+| 执行中条件变化 | `RuntimeCore` 消费代理转交的 `provider.watch()` 推送 | 先置 `cancel_event`，再记原因；确认停止则 `CANCELED`，无法确认则待对账 |
 
 只有**声明了**已损坏标签的技能会被打断：急停期间一个正在播放的语音任务不受影响，因为
 `audio.speak` 没有声明 `estop.clear`。
@@ -349,6 +443,8 @@ blocked = skill.definition.preconditions & await provider.unsatisfied()
 - `WorkflowExecutor` 自身无状态，只负责顺序：申请资源 → 带超时启动技能 → 把结果、超时、
   取消、意外异常映射成恰好一次终态转换。
 - `RuntimeCore` 负责生命周期（启动恢复、关闭）与公开 API，并在提交时完成校验。
+- `KernelHost` 拥有内核线程，外部端口代理拥有自己的循环；真实调用结束与“取消请求已发送”
+  分开记录。跨线程超时不会被当作物理动作已经停止的证据。
 
 所有带 guard 的转换都走同一把任务锁，因此“取消请求”与“执行推进”是公平竞速，不存在已
 取消的任务又被推进成功的窗口。
@@ -368,13 +464,21 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
 `test_recovery` 重启恢复、`test_preconditions` 机器人状态前置条件、`test_sqlite_repository`
 持久化、`test_embedded_sdk` / `test_remote_sdk` 两种接入形态、`test_contracts` 供后续适配器
 复用的契约测试、`test_cc_api` 语音事件匹配与取消/断连边界、`test_task_listeners`
-统一回调注册、任务隔离与监听生命周期。
+统一回调注册、任务隔离与监听生命周期、`test_callback_executor` 守护线程退出、容量、
+排队期限与取消竞态；`test_event_paging` 覆盖分页回放、实时去重和批次让出；`test_thread_runtime` / `test_isolation` / `test_kernel_host` /
+`test_execution_boundaries` / `test_runtime_isolation` 覆盖线程归属、阻塞外部代码、有限取消、
+仓储故障关闭、快照和资源隔离。
 
 ## 当前范围
 
 已实现：运行时内核、技能层框架、Python SDK（嵌入式 + 远程）、UDS 守护进程、SQLite
-持久化、模拟适配器、CC API 语音播报适配器、SDK 统一注册式任务监听（仅本客户端后续提交）。
+持久化、模拟适配器、CC API 语音播报适配器、SDK 统一注册式任务监听（仅本客户端后续提交）、
+同步回调的有界守护线程隔离与排队期限、同进程内核专用线程和外部端口隔离、有限停止
+确认与失控资源隔离、任务总期限、控制容量预留、快照限额、事件分页及有界关闭缓冲。
+
+线程边界保护外部 Python 阻塞或不配合取消时的内核响应，不提供硬实时保证。原生扩展
+长期持有 GIL、进程退出或系统资源耗尽仍会影响整个进程；不能强制终止已经运行的线程。
 
 尚未实现：Agent 集成层（计划生成与重规划）、调度器（`priority` 字段已持久化但不参与
 排序，无并发上限与抢占）、有限重试、结构化日志、其他真实机器人能力适配（导航、
-ROS 2 等）、CC API 结束原因解析与重启对账、云端管理平面。
+ROS 2 等）、CC API 结束原因解析与重启对账、回调进程隔离与强制终止、云端管理平面。

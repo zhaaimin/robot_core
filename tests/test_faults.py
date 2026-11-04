@@ -140,6 +140,8 @@ class ProgressOutcomeSkill:
         if self.definition.name == "timeout":
             try:
                 await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise TaskCancelled("Synthetic work stopped") from None
             finally:
                 assert context.progress is not None
                 context.progress(0.5)

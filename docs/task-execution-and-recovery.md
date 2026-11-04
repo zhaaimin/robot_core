@@ -2,7 +2,7 @@
 
 本文以 CC API 语音播报为例，说明当前项目从提交任务到执行结束的完整流程，以及程序退出后能够和不能够恢复的内容。
 
-依据：2026-11-02 的项目实现。本文中的“当前行为”描述已有代码，“后续需要补齐”描述尚未实现的能力。
+依据：2026-11-03 的项目实现，包含同进程线程隔离。本文中的“当前行为”描述已有代码，“后续需要补齐”描述尚未实现的能力。
 
 最重要的边界：**SQLite 保存记录；Reconciler 负责核实真实状态；当前 recovery 处理重启时的遗留记录，不会自动接管机器人上仍在执行的任务。**
 
@@ -28,6 +28,11 @@
 | [sdk/embedded.py](../src/robot_agent_runtime/sdk/embedded.py) | `RobotRuntime`：供同进程调用方使用的接口 |
 | [sdk/listeners.py](../src/robot_agent_runtime/sdk/listeners.py) | 统一注册事件与结果回调，内部按任务订阅和清理 |
 | [core.py](../src/robot_agent_runtime/core.py) | 启动、关闭、提交、取消、查询等运行时操作 |
+| [kernel_host.py](../src/robot_agent_runtime/kernel_host.py) | 托管独立内核线程，桥接 SDK/Server 请求和事件快照 |
+| [isolation.py](../src/robot_agent_runtime/isolation.py) | 技能、仓储、状态源、对账与校验的外部线程、期限和取消确认 |
+| [boundary.py](../src/robot_agent_runtime/boundary.py) | 在复制前限制快照体积和深度，净化外部结果与异常 |
+| [execution_context.py](../src/robot_agent_runtime/execution_context.py) | 将控制操作的预留容量传递到端口线程 |
+| [thread_runtime.py](../src/robot_agent_runtime/thread_runtime.py) | 区分取消请求和真实完成，限制在途调用并有限关闭 daemon 循环 |
 | [policy.py](../src/robot_agent_runtime/policy.py) | 提交时检查技能、参数 Schema、权限及前置条件 |
 | [executor.py](../src/robot_agent_runtime/executor.py) | 顺序执行各个技能步骤，处理超时、取消和结果 |
 | [resources.py](../src/robot_agent_runtime/resources.py) | 按资源名协调独占使用 |
@@ -72,6 +77,10 @@ task = await runtime.submit_task(
 ```
 
 `submit_task()` 返回提交时的任务快照，通常此时技能还没有执行完成。返回的 `task` 不会自动跟随后台任务更新。
+
+`TaskRequest.timeout_s` 是从接受请求开始的总期限，包含准入校验、排队、资源等待和各步骤执行。
+到期前尚未派发或确认动作已停止，任务以 `FAILED / TASK_TIMEOUT` 结束；无法确认停止则进入
+`RECONCILIATION_REQUIRED` 并隔离资源。停止确认与持久化使用独立期限，不能为了赶期限而省略。
 
 当前 demo 的 `speak()` 没有设置幂等键；上面的示例用于说明如何显式使用该能力。
 
@@ -144,7 +153,7 @@ sequenceDiagram
 
 `resources={"speaker"}` 表示该技能需要独占扬声器。每个资源名一把锁；播报和音乐如果都声明 `speaker`，就需要依次执行。导航声明 `base`，可以与语音使用不同资源并行执行。
 
-锁按每个步骤取得和释放。在播报等待 finished 期间，运行时一直持有 `speaker` 锁；技能退出时释放。锁只在同一个 `RuntimeCore` 实例内共享，其他客户端直接控制机器人不受这把锁约束。
+锁按每个步骤取得和释放。在播报等待 finished 期间，运行时一直持有 `speaker` 锁；正常退出时释放。若超过停止确认期仍不能确认退出，任务进入 `RECONCILIATION_REQUIRED`，该资源在当前运行时内继续隔离，其他等待者报告 `RESOURCE_QUARANTINED`。锁只在同一个 `RuntimeCore` 实例内共享，其他客户端直接控制机器人不受这把锁约束。
 
 取得锁之后、发出 `SKILL_STARTED` 之前，执行器调用 `_require_preconditions()`：
 
@@ -210,6 +219,10 @@ print(final.error)
 ```
 
 正常情况下，事件订阅先回放历史再接收实时事件，收到终态事件后结束。`get_task_status()` 只查询当前快照，本身不会等待任务结束。
+
+历史回放默认每页 128 条，每批之间让出内核循环；内存和 SQLite 仓储直接分页查询，旧仓储在
+外部工作线程内裁页。普通请求、订阅和查询/取消/关闭分别限额，空闲订阅不能挤占控制容量。
+实时队列和关闭后缓存默认各最多 1000 条，溢出报告 `EVENT_STREAM_OVERFLOW` 并保留最后交付水位。
 
 成功的语音结果形如：
 
@@ -392,10 +405,21 @@ class Reconciler(Protocol):
 | 情况 | 当前行为 |
 | --- | --- |
 | 远程客户端退出，Runtime 服务进程仍在 | 服务端继续执行、接收完成事件并保存结果；客户端之后可重新查询 |
-| 调用 `runtime.close()` 正常关闭 | 取消并等待本机执行协程，适配器尝试停止当前动作，再清理资源 |
+| 调用 `runtime.close()` 正常关闭 | 请求取消，有限等待停止确认；无法确认的动作进入待对账，线程中在途代码可能继续 |
 | Runtime 被强制终止、崩溃或断电 | 无法保证清理代码执行；机器人可能继续动作，仓储保留最后提交的记录 |
 
-对于当前语音适配器，本地取消会停止指定 work，并等待匹配的 finished。停止清理有 5 秒默认上限。停止失败或断连时不能将软件任务状态直接当作硬件已经停止的证明；适配器会拒绝后续播报。
+对于当前语音适配器，本地取消会停止指定 work，并等待匹配的 finished。适配器内部停止清理有 5 秒默认上限；运行时还受 `RuntimeOptions.cancel_grace_s` 约束，可能先进入待对账。需要完整等待硬件停止确认的部署须配置足够的确认期。停止失败或断连时不能将软件任务状态直接当作硬件已经停止的证明；适配器会拒绝后续播报。
+
+声明不支持取消的真实调用不会被强制取消。支持取消的调用须正常成功返回或显式抛出
+`TaskCancelled` 证明已停止，只有 `CancelledError` 仍属于停止不明。语音适配器关闭时先完成
+回调解绑，再传播停止未确认错误；多项清理错误聚合上报。SDK 关闭先启动内核停止，异步监听
+清理最多等待 `cancel_grace_s`，吞取消的监听不能阻止业务停止。
+
+SDK 和服务端的内核循环独占一个线程；应用回调留在调用方，技能等外部实现由代理交给
+固定的外部循环。即使外部 async 函数内部同步阻塞，也不占用内核循环。外部仓储超过
+操作期限后停止后续访问，写入结果可能不确定，不能无条件重试。线程无法强制终止，
+原生扩展持有 GIL 或系统资源耗尽也不在此隔离保证内。低层 `RuntimeCore` 单独调用不提供
+托管边界；业务入口应使用 SDK 或 `RuntimeServer`。
 
 如果希望调用方退出后仍能正常记录任务结果，应让 Runtime 常驻，通过 `RemoteRuntime` 提交和查询任务。这能处理客户端退出，但服务端自己崩溃时仍然需要真实状态核对。
 

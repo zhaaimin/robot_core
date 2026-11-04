@@ -31,11 +31,11 @@ async def speak(api: CallbackRobotApi, message: str) -> Task:
     def on_event(event: Event) -> None:
         print(event.model_dump_json(), flush=True)
 
-    def on_done(task: Task) -> None:
+    async def on_done(task: Task) -> None:
         if not completed.done():
             completed.set_result(task)
 
-    def on_error(task_id: str, error: Exception) -> None:
+    async def on_error(task_id: str, error: Exception) -> None:
         if not completed.done():
             completed.set_exception(error)
 

@@ -119,6 +119,14 @@
 
 <h2 id="overview">1. 整体定位与核心结论</h2>
 
+<div class="callout">
+  <strong>线程归属（2026-11-03）</strong>
+  RobotRuntime 与 RuntimeServer 由 KernelHost 托管专用内核循环。状态机和事件总线仍为纯 asyncio；
+  技能、仓储、状态源、对账和参数校验在固定外部线程执行。SDK 监听在调用方循环消费跨线程
+  事件快照，异步用户回调不在内核循环执行。超时与取消只有限等待真实停止；未确认动作进入
+  RECONCILIATION_REQUIRED，资源保持隔离。线程不能强杀，不提供进程隔离或硬实时保证。
+</div>
+
 <p>这套系统实现了「任务状态变更 → 事件 → 用户回调」的通知能力。它的本质是<strong>异步事件流</strong>（async event stream），而非经典的观察者（Observer）模式。</p>
 
 <div class="callout teal">
@@ -131,10 +139,10 @@
   <tr><td>订阅者形态</td><td>观察者对象，持有回调引用</td><td>一个 <code>asyncio.Queue</code> + 一个监听协程</td></tr>
   <tr><td>通知方式</td><td>发布者遍历观察者，逐个调用</td><td>发布者入队即返回，不碰回调</td></tr>
   <tr><td>谁触发回调</td><td>发布者（push）</td><td>事件循环 + 订阅协程自己（pull）</td></tr>
-  <tr><td>慢订阅者</td><td>阻塞发布者</td><td>发布零阻塞；慢订阅者只积压自己的队列</td></tr>
+  <tr><td>慢订阅者</td><td>阻塞发布者</td><td>发布零阻塞；同步回调共享有界线程容量，超载结束对应监听</td></tr>
 </table>
 
-<p>这套设计的"绕"，源自三个必须满足的硬约束（详见 <a href="#invariants">第 7 节</a>）：发布者零阻塞、事件可回放、订阅者可控挂起。它在不引入线程、不引入消息队列、不加任何依赖的前提下，用纯 asyncio 原语满足了这四个需求。</p>
+<p>三个硬约束（详见 <a href="#invariants">第 7 节</a>）是发布者零阻塞、事件可回放、订阅者可控挂起。内核沿用纯 asyncio；SDK 监听层用自管的有界 daemon 线程池隔离同步用户回调，不增加外部依赖。</p>
 
 <figure>
   <svg class="diagram" viewBox="0 0 720 300" role="img" aria-label="系统分层概览">
@@ -219,6 +227,9 @@ async def transition(self, task, event_type, changes=None, data=None, guard=None
 </table>
 
 <h2 id="eventbus">3. EventBus：先回放、后实时、水位去重</h2>
+<p>历史回放按 <code>event_page_size</code> 分页（默认 128 条），每批之间让出内核循环。
+内存与 SQLite 仓储实现可选 <code>PagedEventRepository</code>；旧仓储在外部线程内裁页。
+订阅、普通调用与控制操作分别限额，查询、取消和关闭的容量预留会传递到端口线程。</p>
 
 <p><span class="file-ref">events.py</span> 的 <code>EventBus</code> 是事件的唯一分发组件。它自身不存事件——持久化在 <code>TaskRepository</code>，总线只维护「谁在等」和「发到哪了」。</p>
 
@@ -285,6 +296,10 @@ async def transition(self, task, event_type, changes=None, data=None, guard=None
 </div>
 
 <h3>3.4 背压与关闭</h3>
+<p>内核关闭先停止业务，再限时清理调用方监听；异步回调吞取消也不能无限阻止关闭。
+关闭后事件缓存受 <code>max_event_buffer</code> 限制（默认 1000 条），溢出显式报告
+<code>EVENT_STREAM_OVERFLOW</code> 并附最后实际交付的序号，供重新订阅恢复回放。
+跨边界快照默认最多 1 MiB、64 层，结果和错误均在工作线程净化后交接。</p>
 <ul>
   <li><strong>发布零阻塞</strong>：<code>publish</code> 是纯同步函数，<code>put_nowait</code> 即返回，内核状态机永不被订阅者拖住。</li>
   <li><strong>背压有界</strong>：队列满 1000 触发 <code>_overflow</code>，清空队列并注入一条 <code>EventStreamOverflow</code>（携带当前水位 = 断点续传位置），订阅方抛错后可凭 <code>after_sequence</code> 无损重订。</li>
@@ -353,22 +368,26 @@ async def transition(self, task, event_type, changes=None, data=None, guard=None
 <p>循环体里两个 <code>if self._closed: return</code> 是<strong>防御性检查</strong>，分别在回调前与回调后——因为回调本身可能耗时，期间监听器可能被 <code>close()</code>。注意 <code>return</code> 与 <code>break</code> 语义不同：<code>return</code> 是「不玩了」整个监听作废，<code>break</code> 是「玩完了」进入结果阶段。</p>
 
 <h3>4.1 回调统一入口 _invoke</h3>
-<pre><code># listeners.py:123-133
-@staticmethod
-async def _invoke(callback, *args):
+<pre><code># 分发示意；完整取消及结果清理见 sdk/listeners.py
+async def _invoke(self, callback, *args):
     try:
-        result = callback(*args)            # 同步调用用户函数
-        if inspect.isawaitable(result):     # 返回协程？
-            await result                    # 异步回调：挂起直到跑完
+        if is_async_callback(callback):     # async 函数或 async __call__
+            result = callback(*args)
+        else:
+            result = await executor.submit(callback, *args)
+        if inspect.isawaitable(result):
+            await result                    # 在所属事件循环等待
     except asyncio.CancelledError as error:
         current = asyncio.current_task()
         if current is not None and current.cancelling():
             raise
         raise ListenerCallbackError("Task callback cancelled itself") from error</code></pre>
-<p>同步/异步回调统一由这一处处理，靠返回值是否 awaitable 分流。回调拿到的是 <code>model_copy(deep=True)</code> 快照，改不坏总线与其他订阅者。</p>
+<p>异步回调在调用方事件循环执行，普通函数在回调工作线程执行；普通函数返回的 awaitable 回到调用方循环等待。内核线程只提供事件快照，回调还会收到独立的 <code>model_copy(deep=True)</code> 副本。同步回调不能直接操作 asyncio 对象，应改成 async 回调或使用 <code>loop.call_soon_threadsafe</code>。</p>
+<p><span class="file-ref">sdk/callback_executor.py</span> 自管 4 个 daemon 线程和最多 64 个排队项，排队期限 5 秒，不依赖 ThreadPoolExecutor 私有实现或退出钩子。取消监听会撤销未领取工作；已领取工作视为在途，关闭不等待它，完成结果和异常被丢弃。永久阻塞的线程仍占槽位，不会被强制终止或补建。<code>wait()</code> 也不限制运行时长。</p>
 
 <h3>4.2 错误上报 _report_error</h3>
 <p>订阅、查询或回调的任何异常，只结束<strong>该任务</strong>的监听协程：有 <code>on_error</code> 则调它（传 <code>task_id</code> + 异常）；<code>on_error</code> 缺失或自身再抛，则交 <code>asyncio</code> 事件循环异常处理器，<strong>不静默吞错</strong>。业务任务与内核状态机零感知。</p>
+<p>队列满和排队超时分别上报 <code>LISTENER_CALLBACK_QUEUE_FULL</code>、<code>LISTENER_CALLBACK_TIMEOUT</code>。同步错误回调也受队列约束，失败后交给循环异常处理器；异步错误回调不占工作线程。回调自行抛出的取消映射为 <code>LISTENER_CALLBACK_FAILED</code>，关闭监听触发的取消正常传播。</p>
 
 <h2 id="yield">5. 让出点与唤醒机制</h2>
 
@@ -418,19 +437,19 @@ async def _invoke(callback, *args):
     <g>
       <rect x="390" y="40" width="150" height="60" rx="8" fill="#e1f5ee" stroke="#0f6e56" stroke-width="0.5"/>
       <text x="465" y="62" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="600" fill="#085041">_invoke 调用</text>
-      <text x="465" y="80" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#0f6e56">callback(*args)</text>
+      <text x="465" y="80" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#0f6e56">循环执行 / 线程投递</text>
     </g>
     <g>
       <rect x="570" y="40" width="120" height="60" rx="8" fill="#faece7" stroke="#993c1d" stroke-width="0.5"/>
       <text x="630" y="62" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="600" fill="#712b13">await result</text>
-      <text x="630" y="80" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#993c1d">仅异步回调</text>
+      <text x="630" y="80" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#993c1d">线程完成 / awaitable</text>
     </g>
     <line x1="180" y1="70" x2="210" y2="70" stroke="#888780" stroke-width="1.5" marker-end="url(#m4)"/>
     <line x1="360" y1="70" x2="390" y2="70" stroke="#888780" stroke-width="1.5" marker-end="url(#m4)"/>
     <line x1="540" y1="70" x2="570" y2="70" stroke="#888780" stroke-width="1.5" marker-end="url(#m4)"/>
-    <text x="30" y="140" font-size="13" fill="#5f5e5a">同步回调：从唤醒到回调完成<strong>零让出</strong>，事件处理是原子的</text>
-    <text x="30" y="165" font-size="13" fill="#5f5e5a">异步回调：让出点精确落在 <code>_invoke</code> 帧内的 <code>await result</code></text>
-    <text x="30" y="205" font-size="13" fill="#5f5e5a">取消落点：close() 的 CancelledError 恰好投放在异步回调的挂起点，沿帧弹出路径传播</text>
+    <text x="30" y="140" font-size="13" fill="#5f5e5a">同步回调：投递线程，监听协程等待完成，内核可以继续调度</text>
+    <text x="30" y="165" font-size="13" fill="#5f5e5a">异步回调：等待 awaitable 时协作让出，函数内仍须避免同步阻塞</text>
+    <text x="30" y="205" font-size="13" fill="#5f5e5a">关闭监听：取消未领取工作，遗弃在途结果，取消异步回调</text>
   </svg>
   <figcaption>图 4 · 唤醒后的微指令序列与让出点</figcaption>
 </figure>
@@ -505,7 +524,7 @@ async def _invoke(callback, *args):
 
 <div class="callout coral">
   <strong>结论</strong>
-  这套设计是正确且克制的：在不引入线程、消息队列、任何依赖的前提下，用纯 asyncio 原语精确满足了「零阻塞发布 + 可回放 + 可取消 + 异常隔离」四个硬需求。测试（23 个监听用例）将语义钉得很死。若只是理解成本问题而非正确性问题，不建议重写内核逻辑；可在调用侧加一层语义更直白的薄封装。
+  状态机与事件总线保持纯 asyncio；SDK 使用有界守护线程隔离同步回调。监听可关闭，但在途同步代码的副作用无法强制终止；容量耗尽通过结构化监听错误降级。测试覆盖事件顺序、异常隔离、关闭竞态、队列期限及永久阻塞下的进程退出。
 </div>
 
 </div>

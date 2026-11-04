@@ -14,7 +14,57 @@ import pytest
 from robot_agent_runtime.adapters.simulator import Simulator
 from robot_agent_runtime.models import SkillCall, SkillContext, TaskRequest, TaskState
 from robot_agent_runtime.sdk import RemoteRuntime
-from robot_agent_runtime.ports import CallbackApiResponse, CallbackRobotApi, Skill
+from robot_agent_runtime.ports import CallbackApiResponse, CallbackRobotApi, PagedEventRepository, Skill
+
+
+async def check_paged_event_repository_contract(repository: PagedEventRepository) -> None:
+    from robot_agent_runtime.errors import InvalidRequest
+    from robot_agent_runtime.models import Event, SkillCall, Task
+
+    await repository.start()
+    try:
+        await repository.create_task(Task(id="paged", task_type="contract",
+                                          state=TaskState.CREATED, steps=[SkillCall(skill="none")]))
+        for sequence in (3, 1, 2):
+            await repository.append_event(Event(event_id=f"page-{sequence}", task_id="paged",
+                                                sequence=sequence, event_type="progress"))
+        page = await repository.list_events_page("paged", 0, 2)
+        assert [event.sequence for event in page] == [1, 2]
+        page[0].data["changed"] = True
+        assert (await repository.list_events_page("paged", 0, 1))[0].data == {}
+        assert [event.sequence for event in await repository.list_events_page("paged", 2, 2)] == [3]
+        assert await repository.list_events_page("absent", 0, 2) == []
+        for limit in (0, -1, True):
+            with pytest.raises(InvalidRequest):
+                await repository.list_events_page("paged", 0, limit)
+    finally:
+        await repository.close()
+
+
+async def test_memory_paged_event_repository_contract() -> None:
+    from robot_agent_runtime.repository import InMemoryTaskRepository
+
+    await check_paged_event_repository_contract(InMemoryTaskRepository())
+
+
+async def test_sqlite_paged_event_repository_contract() -> None:
+    from robot_agent_runtime.sqlite_repository import SQLiteTaskRepository
+
+    await check_paged_event_repository_contract(SQLiteTaskRepository(":memory:"))
+
+
+async def test_simulator_cancellation_acknowledges_actual_completion() -> None:
+    from robot_agent_runtime.errors import TaskCancelled
+
+    skill = Simulator().skills["wait.delay"]
+    started = asyncio.Event()
+    context = SkillContext("cancel", "cancel", asyncio.Event(), lambda _: started.set())
+    execution = asyncio.create_task(skill.execute(context, {"delay_s": 30}))
+    await asyncio.wait_for(started.wait(), 1)
+    execution.cancel()
+    with pytest.raises(TaskCancelled):
+        await execution
+    assert skill.active == 0
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

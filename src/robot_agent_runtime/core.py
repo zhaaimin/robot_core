@@ -1,12 +1,15 @@
 import asyncio
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from robot_agent_runtime.errors import (
     AgentRuntimeError,
     InternalError,
+    InvalidRequest,
     SkillNotFound,
     TaskNotFound,
+    TaskTimeout,
 )
 from robot_agent_runtime.events import EventBus
 from robot_agent_runtime.executor import WorkflowExecutor
@@ -18,6 +21,7 @@ from robot_agent_runtime.models import (
     TaskState,
 )
 from robot_agent_runtime.policy import PolicyEnforcer
+from robot_agent_runtime.options import RuntimeOptions
 from robot_agent_runtime.ports import (
     Reconciler,
     RobotStateProvider,
@@ -28,6 +32,9 @@ from robot_agent_runtime.recovery import RecoveryOutcome, recover_nonterminal_ta
 from robot_agent_runtime.registry import SkillRegistry
 from robot_agent_runtime.resources import ResourceLocks
 from robot_agent_runtime.task_state import TaskStateStore
+
+if TYPE_CHECKING:
+    from robot_agent_runtime.isolation import IsolatedPorts
 
 
 class RuntimeCore:
@@ -47,6 +54,16 @@ class RuntimeCore:
         allowed_permissions: set[str] | None = None,
         robot_state: RobotStateProvider | None = None,
     ) -> None:
+        skills = dict(skills)
+        if any(type(name) is not str for name in skills):
+            raise InvalidRequest("Skill registry names must be plain strings")
+        if allowed_permissions is not None:
+            allowed_permissions = set(allowed_permissions)
+            if any(type(permission) is not str for permission in allowed_permissions):
+                raise InvalidRequest("Permissions must contain plain strings")
+        self._port_inputs = (repository, skills, reconciler, allowed_permissions, robot_state)
+        self._isolated_ports: "IsolatedPorts | None" = None
+        self._isolation_failure: Exception | None = None
         self._repository = repository
         self._reconciler = reconciler
         self._robot_state = robot_state
@@ -63,9 +80,50 @@ class RuntimeCore:
         self._close_lock = asyncio.Lock()
         self._close_task: asyncio.Task[None] | None = None
         self._robot_watcher: asyncio.Task[None] | None = None
+        self._event_drainer: Callable[[], Awaitable[None]] | None = None
         self._started = False
         self._closing = False
         self._closed = False
+
+    async def isolate(self, options: RuntimeOptions) -> None:
+        """Wire external ports before an owning host starts this trusted engine.
+
+        RuntimeCore itself stays an asyncio engine for low-level integrations.
+        SDKs and the server own the thread boundary and call this before start;
+        moving live state or loop-bound locks between threads is forbidden.
+        """
+        if self._isolation_failure is not None:
+            raise self._isolation_failure
+        if self._isolated_ports is not None:
+            return
+        if self._started or self._closing or self._closed:
+            raise InvalidRequest("Cannot move a running or closed core between execution boundaries")
+        from robot_agent_runtime.isolation import isolate_ports
+
+        repository, skills, reconciler, permissions, robot_state = self._port_inputs
+        isolated = isolate_ports(repository, skills, reconciler, robot_state, options)
+        try:
+            await isolated.prepare()
+        except BaseException as error:
+            self._isolation_failure = (
+                error if isinstance(error, Exception)
+                else InvalidRequest("Isolation setup was interrupted; this runtime cannot replace its workers")
+            )
+            await isolated.close()
+            raise
+        self._isolated_ports = isolated
+        self._repository = isolated.repository
+        self._reconciler = isolated.reconciler
+        self._robot_state = isolated.robot_state
+        self._registry = SkillRegistry(isolated.skills)
+        self._policy = PolicyEnforcer(self._registry, permissions, isolated.robot_state)
+        self._events._repository = isolated.repository
+        self._events._page_size = options.event_page_size
+        self._events._queue_size = options.max_event_buffer
+        self._state._repository = isolated.repository
+        self._executor = WorkflowExecutor(
+            self._state, self._registry, self._resources, isolated.robot_state, options,
+        )
 
     # Local ownership lives in the state store. These read-only views keep the
     # historical attribute names available for inspection and assertions.
@@ -217,6 +275,8 @@ class RuntimeCore:
             if watcher is not None and not watcher.done():
                 watcher.cancel()
             executions = list(self._state.executions.values())
+            for cancel_event in self._state.cancel_events.values():
+                cancel_event.set()
             for execution in executions:
                 if not execution.done():
                     execution.cancel()
@@ -231,11 +291,21 @@ class RuntimeCore:
         results.extend(await asyncio.gather(*remaining_progress, return_exceptions=True))
         errors = [result for result in results if isinstance(result, Exception)]
         self._events.close()
+        if self._event_drainer is not None:
+            try:
+                await self._event_drainer()
+            except Exception as error:
+                errors.append(error)
         try:
             await self._repository.close()
         except Exception as error:
             errors.append(error)
         finally:
+            if self._isolated_ports is not None:
+                try:
+                    await self._isolated_ports.close()
+                except Exception as error:
+                    errors.append(error)
             async with self._lifecycle_lock:
                 self._state.clear()
                 self._started = False
@@ -244,9 +314,11 @@ class RuntimeCore:
             raise ExceptionGroup("RuntimeCore shutdown errors", errors)
 
     async def submit_task(self, request: TaskRequest) -> Task:
+        deadline = (asyncio.get_running_loop().time() + request.timeout_s
+                    if request.timeout_s is not None else None)
         async with self._lifecycle_lock:
             self._require_running()
-            operation = asyncio.create_task(self._submit_owned(request))
+            operation = asyncio.create_task(self._submit_owned(request, deadline))
             try:
                 return await asyncio.shield(operation)
             except asyncio.CancelledError:
@@ -255,7 +327,7 @@ class RuntimeCore:
                 await asyncio.gather(operation, return_exceptions=True)
                 raise
 
-    async def _submit_owned(self, request: TaskRequest) -> Task:
+    async def _submit_owned(self, request: TaskRequest, deadline: float | None = None) -> Task:
         async with self._idempotency_lock:
             if request.idempotency_key:
                 existing = await self._repository.find_by_idempotency_key(
@@ -281,13 +353,29 @@ class RuntimeCore:
         await self._state.transition(
             task, "TASK_VALIDATING", {"state": TaskState.VALIDATING}
         )
+        budget = asyncio.timeout_at(deadline)
         try:
-            # One reading for the whole task, so every step is judged against
-            # the same robot snapshot. A provider that raises fails the
-            # submission rather than admitting work blindly.
-            unsatisfied = await self._policy.unsatisfied()
-            for call in request.steps:
-                self._policy.validate(call, unsatisfied)
+            async with budget:
+                WorkflowExecutor._require_deadline(deadline, budget)
+                # One reading for the whole task, so every step is judged against
+                # the same robot snapshot. A provider that raises fails the
+                # submission rather than admitting work blindly.
+                unsatisfied = await self._policy.unsatisfied()
+                for call in request.steps:
+                    if self._isolated_ports is None:
+                        self._policy.validate(call, unsatisfied)
+                    else:
+                        await self._isolated_ports.validate(call, unsatisfied, self._port_inputs[3])
+                WorkflowExecutor._require_deadline(deadline, budget)
+        except TimeoutError as cause:
+            error = (TaskTimeout("Task exceeded its total deadline", {"timeout_s": task.timeout_s})
+                     if budget.expired() else InternalError(
+                         f"Task validation failed: {cause}",
+                         {"exception_type": type(cause).__name__},
+                     ))
+            await self._state.fail_task(task, error.info)
+            self._state.cleanup(task.id)
+            return self._state.snapshot(task)
         except AgentRuntimeError as error:
             await self._state.fail_task(task, error.info)
             self._state.cleanup(task.id)
@@ -303,7 +391,7 @@ class RuntimeCore:
 
         await self._state.transition(task, "TASK_QUEUED", {"state": TaskState.QUEUED})
         execution = asyncio.create_task(
-            self._executor.run(task), name=f"robot-task-{task.id}"
+            self._executor.run(task, deadline=deadline), name=f"robot-task-{task.id}"
         )
         self._state.register_execution(task.id, execution)
         return self._state.snapshot(task)

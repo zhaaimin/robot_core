@@ -1,6 +1,8 @@
 import asyncio
 from collections.abc import Callable
+from concurrent.futures import Future
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -8,6 +10,7 @@ from uuid import uuid4
 from robot_agent_runtime.errors import (
     AgentRuntimeError,
     InvalidRequest,
+    InternalError,
     RobotConnectionError,
     RobotRequestError,
     RobotResponseError,
@@ -27,6 +30,7 @@ _MAX_EARLY_EVENTS = 128
 @dataclass
 class _Speech:
     finished: asyncio.Future[None]
+    dispatched: bool = False
     work_id: str | None = None
     early_finished: set[str] = field(default_factory=set)
     stop_task: asyncio.Task[None] | None = None
@@ -106,13 +110,15 @@ class CcApiSpeechSkill:
 
     async def _close(self) -> None:
         self._closed = True
+        errors: list[Exception] = []
         owner = self._owner
         if owner is not None and not owner.done():
             owner.cancel()
-            await asyncio.gather(owner, return_exceptions=True)
+            results = await asyncio.gather(owner, return_exceptions=True)
+            errors.extend(error for error in results
+                          if isinstance(error, Exception) and not isinstance(error, TaskCancelled))
         if not self._started:
             return
-        errors: list[Exception] = []
         for cleanup in (
             lambda: self._api.notify("cc.api.work.unsubscribe"),
             lambda: self._api.remove_service(_FINISHED),
@@ -121,12 +127,122 @@ class CcApiSpeechSkill:
             try:
                 cleanup()
             except Exception as error:
-                errors.append(error)
+                errors.append(RobotConnectionError(
+                    "Could not detach CC API speech callbacks",
+                    details={"cause": type(error).__name__},
+                ))
         self._started = False
+        if len(errors) == 1:
+            raise errors[0]
         if errors:
-            raise RobotConnectionError("Could not detach CC API speech callbacks") from errors[0]
+            raise ExceptionGroup("CC API speech shutdown errors", errors)
 
     async def execute(
+        self, context: SkillContext, params: dict[str, Any]
+    ) -> SkillResult:
+        loop = self._loop
+        if loop is not None and loop is not asyncio.get_running_loop():
+            return await self._execute_on_owner(loop, context, params)
+        return await self._execute(context, params)
+
+    async def _execute_on_owner(
+        self, loop: asyncio.AbstractEventLoop, context: SkillContext, params: dict[str, Any]
+    ) -> SkillResult:
+        """Keep vendor futures and callbacks on the application-owned loop.
+
+        The handoff future settles only after the owner task really exits.
+        Cancelling its waiter requests owner cancellation without falsely
+        acknowledging that the robot has stopped.
+        """
+        completed: Future[SkillResult] = Future()
+        owner_task: asyncio.Task[None] | None = None
+        owner_cancel: asyncio.Event | None = None
+        cancel_requested = False
+        values = deepcopy(params)
+        task_id, execution_id = context.task_id, context.execution_id
+        worker_loop = asyncio.get_running_loop()
+        progress = context.progress
+
+        def report(value: float) -> None:
+            if progress is not None:
+                with suppress(RuntimeError):
+                    worker_loop.call_soon_threadsafe(progress, value)
+
+        async def run() -> None:
+            nonlocal owner_cancel
+            owner_cancel = asyncio.Event()
+            if cancel_requested:
+                owner_cancel.set()
+            try:
+                result = await self._execute(
+                    SkillContext(task_id, execution_id, owner_cancel,
+                                 report if progress is not None else None), values
+                )
+            except asyncio.CancelledError:
+                completed.cancel()
+            except Exception as error:
+                completed.set_exception(error)
+            except BaseException as error:
+                completed.set_exception(InternalError(
+                    "CC API owner raised an unsafe exception",
+                    details={"cause": type(error).__name__},
+                ))
+            else:
+                completed.set_result(deepcopy(result))
+
+        def launch() -> None:
+            nonlocal owner_task
+            owner_task = asyncio.create_task(run())
+            owner_task.add_done_callback(settled)
+
+        def settled(finished: asyncio.Task[None]) -> None:
+            if completed.done():
+                return
+            try:
+                finished.result()
+            except asyncio.CancelledError:
+                completed.cancel()
+            except BaseException as error:
+                completed.set_exception(InternalError(
+                    "CC API owner failed during handoff",
+                    details={"cause": type(error).__name__},
+                ))
+
+        def signal(*, cancel_task: bool = False) -> None:
+            nonlocal cancel_requested
+            cancel_requested = True
+            if owner_cancel is not None:
+                owner_cancel.set()
+            if cancel_task and owner_task is not None:
+                owner_task.cancel()
+
+        async def forward_cancel() -> None:
+            await context.cancel_event.wait()
+            loop.call_soon_threadsafe(signal)
+
+        loop.call_soon_threadsafe(launch)
+        waiter = asyncio.wrap_future(completed)
+        forwarder = asyncio.create_task(forward_cancel())
+        try:
+            return await asyncio.shield(waiter)
+        except asyncio.CancelledError:
+            loop.call_soon_threadsafe(lambda: signal(cancel_task=True))
+            while not waiter.done():
+                try:
+                    await asyncio.shield(waiter)
+                except asyncio.CancelledError:
+                    continue
+            return waiter.result()
+        finally:
+            forwarder.cancel()
+            cleanup = asyncio.gather(forwarder, return_exceptions=True)
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+
+    async def _execute(
         self, context: SkillContext, params: dict[str, Any]
     ) -> SkillResult:
         if not self._started or self._closed or self._broken:
@@ -166,6 +282,15 @@ class CcApiSpeechSkill:
                 except asyncio.CancelledError:
                     continue
             await cleanup
+            raise TaskCancelled("Speech cancellation confirmed by finished notification") from None
+        except RobotStopError:
+            raise
+        except Exception as error:
+            rejected_start = isinstance(error, RobotRequestError) and speech.work_id is None
+            finished = (speech.finished.done() and not speech.finished.cancelled()
+                        and speech.finished.exception() is None)
+            if speech.dispatched and not rejected_start and not finished:
+                await self._stop(speech, launch)
             raise
         finally:
             cancelled.cancel()
@@ -225,8 +350,10 @@ class CcApiSpeechSkill:
             self._post(self._resolve_response, response, value)
 
         try:
+            if method == _START and self._speech is not None:
+                self._speech.dispatched = True
             self._api.request(method, params, received)
-        except Exception as error:
+        except BaseException as error:
             self._broken = True
             response.cancel()
             raise RobotConnectionError("CC API request dispatch failed", details={"method": method}) from error
@@ -238,7 +365,9 @@ class CcApiSpeechSkill:
                     details={"method": method, "vendor_code": value.error_code},
                 )
             return value.result
-        except AttributeError as error:
+        except RobotRequestError:
+            raise
+        except BaseException as error:
             self._broken = True
             raise RobotResponseError("Malformed CC API response", details={"method": method}) from error
 
