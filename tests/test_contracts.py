@@ -14,7 +14,44 @@ import pytest
 from robot_agent_runtime.adapters.simulator import Simulator
 from robot_agent_runtime.models import SkillCall, SkillContext, TaskRequest, TaskState
 from robot_agent_runtime.sdk import RemoteRuntime
-from robot_agent_runtime.ports import CallbackApiResponse, CallbackRobotApi, PagedEventRepository, Skill
+from robot_agent_runtime.ports import (
+    AdmissionValidator, CallbackApiResponse, CallbackRobotApi, PagedEventRepository, Skill,
+)
+
+
+async def check_admission_validator_contract(validator: AdmissionValidator) -> None:
+    from robot_agent_runtime.errors import PermissionDenied, PreconditionFailed, SchemaValidationError
+
+    valid = SkillCall(skill="navigation.navigate_to", params={"target": "dock"})
+    await validator.validate(valid, frozenset())
+    with pytest.raises(SchemaValidationError):
+        await validator.validate(SkillCall(skill="navigation.navigate_to", params={}), frozenset())
+    with pytest.raises(PreconditionFailed):
+        await validator.validate(valid, frozenset({"estop.clear"}))
+    with pytest.raises(PermissionDenied):
+        await validator.validate(SkillCall(skill="audio.speak", params={"message": "hello"}), frozenset())
+
+
+async def test_local_admission_validator_contract() -> None:
+    from robot_agent_runtime.kernel.policy import LocalAdmissionValidator, PolicyEnforcer
+    from robot_agent_runtime.kernel.registry import SkillRegistry
+
+    await check_admission_validator_contract(LocalAdmissionValidator(
+        PolicyEnforcer(SkillRegistry(Simulator().skills), {"navigation"}),
+    ))
+
+
+async def test_isolated_admission_validator_contract() -> None:
+    from robot_agent_runtime.hosting.isolation import IsolatedAdmissionValidator, isolate_ports
+    from robot_agent_runtime.options import RuntimeOptions
+    from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
+
+    ports = isolate_ports(InMemoryTaskRepository(), Simulator().skills, None, None, RuntimeOptions())
+    await ports.prepare()
+    try:
+        await check_admission_validator_contract(IsolatedAdmissionValidator(ports, {"navigation"}))
+    finally:
+        await ports.close()
 
 
 async def check_paged_event_repository_contract(repository: PagedEventRepository) -> None:
@@ -42,13 +79,13 @@ async def check_paged_event_repository_contract(repository: PagedEventRepository
 
 
 async def test_memory_paged_event_repository_contract() -> None:
-    from robot_agent_runtime.repository import InMemoryTaskRepository
+    from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 
     await check_paged_event_repository_contract(InMemoryTaskRepository())
 
 
 async def test_sqlite_paged_event_repository_contract() -> None:
-    from robot_agent_runtime.sqlite_repository import SQLiteTaskRepository
+    from robot_agent_runtime.repositories.sqlite import SQLiteTaskRepository
 
     await check_paged_event_repository_contract(SQLiteTaskRepository(":memory:"))
 

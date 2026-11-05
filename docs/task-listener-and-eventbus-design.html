@@ -188,7 +188,7 @@
 
 <h2 id="birth">2. 事件如何诞生：唯一写入点</h2>
 
-<p>所有事件只有一个产出点——<span class="file-ref">task_state.py</span> 的 <code>TaskStateStore.transition()</code>（内核不变量 1：任务状态唯一写入点）。它在<strong>持有该任务锁</strong>的前提下，按固定四步顺序执行：</p>
+<p>所有事件只有一个产出点——<span class="file-ref">kernel/task_state.py</span> 的 <code>TaskStateStore.transition()</code>（内核不变量 1：任务状态唯一写入点）。它在<strong>持有该任务锁</strong>的前提下，按固定四步顺序执行：</p>
 
 <ol>
   <li><strong>快照</strong>：深拷贝当前 <code>Task</code>，套用变更得到新快照；</li>
@@ -199,7 +199,7 @@
 
 <p>顺序的意义：<code>publish</code> 在锁内、持久化之后，因此<strong>事件的发布顺序严格等于状态迁移顺序</strong>，且订阅者读到的事件一定已经落盘。</p>
 
-<pre><code># task_state.py:104-133（精简）
+<pre><code># kernel/task_state.py:104-133（精简）
 async def transition(self, task, event_type, changes=None, data=None, guard=None):
     async with self.task_locks[task.id]:
         snapshot = self.snapshot(task)
@@ -219,11 +219,11 @@ async def transition(self, task, event_type, changes=None, data=None, guard=None
 
 <table>
   <tr><th>事件类型</th><th>产出位置</th></tr>
-  <tr><td>TASK_CREATED</td><td><code>core.py:280</code></td></tr>
-  <tr><td>SKILL_STARTED / SKILL_SUCCEEDED / SKILL_FAILED / SKILL_PROGRESS</td><td><code>executor.py</code></td></tr>
-  <tr><td>TASK_SUCCEEDED / TASK_FAILED / TASK_CANCEL_REQUESTED</td><td><code>task_state.py</code></td></tr>
-  <tr><td>TASK_CANCELED</td><td><code>executor.py</code></td></tr>
-  <tr><td>TASK_RECONCILED</td><td><code>recovery.py</code></td></tr>
+  <tr><td>TASK_CREATED</td><td><code>kernel/core.py:280</code></td></tr>
+  <tr><td>SKILL_STARTED / SKILL_SUCCEEDED / SKILL_FAILED / SKILL_PROGRESS</td><td><code>kernel/executor.py</code></td></tr>
+  <tr><td>TASK_SUCCEEDED / TASK_FAILED / TASK_CANCEL_REQUESTED</td><td><code>kernel/task_state.py</code></td></tr>
+  <tr><td>TASK_CANCELED</td><td><code>kernel/executor.py</code></td></tr>
+  <tr><td>TASK_RECONCILED</td><td><code>kernel/recovery.py</code></td></tr>
 </table>
 
 <h2 id="eventbus">3. EventBus：先回放、后实时、水位去重</h2>
@@ -231,7 +231,7 @@ async def transition(self, task, event_type, changes=None, data=None, guard=None
 内存与 SQLite 仓储实现可选 <code>PagedEventRepository</code>；旧仓储在外部线程内裁页。
 订阅、普通调用与控制操作分别限额，查询、取消和关闭的容量预留会传递到端口线程。</p>
 
-<p><span class="file-ref">events.py</span> 的 <code>EventBus</code> 是事件的唯一分发组件。它自身不存事件——持久化在 <code>TaskRepository</code>，总线只维护「谁在等」和「发到哪了」。</p>
+<p><span class="file-ref">kernel/events.py</span> 的 <code>EventBus</code> 是事件的唯一分发组件。它自身不存事件——持久化在 <code>TaskRepository</code>，总线只维护「谁在等」和「发到哪了」。</p>
 
 <h3>3.1 四份内部状态</h3>
 <table>
@@ -402,7 +402,7 @@ async def _invoke(self, callback, *args):
 </table>
 
 <h3>5.1 唯一常驻让出点</h3>
-<p>让出控制权的位置在 <span class="file-ref">events.py:81</span> 的 <code>queued = await queue.get()</code>。更精确地说，是它驱动到的 <code>asyncio.Queue.get</code> 内部 <code>await getter</code>（future 未完成）那一刻。</p>
+<p>让出控制权的位置在 <span class="file-ref">kernel/events.py:81</span> 的 <code>queued = await queue.get()</code>。更精确地说，是它驱动到的 <code>asyncio.Queue.get</code> 内部 <code>await getter</code>（future 未完成）那一刻。</p>
 
 <div class="callout">
   <strong>yield 与 await 的区分（关键）</strong>

@@ -16,7 +16,7 @@ from robot_agent_runtime.sdk.listeners import (
     TaskListener,
     TaskListeners,
 )
-from robot_agent_runtime.wire import read_message, write_message
+from robot_agent_runtime.transport.wire import read_message, write_message
 
 
 class RemoteRuntimeError(AgentRuntimeError):

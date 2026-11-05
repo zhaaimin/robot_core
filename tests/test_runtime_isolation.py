@@ -9,7 +9,7 @@ from robot_agent_runtime.adapters.simulator import Simulator
 from robot_agent_runtime.errors import ExtensionTimeout, InvalidRequest
 from robot_agent_runtime.models import SkillCall, SkillContext, SkillDefinition, SkillResult, Task, TaskRequest, TaskState
 from robot_agent_runtime.options import RuntimeOptions
-from robot_agent_runtime.repository import InMemoryTaskRepository
+from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 from robot_agent_runtime.sdk import RobotRuntime
 
 

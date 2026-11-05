@@ -8,7 +8,7 @@ import pytest
 from robot_agent_runtime.adapters.simulator import Simulator
 from robot_agent_runtime.errors import TaskNotFound
 from robot_agent_runtime.models import Event, SkillCall, Task, TaskRequest, TaskState
-from robot_agent_runtime.repository import InMemoryTaskRepository
+from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 from robot_agent_runtime.sdk import RobotRuntime
 
 

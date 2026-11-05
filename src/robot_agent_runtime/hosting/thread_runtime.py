@@ -7,7 +7,7 @@ from contextvars import Context
 from typing import Any, Generic, TypeVar
 
 from robot_agent_runtime.errors import ExtensionCapacityExceeded, InternalError, InvalidRequest
-from robot_agent_runtime.execution_context import CONTROL_OPERATION
+from robot_agent_runtime.hosting.execution_context import CONTROL_OPERATION
 
 
 T = TypeVar("T")
@@ -35,6 +35,8 @@ class LoopJob(Generic[T]):
     The completion future belongs to the actual invocation. Waiting, timing out,
     or cancelling a waiter never changes it. A queued invocation can finish as
     cancelled immediately because its factory has not acquired the thread yet.
+    cancel_if_queued atomically revokes only unstarted work. A caller can then
+    disable an uncertain port before requesting cancellation of started work.
     """
 
     def __init__(
@@ -55,6 +57,9 @@ class LoopJob(Generic[T]):
 
     def cancel(self) -> None:
         self._owner._cancel(self)
+
+    def cancel_if_queued(self) -> bool:
+        return self._owner._cancel(self, only_if_queued=True)
 
     def done(self) -> bool:
         return self._completion.done()
@@ -249,12 +254,14 @@ class LoopThread:
             job._task = None
             self._stop_when_idle()
 
-    def _cancel(self, job: LoopJob[Any]) -> None:
+    def _cancel(self, job: LoopJob[Any], *, only_if_queued: bool = False) -> bool:
         with self._lock:
+            if only_if_queued and job._started:
+                return False
             if job.done() or job._cancel_requested:
-                return
+                return not job._started
             if job._started and not job._cancellable:
-                return
+                return False
             job._cancel_requested = True
             if not job._started:
                 job._completion.cancel()
@@ -263,6 +270,7 @@ class LoopThread:
             if self._loop is not None and job._task is not None:
                 self._loop.call_soon_threadsafe(job._task.cancel)
             self._stop_when_idle()
+            return not job._started
 
     def _stop_when_idle(self) -> None:
         if self._closed and not self._jobs and not self._tasks and self._loop is not None:

@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 import robot_agent_runtime.adapters.simulator as simulator_module
-from robot_agent_runtime.core import RuntimeCore
+from robot_agent_runtime.kernel.core import RuntimeCore
 from robot_agent_runtime.models import (
     Event,
     SkillCall,
@@ -16,8 +16,8 @@ from robot_agent_runtime.models import (
     TaskRequest,
     TaskState,
 )
-from robot_agent_runtime.repository import InMemoryTaskRepository
-from robot_agent_runtime.sqlite_repository import SQLiteTaskRepository
+from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
+from robot_agent_runtime.repositories.sqlite import SQLiteTaskRepository
 
 
 NONTERMINAL_STATES = [

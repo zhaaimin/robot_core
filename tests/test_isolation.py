@@ -23,7 +23,7 @@ from robot_agent_runtime.models import (
     TaskState,
 )
 from robot_agent_runtime.options import RuntimeOptions
-from robot_agent_runtime.repository import InMemoryTaskRepository
+from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 
 
 def definition(name: str = "test.skill") -> SkillDefinition:
@@ -55,7 +55,7 @@ async def checkpoint() -> None:
 
 
 async def test_skill_definition_and_blocking_execution_keep_stable_worker_affinity() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     loop = asyncio.get_running_loop()
     kernel_thread = threading.get_ident()
@@ -94,7 +94,7 @@ async def test_skill_definition_and_blocking_execution_keep_stable_worker_affini
 
 
 async def test_skill_params_results_and_declarations_are_independent_snapshots() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     class SnapshotSkill:
         definition = definition()
@@ -127,7 +127,7 @@ async def test_skill_params_results_and_declarations_are_independent_snapshots()
 
 
 async def test_blocking_skill_cancel_is_bounded_and_poisons_instance() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     loop = asyncio.get_running_loop()
     entered = asyncio.Event()
@@ -163,7 +163,7 @@ async def test_blocking_skill_cancel_is_bounded_and_poisons_instance() -> None:
 
 
 async def test_skill_cancellation_forwards_local_event_and_confirms_real_completion() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     loop = asyncio.get_running_loop()
     entered = asyncio.Event()
@@ -196,7 +196,7 @@ async def test_skill_cancellation_forwards_local_event_and_confirms_real_complet
 
 
 async def test_repository_timeout_poisons_later_writes_and_never_blocks_kernel() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     release = threading.Event()
 
@@ -226,7 +226,7 @@ async def test_repository_timeout_poisons_later_writes_and_never_blocks_kernel()
 
 
 async def test_repository_results_are_snapshots_even_if_adapter_returns_live_models() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     class LiveRepository(InMemoryTaskRepository):
         value = task()
@@ -247,7 +247,7 @@ async def test_repository_results_are_snapshots_even_if_adapter_returns_live_mod
 
 
 async def test_state_and_reconciler_deadlines_are_bounded() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     release = threading.Event()
 
@@ -279,7 +279,7 @@ async def test_state_and_reconciler_deadlines_are_bounded() -> None:
 
 
 async def test_extension_base_exception_becomes_internal_error() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     class BrokenState:
         async def unsatisfied(self) -> frozenset[str]:
@@ -301,7 +301,7 @@ async def test_extension_base_exception_becomes_internal_error() -> None:
 
 
 async def test_distinct_extension_objects_obey_fixed_thread_capacity() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     class Skill:
         definition = definition()
@@ -324,7 +324,7 @@ async def test_distinct_extension_objects_obey_fixed_thread_capacity() -> None:
 
 async def test_simulator_push_crosses_thread_owner_loop_safely() -> None:
     from robot_agent_runtime.adapters.simulator import SimulatedRobotState
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     loop = asyncio.get_running_loop()
     watching = asyncio.Event()
@@ -360,7 +360,7 @@ class Response:
 
 async def test_cc_api_execute_uses_adapter_owner_loop_and_real_stop_completion() -> None:
     from robot_agent_runtime.adapters.cc_api import CcApiSpeechSkill
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     owner_thread = threading.get_ident()
 
@@ -412,7 +412,7 @@ async def test_cc_api_execute_uses_adapter_owner_loop_and_real_stop_completion()
 
 
 async def test_cancelled_repository_read_does_not_poison_close_or_later_writes() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     loop = asyncio.get_running_loop()
     entered = asyncio.Event()
@@ -438,7 +438,7 @@ async def test_cancelled_repository_read_does_not_poison_close_or_later_writes()
 
 
 async def test_cancelled_repository_write_returns_authoritative_completion() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     loop = asyncio.get_running_loop()
     entered = asyncio.Event()
@@ -466,7 +466,7 @@ async def test_cancelled_repository_write_returns_authoritative_completion() -> 
 
 
 async def test_progress_is_delivered_before_normal_completion_and_late_calls_are_ignored() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     class ProgressSkill:
         definition = definition()
@@ -497,7 +497,7 @@ async def test_progress_is_delivered_before_normal_completion_and_late_calls_are
 
 
 async def test_swallowed_cancellation_is_unresponsive_until_real_task_stops() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     loop = asyncio.get_running_loop()
     entered = asyncio.Event()
@@ -534,7 +534,7 @@ async def test_swallowed_cancellation_is_unresponsive_until_real_task_stops() ->
 
 
 async def test_queued_repository_write_cannot_start_after_another_call_times_out() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     loop = asyncio.get_running_loop()
     entered = asyncio.Event()
@@ -574,7 +574,7 @@ async def test_queued_repository_write_cannot_start_after_another_call_times_out
 
 
 async def test_non_json_payload_and_custom_exception_never_cross_into_kernel() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     class UnsafeError(Exception):
         def __str__(self) -> str:
@@ -614,8 +614,8 @@ async def test_validation_runs_on_fixed_bounded_worker_and_keeps_policy_rules() 
     from unittest.mock import patch
 
     from robot_agent_runtime.errors import SchemaValidationError
-    from robot_agent_runtime.isolation import isolate_ports
-    from robot_agent_runtime.policy import PolicyEnforcer
+    from robot_agent_runtime.hosting.isolation import isolate_ports
+    from robot_agent_runtime.kernel.policy import PolicyEnforcer
 
     class Skill:
         definition = definition()
@@ -660,7 +660,7 @@ async def test_validation_runs_on_fixed_bounded_worker_and_keeps_policy_rules() 
 
 
 async def test_blocked_state_watch_close_is_bounded_until_real_pull_finishes() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     loop = asyncio.get_running_loop()
     entered = asyncio.Event()
@@ -694,7 +694,7 @@ async def test_blocked_state_watch_close_is_bounded_until_real_pull_finishes() -
 
 
 async def test_precancelled_skill_never_dispatches_external_execute() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     class Action:
         definition = definition()
@@ -722,7 +722,7 @@ async def test_precancelled_skill_never_dispatches_external_execute() -> None:
 async def test_progress_conversion_cannot_hold_a_lock_needed_by_kernel_close() -> None:
     from unittest.mock import patch
 
-    from robot_agent_runtime.isolation import _ProgressBridge, isolate_ports
+    from robot_agent_runtime.hosting.isolation import _ProgressBridge, isolate_ports
 
     loop = asyncio.get_running_loop()
     entered = asyncio.Event()
@@ -784,7 +784,7 @@ async def test_progress_conversion_cannot_hold_a_lock_needed_by_kernel_close() -
 
 
 def test_bounded_snapshot_rejects_size_depth_and_cycles_before_copying() -> None:
-    from robot_agent_runtime.boundary import bounded_snapshot
+    from robot_agent_runtime.hosting.boundary import bounded_snapshot
 
     for value, max_bytes, max_depth in (
         ({"large": "x" * 1000}, 100, 64),
@@ -799,7 +799,7 @@ def test_bounded_snapshot_rejects_size_depth_and_cycles_before_copying() -> None
 
 
 def test_bounded_snapshot_uses_plain_types_without_external_copy_or_dump_hooks() -> None:
-    from robot_agent_runtime.boundary import bounded_snapshot
+    from robot_agent_runtime.hosting.boundary import bounded_snapshot
 
     class HostileString(str):
         def __str__(self) -> str:
@@ -827,7 +827,7 @@ def test_bounded_snapshot_uses_plain_types_without_external_copy_or_dump_hooks()
 
 
 async def test_all_extension_exception_branches_are_bounded_and_have_no_external_chain() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     class UnsafeException(Exception):
         pass
@@ -863,7 +863,7 @@ async def test_all_extension_exception_branches_are_bounded_and_have_no_external
 
 
 async def test_noncancellable_skill_waits_for_natural_completion_without_injecting_cancel() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     loop = asyncio.get_running_loop()
     entered, cancellation_seen = asyncio.Event(), asyncio.Event()
@@ -902,7 +902,7 @@ async def test_noncancellable_skill_waits_for_natural_completion_without_injecti
 
 
 async def test_started_skill_cancelled_error_is_an_unconfirmed_physical_stop() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     loop = asyncio.get_running_loop()
     entered = asyncio.Event()
@@ -931,7 +931,7 @@ async def test_started_skill_cancelled_error_is_an_unconfirmed_physical_stop() -
 
 
 async def test_cancelled_repository_lifecycle_cannot_overlap_retry_or_cleanup() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     for operation in ("start", "close"):
         loop = asyncio.get_running_loop()
@@ -973,7 +973,7 @@ async def test_cancelled_repository_lifecycle_cannot_overlap_retry_or_cleanup() 
 
 
 async def test_legacy_repository_event_page_is_sliced_in_worker_before_snapshot() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
     from robot_agent_runtime.models import Event
 
     class LegacyRepository:
@@ -992,7 +992,7 @@ async def test_legacy_repository_event_page_is_sliced_in_worker_before_snapshot(
 
 
 def test_bounded_snapshot_rejects_foreign_objects_without_reading_their_class_hook() -> None:
-    from robot_agent_runtime.boundary import bounded_snapshot
+    from robot_agent_runtime.hosting.boundary import bounded_snapshot
 
     class UnsafeValue:
         @property
@@ -1004,8 +1004,8 @@ def test_bounded_snapshot_rejects_foreign_objects_without_reading_their_class_ho
 
 
 async def test_control_port_call_has_capacity_and_worker_context_when_normal_slot_is_full() -> None:
-    from robot_agent_runtime.execution_context import CONTROL_OPERATION
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.execution_context import CONTROL_OPERATION
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     loop = asyncio.get_running_loop()
     entered = asyncio.Event()
@@ -1046,7 +1046,7 @@ async def test_control_port_call_has_capacity_and_worker_context_when_normal_slo
 
 
 async def test_invalid_cancellation_results_poison_skill_before_another_dispatch() -> None:
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     for returned in ({}, [], None, SkillResult(success=False)):
         loop = asyncio.get_running_loop()
@@ -1085,7 +1085,7 @@ async def test_invalid_cancellation_results_poison_skill_before_another_dispatch
 async def test_simultaneous_cancellation_and_completion_requires_confirmed_stop() -> None:
     from unittest.mock import patch
 
-    from robot_agent_runtime.isolation import isolate_ports
+    from robot_agent_runtime.hosting.isolation import isolate_ports
 
     original_wait = asyncio.wait
 
@@ -1111,7 +1111,7 @@ async def test_simultaneous_cancellation_and_completion_requires_confirmed_stop(
         await ports.prepare()
         confirmed = type(returned) is SkillResult and returned.success
         try:
-            with patch("robot_agent_runtime.isolation.asyncio.wait", both_ready):
+            with patch("robot_agent_runtime.hosting.isolation.asyncio.wait", both_ready):
                 expected = TaskCancelled if confirmed else ExecutionUnresponsive
                 with pytest.raises(expected):
                     await asyncio.wait_for(ports.skills["test.skill"].execute(ctx, {}), 0.3)

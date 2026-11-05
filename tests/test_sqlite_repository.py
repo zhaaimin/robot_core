@@ -45,11 +45,11 @@ def make_event(task_id: str, sequence: int, event_id: str | None = None) -> Even
 @asynccontextmanager
 async def repository(kind: str, tmp_path: Path) -> AsyncIterator[TaskRepository]:
     if kind == "memory":
-        from robot_agent_runtime.repository import InMemoryTaskRepository
+        from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 
         repo = InMemoryTaskRepository()
     else:
-        from robot_agent_runtime.sqlite_repository import SQLiteTaskRepository
+        from robot_agent_runtime.repositories.sqlite import SQLiteTaskRepository
 
         repo = SQLiteTaskRepository(":memory:")
     await repo.start()
@@ -251,7 +251,7 @@ async def test_duplicate_event_sequence_for_one_task_conflicts(
 
 
 async def test_inmemory_apply_transition_failure_leaves_task_and_events_unchanged() -> None:
-    from robot_agent_runtime.repository import InMemoryTaskRepository
+    from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 
     repo = InMemoryTaskRepository()
     await repo.start()
@@ -298,7 +298,7 @@ async def test_nonterminal_tasks_are_filtered_and_stably_sorted(
 
 
 async def test_sqlite_memory_start_and_close_are_idempotent() -> None:
-    from robot_agent_runtime.sqlite_repository import SQLiteTaskRepository
+    from robot_agent_runtime.repositories.sqlite import SQLiteTaskRepository
 
     repo = SQLiteTaskRepository(":memory:")
     await repo.start()
@@ -313,7 +313,7 @@ async def test_sqlite_memory_start_and_close_are_idempotent() -> None:
 async def test_sqlite_same_instance_can_restart_after_repeated_close(
     tmp_path: Path,
 ) -> None:
-    from robot_agent_runtime.sqlite_repository import SQLiteTaskRepository
+    from robot_agent_runtime.repositories.sqlite import SQLiteTaskRepository
 
     repo = SQLiteTaskRepository(str(tmp_path / "restart.db"))
     task = make_task("persistent")
@@ -334,7 +334,7 @@ async def test_sqlite_start_closes_controlled_connection_when_schema_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import aiosqlite
-    import robot_agent_runtime.sqlite_repository as sqlite_repository
+    import robot_agent_runtime.repositories.sqlite as sqlite_repository
 
     class FailingSchemaConnection:
         def __init__(self) -> None:
@@ -367,7 +367,7 @@ async def test_sqlite_cancel_before_commit_rolls_back_and_allows_later_operation
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import aiosqlite
-    from robot_agent_runtime.sqlite_repository import SQLiteTaskRepository
+    from robot_agent_runtime.repositories.sqlite import SQLiteTaskRepository
 
     repo = SQLiteTaskRepository(":memory:")
     await repo.start()
@@ -411,7 +411,7 @@ async def test_sqlite_read_waits_for_update_commit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import aiosqlite
-    from robot_agent_runtime.sqlite_repository import SQLiteTaskRepository
+    from robot_agent_runtime.repositories.sqlite import SQLiteTaskRepository
 
     repo = SQLiteTaskRepository(":memory:")
     await repo.start()
@@ -459,7 +459,7 @@ async def test_sqlite_read_waits_for_update_commit(
 
 
 async def test_sqlite_can_continue_reading_and_writing_after_unique_conflict() -> None:
-    from robot_agent_runtime.sqlite_repository import SQLiteTaskRepository
+    from robot_agent_runtime.repositories.sqlite import SQLiteTaskRepository
 
     repo = SQLiteTaskRepository(":memory:")
     await repo.start()
@@ -481,7 +481,7 @@ async def test_sqlite_concurrent_start_creates_only_one_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import aiosqlite
-    from robot_agent_runtime.sqlite_repository import SQLiteTaskRepository
+    from robot_agent_runtime.repositories.sqlite import SQLiteTaskRepository
 
     original_connect = aiosqlite.connect
     connect_started = asyncio.Event()
@@ -531,7 +531,7 @@ async def test_sqlite_close_waits_for_concurrent_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import aiosqlite
-    from robot_agent_runtime.sqlite_repository import SQLiteTaskRepository
+    from robot_agent_runtime.repositories.sqlite import SQLiteTaskRepository
 
     original_connect = aiosqlite.connect
     connect_started = asyncio.Event()
@@ -577,7 +577,7 @@ async def test_sqlite_preserves_unknown_integrity_errors(
     operation: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import aiosqlite
-    from robot_agent_runtime.sqlite_repository import SQLiteTaskRepository
+    from robot_agent_runtime.repositories.sqlite import SQLiteTaskRepository
 
     repo = SQLiteTaskRepository(":memory:")
     await repo.start()
@@ -605,7 +605,7 @@ async def test_sqlite_preserves_unknown_integrity_errors(
 
 
 async def test_sqlite_file_data_survives_close_and_reopen(tmp_path: Path) -> None:
-    from robot_agent_runtime.sqlite_repository import SQLiteTaskRepository
+    from robot_agent_runtime.repositories.sqlite import SQLiteTaskRepository
 
     database = str(tmp_path / "runtime.db")
     task = make_task("persistent", idempotency_key="persistent-key")

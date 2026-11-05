@@ -29,7 +29,7 @@ pip install -e '.[test]'
 ```python
 from robot_agent_runtime.adapters.simulator import Simulator
 from robot_agent_runtime.models import SkillCall, TaskRequest
-from robot_agent_runtime.repository import InMemoryTaskRepository
+from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 from robot_agent_runtime.sdk import RobotRuntime
 
 simulator = Simulator()
@@ -79,9 +79,12 @@ finally:
 
 `RobotRuntime` 与 `RemoteRuntime` 均提供：
 
+服务端从 `robot_agent_runtime.transport.server` 导入 `RuntimeServer`；低层内核从
+`robot_agent_runtime.kernel.core` 导入 `RuntimeCore`。使用下方模块结构中的新路径导入。
+
 | 方法 | 说明 |
 | --- | --- |
-| `start()` | 嵌入式启动线程并完成重启恢复；远程模式确认服务可用 |
+| `start()` | 嵌入式按对象的线程绑定启动并完成重启恢复；远程模式确认服务可用 |
 | `submit_task(request)` | 提交任务，返回快照；校验失败直接返回 `FAILED` 任务 |
 | `get_task_status(task_id)` | 读取持久化的任务状态 |
 | `cancel_task(task_id)` | 请求取消并在有限停止确认期后返回终态；无法确认时进入待对账状态 |
@@ -91,7 +94,21 @@ finally:
 | `close()` | 嵌入式停止内核并限时清理监听；远程模式清理本客户端监听和连接 |
 
 `RobotRuntime(..., options=RuntimeOptions(...))` 与
-`RuntimeServer(core, socket_path, options=RuntimeOptions(...))` 可以配置隔离边界：
+`RuntimeServer(repository, skills, socket_path, options=RuntimeOptions(...))` 可以配置隔离边界。
+服务端直接接收端口，不再接收已创建的 `RuntimeCore`：
+
+```python
+from robot_agent_runtime.transport.server import RuntimeServer
+
+server = RuntimeServer(
+    repository, skills, socket_path,
+    reconciler=reconciler,
+    allowed_permissions={"navigation", "audio"},
+    robot_state=robot_state,
+)
+```
+
+隔离配置示例：
 
 ```python
 from robot_agent_runtime.sdk import RuntimeOptions
@@ -131,9 +148,83 @@ options = RuntimeOptions(
 接实时。输入和结果须能表示为 JSON 数据。低层 `RuntimeCore` 单独使用时是受信任的
 asyncio 引擎，不自动提供线程隔离；面向业务的入口应使用 SDK 或 `RuntimeServer`。
 
+`KernelHost` 在专用内核循环中准备外部代理，随后创建唯一的 `RuntimeCore`。内核从构造时
+就使用最终端口、事件容量和准入校验器，不接收线程绑定，也不在运行期间替换依赖。
+`AdmissionValidator` 只负责准入规则：默认本地实现在当前循环校验，托管实现将相同规则
+交给有界校验线程；任务状态始终由内核写入。
+
+关闭由宿主协调：先 `RuntimeCore.stop()` 完成停止确认和终态持久化并结束事件生产，
+再排空已打开订阅的事件，之后 `RuntimeCore.close()` 关闭仓储，最后关闭外部循环和内核
+循环。`stop()` 与 `close()` 各自共享真实完成结果，重复调用和等待方取消不重复清理。
+`KernelHost.begin_close()` 发起同一次关闭并立即返回，`close()` 等待结果；SDK 先发起
+业务停止，再限时清理监听。停止或排空失败仍继续资源释放并汇总异常。
+
+### 外部对象的线程归属
+
+注册已有对象时可以用 `ThreadBinding` 选择线程，不传绑定保持原有的对象独占行为：
+
+| 注册方式 | 在一个运行时内的线程归属 |
+| --- | --- |
+| `ThreadBinding.shared(obj)` | 所有选择 shared 的对象共用一个外部线程 |
+| `ThreadBinding.group(obj, "navigation")` | 同名组共用一个外部线程，不同组彼此独立 |
+| `ThreadBinding.dedicated(obj)` 或直接传 `obj` | 该对象独占一个外部线程 |
+
+```python
+from robot_agent_runtime.sdk import RobotRuntime, ThreadBinding
+
+runtime = RobotRuntime(
+    repository,  # 仓储保持默认独占
+    {
+        "navigation.navigate_to": ThreadBinding.group(navigate_skill, "navigation"),
+        "navigation.position": ThreadBinding.group(position_skill, "navigation"),
+        "audio.speak": ThreadBinding.shared(speak_skill),
+        "vendor.blocking": ThreadBinding.dedicated(blocking_skill),
+    },
+    robot_state=navigation_state,  # 状态源保持默认独占，及时交付前置条件变化
+)
+```
+
+上面的变量代表应用预先创建的对象。`blocking_skill` 是示例变量名，表示可能调用同步阻塞
+接口的技能对象，例如等待返回的厂商 SDK 方法、同步网络请求或 `time.sleep()`；
+`"vendor.blocking"` 是示例注册名。两者都由应用自行定义，框架没有内置 blocking 技能。
+`ThreadBinding.dedicated(blocking_skill)` 为它选择独占线程，避免同步阻塞拖住共享线程
+中的其他对象。线程策略由应用显式选择，运行时不会自动检测技能是否阻塞。
+真正的异步 I/O 或 `await asyncio.sleep()` 会让出事件循环，适合使用共享或指定组线程；
+仅把包含同步阻塞调用的函数声明成 `async def`，仍会阻塞它所在的线程。
+
+技能、仓储、状态源和对账器都支持绑定。`RuntimeServer` 直接在端口构造参数中
+接收相同绑定，远程客户端不能改变服务端线程归属。共享和指定组均为运行时内部线程，
+不使用应用循环；默认 shared 线程与名为 `"shared"` 的指定组分开，不同运行时也不共享。
+同一对象按身份去重，重复注册必须使用相同模式和组名；普通对象等同 dedicated，
+与 shared/group 混用会在启动外部线程前以 `INVALID_REQUEST` 拒绝。
+绑定目标必须是实际对象，`ThreadBinding.shared(None)` 等空目标会在构造时以
+`INVALID_REQUEST` 拒绝；可选端口直接传 `None` 仍表示不启用该端口。
+
+线程名标明配置归属：默认共享为 `robot-extension-shared`，指定组为
+`robot-extension-group-组名`，独占为 `robot-extension-dedicated-序号`。
+这些名称可在线程调试器中核对；不同运行时可能出现相同名称，仍是不同线程。
+
+`max_extension_threads` 按实际分配的外部线程加一个校验线程计数，内核和 SDK 回调线程
+另计。共享线程上的所有对象共用 `max_pending_calls` 和控制调用额度，超限立即报错。
+同一线程内逐个读取技能声明，不会因技能数量多而在启动时挤满调用额度。
+
+共享只统一线程与事件循环，不保证调用串行；协程在 `await` 时可以交错，资源互斥仍由
+运行时资源锁负责。同步阻塞影响同组全部对象。**需要及时触发任务打断的状态源，不得与
+可能同步阻塞的技能共用事件循环**，否则 `watch()` 无法交付标签变化，运行中的任务不能
+及时响应前置条件丢失。状态源建议保持默认独占；适配器若自行交回其他循环，实际状态读取
+和推送所在的循环也必须避免同步阻塞。线程配置不会检测或自动禁止这些业务层组合。
+仓储建议保持默认独占，避免技能阻塞拖住任务持久化。某技能停止未确认只隔离该技能
+实例和资源，不关闭同组其他对象的线程。
+组内其他调用若也因阻塞而到期，仍分别遵守原有超时和故障关闭规则。
+
+绑定只控制运行时后续调用，`MySkill(...)` 构造仍在调用方线程；不提供工厂构造或自动迁移
+已绑定的 asyncio 对象。CC API 仍会将厂商操作交回适配器 `start()` 所在循环。
+低层 `RuntimeCore` 只接收普通端口对象并在当前循环执行；线程绑定交给 SDK/Server。
+
 端口截止后按失败关闭：状态读取失败仍以 `INTERNAL_ERROR` 拒绝提交；对账超时不猜测
-终态；仓储操作超时后报告 `EXTENSION_TIMEOUT` 并禁止继续使用该仓储，避免不确定提交
-之后继续写入。仓储不可用时，任务最终状态可能无法落盘，应在恢复仓储后对账。
+终态；仓储操作超时后报告 `EXTENSION_TIMEOUT`。若调用已开始，则禁止继续使用该仓储，
+避免不确定提交之后继续写入；仅排队且已确认撤销、从未开始的调用不会禁用仓储，也不会
+在队列恢复后补执行。仓储不可用时，任务最终状态可能无法落盘，应在恢复仓储后对账。
 
 接入 CC API 语音时，应用先调用 `CcApiSpeechSkill.start()` 注册回调，再启动运行时；
 退出时先关闭运行时，再关闭技能适配器，最后停止 SDK 连接。
@@ -215,6 +306,9 @@ SDK `close()` 会停止监听，不保证交付尚未完成的回调，要收齐
 
 ## 任务状态机
 
+目录按职责归类，任务状态、持久化与停止确认语义保持一致。
+`stop()` / `close()` 是运行时生命周期阶段，不增加业务任务状态；停止未确认仍落待对账。
+
 ```
 CREATED → VALIDATING → QUEUED → RUNNING → SUCCEEDED
                            │        │  ↕
@@ -231,6 +325,10 @@ CREATED → VALIDATING → QUEUED → RUNNING → SUCCEEDED
 
 注册式监听只观察这些状态，不增加新的状态或写入状态。`on_done` 包含所有终态，
 表示本次任务已结束，不等于成功；`on_error` 及回调队列满、排队超时也不改变机器人任务状态。
+线程选择不增加任务状态；共享组被阻塞时仍按原有期限、停止确认和资源隔离规则处理。
+尚未派发的技能在排队期间单步期限到期为 `FAILED / SKILL_TIMEOUT`，总期限到期为
+`FAILED / TASK_TIMEOUT`，撤销后不会补执行或隔离该技能实例。已开始且无法确认停止的
+调用仍进入待对账并隔离资源；软件状态不证明机器人已经停止。
 
 CC API 的 `audio.speak` 在启动受理后保持 `RUNNING`，收到匹配 `workId` 的
 `cc.api.work.finished` 才成功。首版按约定不解析 finished 的结束原因，外部停止/失败
@@ -258,38 +356,57 @@ CC API 的 `audio.speak` 在启动受理后保持 `RUNNING`，收到匹配 `work
 
 ## 模块结构
 
-```
+实现按职责归类；根目录只保留公共契约、配置与命令行入口。
+
+```text
 src/robot_agent_runtime/
-├── models.py              任务/事件/技能的数据模型与状态枚举
-├── errors.py              结构化错误码
-├── ports.py               技能、仓储、对账、状态源与回调型机器人 API 的 Protocol
-├── core.py                RuntimeCore：运行时生命周期与公开任务 API
-├── kernel_host.py         KernelHost：专用内核线程、请求/事件快照交接与关闭
-├── thread_runtime.py      LoopThread / LoopJob：固定 daemon 循环、容量与实际完成
-├── isolation.py           外部端口代理：线程归属、期限、取消/进度桥接与故障关闭
-├── boundary.py            有界快照：规范模型与普通数据，拒绝外部对象钩子
-├── execution_context.py   控制操作上下文，传递预留容量权限
-├── options.py             RuntimeOptions：容量、快照与事件限额、端口期限和停止确认期
-├── task_state.py          TaskStateStore：本机任务归属与状态机唯一写入点
-├── executor.py            WorkflowExecutor：单任务步骤编排
-├── registry.py            SkillRegistry：技能注册与查找
-├── policy.py              PolicyEnforcer：准入策略（Schema 校验、权限与前置条件检查）
-├── resources.py           ResourceLocks：按技能声明的资源互斥
-├── events.py              EventBus：历史回放 + 实时事件推送
-├── recovery.py            重启恢复与状态对账
-├── repository.py          InMemoryTaskRepository
-├── sqlite_repository.py   SQLiteTaskRepository
-├── wire.py                NDJSON 成帧与编解码
-├── server.py              RuntimeServer：UDS 守护进程
-├── sdk/
+├── models.py              任务、事件、技能数据模型
+├── errors.py              结构化错误
+├── ports.py               外部能力 Protocol
+├── options.py             运行时容量、期限和快照配置
+├── thread_binding.py      外部对象线程归属配置
+├── __main__.py            命令行组装入口
+├── kernel/                内核任务执行与状态
+│   ├── core.py            生命周期与公开任务 API
+│   ├── task_state.py      唯一状态写入点
+│   ├── executor.py        步骤编排、超时与停止确认
+│   ├── resources.py       资源互斥与隔离
+│   ├── events.py          历史回放与实时事件
+│   ├── policy.py          准入规则与本地 AdmissionValidator
+│   ├── registry.py        技能查找
+│   └── recovery.py        重启状态核对
+├── hosting/               内核托管与外部调用边界
+│   ├── kernel_host.py     内核装配、线程与分阶段关闭、请求和事件交接
+│   ├── thread_runtime.py  固定循环线程与真实完成结果
+│   ├── isolation.py       外部端口代理与线程分配
+│   ├── boundary.py        有界快照与外部结果净化
+│   └── execution_context.py  控制容量上下文
+├── repositories/          仓储实现
+│   ├── memory.py          InMemoryTaskRepository
+│   └── sqlite.py          SQLiteTaskRepository
+├── transport/             UDS 服务与协议
+│   ├── server.py          RuntimeServer
+│   └── wire.py            NDJSON 成帧与编解码
+├── sdk/                   应用调用接口
 │   ├── embedded.py        RobotRuntime
 │   ├── remote.py          RemoteRuntime
-│   ├── listeners.py       TaskListener：统一回调注册、按任务订阅与清理
-│   └── callback_executor.py  CallbackExecutor：有界 daemon 线程池、排队期限与取消/遗弃结果
-└── adapters/
-    ├── cc_api.py          CcApiSpeechSkill：CC API 语音播报、结束事件与停止确认
-    └── simulator.py       模拟技能、Reconciler 与两个模拟机器人状态源（无硬件自测用）
+│   ├── listeners.py       TaskListener
+│   └── callback_executor.py  同步回调执行器
+└── adapters/              机器人能力实现
+    ├── cc_api.py          CC API 语音适配器
+    └── simulator.py       模拟技能、状态源与对账器
 ```
+
+| 原模块（已移除旧入口） | 当前实现路径 |
+| --- | --- |
+| `core`、`executor`、`task_state`、`resources`、`events`、`policy`、`registry`、`recovery` | `kernel.<同名模块>` |
+| `kernel_host`、`thread_runtime`、`isolation`、`boundary`、`execution_context` | `hosting.<同名模块>` |
+| `repository` / `sqlite_repository` | `repositories.memory` / `repositories.sqlite` |
+| `server` / `wire` | `transport.server` / `transport.wire` |
+
+表中的路径均以 `robot_agent_runtime.` 开头。旧根目录模块已删除，所有导入和补丁路径
+均使用当前实现路径。`sdk` 的公开导入保持一致。
+托管层负责代理与内核装配；内核只依赖普通端口及 `AdmissionValidator`，不依赖 `hosting`。
 
 ## 技能定义
 
@@ -467,13 +584,23 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
 统一回调注册、任务隔离与监听生命周期、`test_callback_executor` 守护线程退出、容量、
 排队期限与取消竞态；`test_event_paging` 覆盖分页回放、实时去重和批次让出；`test_thread_runtime` / `test_isolation` / `test_kernel_host` /
 `test_execution_boundaries` / `test_runtime_isolation` 覆盖线程归属、阻塞外部代码、有限取消、
-仓储故障关闭、快照和资源隔离。
+仓储故障关闭、快照和资源隔离；`test_thread_bindings` 覆盖共享/分组/独占、配置冲突、
+实际线程容量、SDK/Server 接入及组内阻塞和取消边界。
+`test_thread_binding_boundaries` 覆盖状态源独占与组内阻塞的对照、空目标拒绝、排队调用
+超时撤销后可复用，以及线程名的配置归属。
+`test_package_layout` 覆盖新模块导入、旧入口移除、当前路径补丁及独立进程导入顺序。
+`test_runtime_ownership` 覆盖内核依赖方向、构造线程、分阶段停止、异常释放与校验隔离；
+`test_contracts` 包含本地和托管准入校验器的可复用契约。
 
 ## 当前范围
 
+源码按 `kernel`、`hosting`、`repositories`、`transport`、`sdk`、`adapters` 职责归类，
+根目录只保留公共契约和配置，旧模块入口已删除。
+外部代理装配与整体关闭次序由托管层负责，内核支持保留仓储的停止阶段。
+
 已实现：运行时内核、技能层框架、Python SDK（嵌入式 + 远程）、UDS 守护进程、SQLite
 持久化、模拟适配器、CC API 语音播报适配器、SDK 统一注册式任务监听（仅本客户端后续提交）、
-同步回调的有界守护线程隔离与排队期限、同进程内核专用线程和外部端口隔离、有限停止
+同步回调的有界守护线程隔离与排队期限、同进程内核专用线程和外部端口共享/分组/独占配置、有限停止
 确认与失控资源隔离、任务总期限、控制容量预留、快照限额、事件分页及有界关闭缓冲。
 
 线程边界保护外部 Python 阻塞或不配合取消时的内核响应，不提供硬实时保证。原生扩展

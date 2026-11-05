@@ -10,7 +10,7 @@ from robot_agent_runtime.adapters.cc_api import CcApiSpeechSkill
 from robot_agent_runtime.errors import RobotConnectionError, SkillExecutionError
 from robot_agent_runtime.models import Event, SkillCall, Task, TaskRequest, TaskState
 from robot_agent_runtime.ports import CallbackRobotApi
-from robot_agent_runtime.repository import InMemoryTaskRepository
+from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 from robot_agent_runtime.sdk import RobotRuntime
 
 

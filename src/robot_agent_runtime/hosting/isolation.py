@@ -8,13 +8,14 @@ from contextlib import suppress
 from typing import Any
 
 import robot_agent_runtime.errors as runtime_errors
-from robot_agent_runtime.boundary import bounded_snapshot
+from robot_agent_runtime.hosting.boundary import bounded_snapshot
 from robot_agent_runtime.errors import (
     AgentRuntimeError,
     ExecutionUnresponsive,
     ExtensionCapacityExceeded,
     ExtensionTimeout,
     InternalError,
+    InvalidRequest,
     SnapshotTooLarge,
     TaskCancelled,
 )
@@ -28,12 +29,13 @@ from robot_agent_runtime.models import (
     Task,
     TaskState,
 )
-from robot_agent_runtime.execution_context import CONTROL_OPERATION
+from robot_agent_runtime.hosting.execution_context import CONTROL_OPERATION
 from robot_agent_runtime.options import RuntimeOptions
 from robot_agent_runtime.ports import Reconciler, RobotStateProvider, Skill, TaskRepository
-from robot_agent_runtime.policy import PolicyEnforcer
-from robot_agent_runtime.registry import SkillRegistry
-from robot_agent_runtime.thread_runtime import LoopJob, LoopThread
+from robot_agent_runtime.kernel.policy import PolicyEnforcer
+from robot_agent_runtime.kernel.registry import SkillRegistry
+from robot_agent_runtime.hosting.thread_runtime import LoopJob, LoopThread
+from robot_agent_runtime.thread_binding import ThreadBinding, unwrap_thread_binding
 
 
 def _snapshot(value: Any, options: RuntimeOptions) -> Any:
@@ -108,10 +110,12 @@ async def _invoke(
 
 
 class _Port:
-    """One fixed loop owns each external object, including all of its methods.
+    """Each external object keeps its own faults on a fixed, possibly shared loop.
 
-    A repository deadline leaves the commit outcome unknown, so subsequent
-    operations are rejected rather than allowed to overlap the unfinished one.
+    A repository deadline after dispatch leaves the commit outcome unknown, so
+    subsequent operations are rejected rather than allowed to overlap it.
+    Cancelling a queued job under the runner lock proves it cannot start; only
+    then can the started flag safely distinguish queue delay from uncertain work.
     Other ports retain their loop after a deadline; threads are never replaced.
     """
 
@@ -158,9 +162,11 @@ class _Port:
                         break
                 return _unwrap(authority.result())
         except TimeoutError as error:
-            if poison:
+            queued_cancelled = job.cancel_if_queued()
+            if poison and not queued_cancelled:
                 self.poisoned = True
-            job.cancel()
+            if not queued_cancelled:
+                job.cancel()
             raise ExtensionTimeout(
                 "Extension operation exceeded its deadline", details={"operation": method}
             ) from error
@@ -493,45 +499,71 @@ class IsolatedPorts:
 
     def __init__(
         self,
-        repository: TaskRepository,
-        skills: Mapping[str, Skill],
-        reconciler: Reconciler | None,
-        robot_state: RobotStateProvider | None,
+        repository: TaskRepository | ThreadBinding[TaskRepository],
+        skills: Mapping[str, Skill | ThreadBinding[Skill]],
+        reconciler: Reconciler | ThreadBinding[Reconciler] | None,
+        robot_state: RobotStateProvider | ThreadBinding[RobotStateProvider] | None,
         options: RuntimeOptions,
     ) -> None:
         originals = [repository, *skills.values()]
         originals.extend(value for value in (reconciler, robot_state) if value is not None)
-        unique = {id(value): value for value in originals}
-        required = len(unique) + 1
+        unique: dict[int, Any] = {}
+        assignments: dict[int, tuple[str, str | int | None]] = {}
+        for value in originals:
+            binding = value if type(value) is ThreadBinding else ThreadBinding.dedicated(value)
+            identity = id(binding.target)
+            key = (binding.mode, identity if binding.mode == "dedicated" else binding.group_name)
+            if identity in assignments and assignments[identity] != key:
+                raise InvalidRequest("The same external object has conflicting thread bindings")
+            unique[identity] = binding.target
+            assignments[identity] = key
+        keys = dict.fromkeys(assignments.values())
+        required = len(keys) + 1
         if required > options.max_extension_threads:
             raise ExtensionCapacityExceeded(
-                "External port objects exceed the configured thread capacity",
+                "External thread bindings exceed the configured thread capacity",
                 details={"required": required, "maximum": options.max_extension_threads},
             )
         self._options = options
         self._validation = LoopThread("robot-validation", max_pending=options.max_pending_calls,
                                       control_capacity=options.max_control_calls + 3)
+        runners: dict[tuple[str, str | int | None], LoopThread] = {}
+        for index, key in enumerate(keys):
+            label = (f"dedicated-{index}" if key[0] == "dedicated" else
+                     f"group-{key[1]}" if key[0] == "group" else "shared")
+            runners[key] = LoopThread(f"robot-extension-{label}",
+                                      max_pending=options.max_pending_calls,
+                                      control_capacity=options.max_control_calls + 3)
+        self._runners = list(runners.values())
         self._ports = {
-            identity: _Port(value, LoopThread(f"robot-extension-{index}",
-                                             max_pending=options.max_pending_calls,
-                                             control_capacity=options.max_control_calls + 3), options)
-            for index, (identity, value) in enumerate(unique.items())
+            identity: _Port(value, runners[assignments[identity]], options)
+            for identity, value in unique.items()
         }
-        self.repository = _Repository(self._ports[id(repository)])
+        self.repository = _Repository(self._ports[id(unwrap_thread_binding(repository))])
         proxies: dict[int, _Skill] = {}
         self.skills: dict[str, Skill] = {}
         for name, skill in skills.items():
-            proxy = proxies.setdefault(id(skill), _Skill(self._ports[id(skill)]))
+            identity = id(unwrap_thread_binding(skill))
+            proxy = proxies.setdefault(identity, _Skill(self._ports[identity]))
             self.skills[name] = proxy
         self._skills = list(proxies.values())
-        self.reconciler = _Reconciler(self._ports[id(reconciler)]) if reconciler is not None else None
-        self.robot_state = _RobotState(self._ports[id(robot_state)]) if robot_state is not None else None
+        self.reconciler = (_Reconciler(self._ports[id(unwrap_thread_binding(reconciler))])
+                           if reconciler is not None else None)
+        self.robot_state = (_RobotState(self._ports[id(unwrap_thread_binding(robot_state))])
+                           if robot_state is not None else None)
 
     async def prepare(self) -> None:
+        async def prepare_group(skills: list[_Skill]) -> None:
+            for skill in skills:
+                await skill.prepare()
+
         try:
-            await asyncio.gather(*(port.runner.start() for port in self._ports.values()))
+            await asyncio.gather(*(runner.start() for runner in self._runners))
             await self._validation.start()
-            await asyncio.gather(*(skill.prepare() for skill in self._skills))
+            declarations: dict[LoopThread, list[_Skill]] = {}
+            for skill in self._skills:
+                declarations.setdefault(skill._port.runner, []).append(skill)
+            await asyncio.gather(*(prepare_group(skills) for skills in declarations.values()))
         except BaseException:
             await self.close()
             raise
@@ -539,8 +571,8 @@ class IsolatedPorts:
     async def close(self) -> None:
         await asyncio.gather(
             self._validation.close(grace_s=self._options.cancel_grace_s),
-            *(port.runner.close(grace_s=self._options.cancel_grace_s)
-              for port in self._ports.values()), return_exceptions=True,
+            *(runner.close(grace_s=self._options.cancel_grace_s)
+              for runner in self._runners), return_exceptions=True,
         )
 
     async def validate(
@@ -566,10 +598,25 @@ class IsolatedPorts:
 
 
 def isolate_ports(
-    repository: TaskRepository,
-    skills: Mapping[str, Skill],
-    reconciler: Reconciler | None,
-    robot_state: RobotStateProvider | None,
+    repository: TaskRepository | ThreadBinding[TaskRepository],
+    skills: Mapping[str, Skill | ThreadBinding[Skill]],
+    reconciler: Reconciler | ThreadBinding[Reconciler] | None,
+    robot_state: RobotStateProvider | ThreadBinding[RobotStateProvider] | None,
     options: RuntimeOptions,
 ) -> IsolatedPorts:
     return IsolatedPorts(repository, skills, reconciler, robot_state, options)
+
+
+class IsolatedAdmissionValidator:
+    """Schedule kernel policy rules on the existing bounded validation owner.
+
+    The port collection owns its lifecycle. The core sees only an admission
+    contract and never has to select an execution thread or manage its workers.
+    """
+
+    def __init__(self, ports: IsolatedPorts, allowed_permissions: set[str] | None) -> None:
+        self._ports = ports
+        self._permissions = set(allowed_permissions) if allowed_permissions is not None else None
+
+    async def validate(self, call: SkillCall, unsatisfied: frozenset[str]) -> None:
+        await self._ports.validate(call, unsatisfied, self._permissions)

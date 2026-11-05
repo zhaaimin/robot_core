@@ -53,15 +53,19 @@ python -m pytest -q
 
 ### sweep 的已知基线
 
-2026-10-26 在干净工作树上：**95 passed, 2 failed, 42 skipped**。
+2026-11-05 在当前工作树（含未提交的线程绑定、按职责分目录与托管装配重构）上：**302 passed, 3 failed, 42 skipped**。
 
-- 2 个 fail 固定是 `test_sqlite_repository.py` 的
-  `test_sqlite_memory_start_and_close_are_idempotent` 和
-  `test_sqlite_can_continue_reading_and_writing_after_unique_conflict`，原因是 `aiosqlite` 被
-  stub 掉了，不是回归。
+- 3 个 fail 固定是 `aiosqlite` 被 stub 掉的后果，不是回归：
+  `test_sqlite_repository.py` 的 `test_sqlite_memory_start_and_close_are_idempotent`、
+  `test_sqlite_can_continue_reading_and_writing_after_unique_conflict`，以及
+  `test_contracts.py` 的 `test_sqlite_paged_event_repository_contract`（报
+  `RuntimeError: aiosqlite is stubbed in .verify; run the SQLite tests in the container`）。
 - 42 个 skip 是需要 `tmp_path` / `monkeypatch` / `parametrize` 的用例，替身提供不了。
 
-**除这 2 个以外的任何 fail 都是真回归。** 改完代码请对比这组数字，而不是只看“跑完了”。
+**除这 3 个以外的任何 fail 都是真回归。** 改完代码请对比这组数字，而不是只看“跑完了”。
+
+数字会随用例增加往上走，历史基线（2026-10-26：95 / 2 / 42；2026-11-04：286 / 3 / 42）不要再拿来对账。
+容器完整套件的同期基线是 **414 passed**（`python3 -m pytest -q`，约 11 秒）。
 
 ### 容器
 
@@ -88,24 +92,39 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
 
 照着现有文件写，别引入新风格：
 
+- **按职责放实现**：`kernel/` 管任务状态与执行，`hosting/` 管线程与调用边界，
+  `repositories/` 放仓储实现，`transport/` 放服务端与协议；`sdk/`、`adapters/` 保持原职责。
+  公共模型、错误、端口、配置与线程绑定留在包根目录。旧根目录模块已删除，导入与补丁
+  均使用子包绝对路径；不要重新添加旧路径兼容入口。不在子包 `__init__` 提前装配。
+  内核不得依赖 `hosting` 或 `ThreadBinding`；宿主准备代理后在内核循环创建 RuntimeCore。
+  依赖在构造时确定，禁止创建后替换其他对象的私有依赖。准入规则仍由 kernel/policy.py
+  实现，通过 AdmissionValidator 端口选择本地或有界隔离执行。
 - **绝对导入**：`from robot_agent_runtime.models import Task`，不用相对导入。
 - **全量类型注解**，PEP 585/604 风格（`dict[str, Any]`、`Task | None`、`frozenset[str]`）。
 - **端口用 `typing.Protocol`** 声明在 `ports.py`，适配器靠结构匹配，不继承、不注册。
 - **错误走 `errors.py`**：每个失败模式一个 `AgentRuntimeError` 子类 + 一个 `code` 字符串常量。
   不要裸 `raise RuntimeError`，也不要在业务代码里硬编码错误码字符串。
 - **docstring 写“为什么”和边界**，放在类/Protocol 级别，解释不变量与降级行为（看
-  `task_state.py`、`ports.py` 的写法）。不写逐行注释，不写复述代码的注释。
+  `kernel/task_state.py`、`ports.py` 的写法）。不写逐行注释，不写复述代码的注释。
 - **内核线程独占，内核逻辑仍为纯 asyncio**。SDK/Server 经 `KernelHost` 托管专用 daemon
   事件循环；状态机、资源锁和总线只在此循环操作，不在线程内直接读写它们。技能、仓储、
-  状态源、对账与外部声明校验由 `isolation.py` 交给固定的 `LoopThread`，不使用进程隔离。
+  状态源、对账与外部声明校验由 `hosting/isolation.py` 交给固定的 `LoopThread`，不使用进程隔离。
+  外部对象注册可用 `ThreadBinding.shared/group/dedicated`，普通对象默认独占；同一对象的
+  绑定必须一致，冲突在启动外部线程前拒绝。共享线程只启动/关闭一次，容量按真实线程
+  加校验线程计数；对象级故障独立，同组同步阻塞会拖住整组，但不能占用内核循环。
+  需及时交付前置条件变化的状态源不得与可能阻塞的技能共用循环，示例默认保持状态源独占。
   调用输入/结果是快照；跨线程取消只表示请求，真实结束才能确认停止。期限或停止确认期
   结束后不得无限 gather 外部代码，不补建被阻塞线程；不确定停止须落待对账并隔离资源。
-  仓储超时可能已提交，须毒化停止后续写入。直接使用低层 RuntimeCore 不提供上述隔离。
+  仓储调用已开始时超时可能已提交，须毒化停止后续写入；排队超时须先在 runner 锁内撤销，
+  再确认未开始，此时不毒化。直接使用低层 RuntimeCore 不提供上述隔离。
   SDK 异步监听留在调用方循环，同步监听用自管 CallbackExecutor（4 线程、64 排队、5 秒
   排队期限）。不得使用 ThreadPoolExecutor 私有字段或退出钩子。关闭取消未领取工作并
   遗弃在途结果，不能宣称副作用已停止。不要跨线程直接操作 asyncio 对象；只用受控桥接。
   普通请求、订阅和控制操作分别限额，查询/取消/关闭的预留容量必须传递到端口线程。
   生命周期共享真实完成结果并只在内核循环串行；SDK 关闭先启动内核停止，再限时清理监听。
+  宿主按 core.stop → 排空已打开订阅 → core.close（仓储）→ 外部线程 → 内核线程关闭。
+  通过 begin_close()/close() 协作，不注入 _event_drainer 或跨层调用私有关闭入口。
+  stop/close 各自共享真实结果；停止或排空失败不能跳过后续释放，重复调用不得重做清理。
   快照默认 1 MiB/64 层，外部结果与异常在工作线程净化；历史事件分页（默认 128 条），
   实时队列与关闭缓冲有界，溢出保留交付水位并显式报错。任务总期限覆盖准入、排队、
   等资源和执行；停止确认/持久化独立有界，重复取消不得绕过停止确认或误释放资源。

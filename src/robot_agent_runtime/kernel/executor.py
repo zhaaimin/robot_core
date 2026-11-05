@@ -14,9 +14,9 @@ from robot_agent_runtime.errors import (
 from robot_agent_runtime.models import ErrorInfo, SkillContext, Task, TaskState
 from robot_agent_runtime.options import RuntimeOptions
 from robot_agent_runtime.ports import RobotStateProvider, Skill
-from robot_agent_runtime.registry import SkillRegistry
-from robot_agent_runtime.resources import ResourceLocks
-from robot_agent_runtime.task_state import TaskStateStore
+from robot_agent_runtime.kernel.registry import SkillRegistry
+from robot_agent_runtime.kernel.resources import ResourceLocks
+from robot_agent_runtime.kernel.task_state import TaskStateStore
 
 
 class WorkflowExecutor:

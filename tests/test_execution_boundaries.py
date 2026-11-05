@@ -1,10 +1,10 @@
 import asyncio
 from typing import Any
 
-from robot_agent_runtime.core import RuntimeCore
+from robot_agent_runtime.kernel.core import RuntimeCore
 from robot_agent_runtime.errors import RobotStopError
 from robot_agent_runtime.models import Event, SkillCall, SkillContext, SkillDefinition, SkillResult, Task, TaskRequest, TaskState
-from robot_agent_runtime.repository import InMemoryTaskRepository
+from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 
 
 class StubbornSkill:

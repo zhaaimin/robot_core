@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from robot_agent_runtime.core import RuntimeCore
+from robot_agent_runtime.kernel.core import RuntimeCore
 from robot_agent_runtime.errors import SkillExecutionError, TaskCancelled, TaskNotFound
 from robot_agent_runtime.models import (
     ErrorInfo,
@@ -19,7 +19,7 @@ from robot_agent_runtime.models import (
     TaskState,
 )
 from robot_agent_runtime.ports import Skill
-from robot_agent_runtime.repository import InMemoryTaskRepository
+from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 
 
 async def wait_for_event(event: asyncio.Event) -> None:

@@ -9,9 +9,11 @@ from robot_agent_runtime.ports import TaskRepository
 class EventBus:
     """Persistent replay followed by live, per-task event delivery."""
 
-    def __init__(self, repository: TaskRepository, *, page_size: int = 128) -> None:
+    def __init__(
+        self, repository: TaskRepository, *, page_size: int = 128, queue_size: int = 1000,
+    ) -> None:
         self._repository = repository
-        self._queue_size = 1000
+        self._queue_size = queue_size
         self._page_size = page_size
         self._subscribers: dict[
             str, set[asyncio.Queue[Event | EventStreamOverflow | None]]

@@ -10,7 +10,6 @@ from typing import Any
 import pytest
 
 from robot_agent_runtime.adapters.simulator import Simulator
-from robot_agent_runtime.core import RuntimeCore
 from robot_agent_runtime.errors import (
     EventStreamOverflow,
     InvalidRequest,
@@ -20,11 +19,11 @@ from robot_agent_runtime.errors import (
     TaskEventStreamEnded,
 )
 from robot_agent_runtime.models import Event, SkillCall, Task, TaskRequest, TaskState
-from robot_agent_runtime.repository import InMemoryTaskRepository
+from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 from robot_agent_runtime.sdk import RemoteRuntime, RobotRuntime
 from robot_agent_runtime.sdk.callback_executor import CallbackExecutor
 from robot_agent_runtime.options import RuntimeOptions
-from robot_agent_runtime.server import RuntimeServer
+from robot_agent_runtime.transport.server import RuntimeServer
 
 
 def request(*, key: str | None = None, skill: str = "robot.get_state") -> TaskRequest:
@@ -60,7 +59,7 @@ async def embedded() -> AsyncIterator[RobotRuntime]:
 async def remote_pair() -> AsyncIterator[tuple[RemoteRuntime, RemoteRuntime]]:
     with tempfile.TemporaryDirectory(prefix="rar-listener-") as directory:
         socket_path = str(Path(directory) / "s.sock")
-        server = RuntimeServer(RuntimeCore(InMemoryTaskRepository(), Simulator().skills), socket_path)
+        server = RuntimeServer(InMemoryTaskRepository(), Simulator().skills, socket_path)
         await server.start()
         first, second = RemoteRuntime(socket_path), RemoteRuntime(socket_path)
         try:

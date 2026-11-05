@@ -5,10 +5,23 @@ from robot_agent_runtime.models import (
     Event,
     SkillContext,
     SkillDefinition,
+    SkillCall,
     SkillResult,
     Task,
     TaskState,
 )
+
+
+class AdmissionValidator(Protocol):
+    """Apply admission rules independently of where validation is scheduled.
+
+    The caller takes one condition snapshot for the whole request. Implementors
+    raise structured validation errors, never mutate task state, and return only
+    after their actual validation result is available. Hosted implementations
+    keep schema hooks off the kernel and bound their external work.
+    """
+
+    async def validate(self, call: SkillCall, unsatisfied: frozenset[str]) -> None: ...
 
 
 class Skill(Protocol):
@@ -34,8 +47,9 @@ class Skill(Protocol):
 class TaskRepository(Protocol):
     """Atomic persistence on one owned event loop while a runtime is hosted.
 
-    A deadline can leave a write outcome unknown. The host poisons a timed-out
-    repository rather than retrying or starting another write alongside it.
+    A deadline after dispatch can leave a write outcome unknown. The host poisons
+    that repository rather than starting another write alongside it. Calls
+    cancelled before dispatch cannot commit and do not poison the repository.
     Callers must not use the same repository outside its owner while hosted.
     """
 

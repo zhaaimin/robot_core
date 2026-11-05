@@ -10,7 +10,7 @@ from robot_agent_runtime.adapters.simulator import (
     SimulatedRobotState,
     Simulator,
 )
-from robot_agent_runtime.core import RuntimeCore
+from robot_agent_runtime.kernel.core import RuntimeCore
 from robot_agent_runtime.models import (
     SkillCall,
     SkillContext,
@@ -21,7 +21,7 @@ from robot_agent_runtime.models import (
     TaskState,
 )
 from robot_agent_runtime.ports import Skill
-from robot_agent_runtime.repository import InMemoryTaskRepository
+from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 
 
 async def wait_for_terminal(core: RuntimeCore, task_id: str) -> Task:

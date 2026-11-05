@@ -1,9 +1,9 @@
 from collections.abc import AsyncGenerator, Mapping
 from contextlib import aclosing
 
-from robot_agent_runtime.core import RuntimeCore
+from robot_agent_runtime.kernel.core import RuntimeCore
 from robot_agent_runtime.errors import InvalidRequest
-from robot_agent_runtime.kernel_host import KernelHost
+from robot_agent_runtime.hosting.kernel_host import KernelHost
 from robot_agent_runtime.models import Event, SkillDefinition, Task, TaskRequest
 from robot_agent_runtime.options import RuntimeOptions
 from robot_agent_runtime.ports import (
@@ -19,29 +19,35 @@ from robot_agent_runtime.sdk.listeners import (
     TaskListener,
     TaskListeners,
 )
+from robot_agent_runtime.thread_binding import ThreadBinding
 
 
 class RobotRuntime:
     def __init__(
         self,
-        repository: TaskRepository,
-        skills: Mapping[str, Skill],
-        reconciler: Reconciler | None = None,
+        repository: TaskRepository | ThreadBinding[TaskRepository],
+        skills: Mapping[str, Skill | ThreadBinding[Skill]],
+        reconciler: Reconciler | ThreadBinding[Reconciler] | None = None,
         allowed_permissions: set[str] | None = None,
-        robot_state: RobotStateProvider | None = None,
+        robot_state: RobotStateProvider | ThreadBinding[RobotStateProvider] | None = None,
         *,
         options: RuntimeOptions | None = None,
     ) -> None:
-        self._core = RuntimeCore(
-            repository, skills, reconciler, allowed_permissions, robot_state
-        )
         self._options = options or RuntimeOptions()
-        self._host = KernelHost(self._core, self._options)
+        self._host = KernelHost(repository, skills, reconciler, allowed_permissions, robot_state,
+                                options=self._options)
         self._listeners = TaskListeners(
             self.subscribe_task_events, self.get_task_status,
             cancel_grace_s=self._options.cancel_grace_s,
         )
         self._closing = False
+
+    @property
+    def _core(self) -> RuntimeCore:
+        core = self._host._core
+        if core is None:
+            raise InvalidRequest("Runtime core has not been prepared")
+        return core
 
     def add_task_listener(
         self,
@@ -59,7 +65,7 @@ class RobotRuntime:
 
     async def close(self) -> None:
         self._closing = True
-        await self._host._begin_close()
+        await self._host.begin_close()
         try:
             await self._listeners.close()
         finally:

@@ -15,7 +15,7 @@ from robot_agent_runtime import errors
 
 
 async def test_control_capacity_is_reserved_and_bounded() -> None:
-    from robot_agent_runtime.thread_runtime import LoopThread
+    from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
     owner = LoopThread("reserved-control", max_pending=1, control_capacity=1)
     state: dict[str, Any] = {}
@@ -49,7 +49,7 @@ async def test_control_capacity_is_reserved_and_bounded() -> None:
 
 
 async def test_close_does_not_force_cancel_protected_started_work() -> None:
-    from robot_agent_runtime.thread_runtime import LoopThread
+    from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
     owner = LoopThread("protected-work")
     caller = asyncio.get_running_loop()
@@ -125,7 +125,7 @@ def test_runtime_options_have_frozen_validated_defaults() -> None:
 
 
 async def test_loop_thread_calls_factory_and_awaitable_in_daemon_thread() -> None:
-    from robot_agent_runtime.thread_runtime import LoopThread
+    from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
     owner = LoopThread("test-loop-thread")
     caller_thread = threading.get_ident()
@@ -160,7 +160,7 @@ async def wait_until(predicate: Callable[[], bool]) -> None:
 
 
 async def test_blocking_factory_does_not_block_caller_or_other_loop() -> None:
-    from robot_agent_runtime.thread_runtime import LoopThread
+    from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
     caller = asyncio.get_running_loop()
     entered = asyncio.Event()
@@ -192,7 +192,7 @@ async def test_blocking_factory_does_not_block_caller_or_other_loop() -> None:
 
 
 async def test_cancel_request_does_not_complete_job_that_swallows_cancellation() -> None:
-    from robot_agent_runtime.thread_runtime import LoopThread
+    from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
     caller = asyncio.get_running_loop()
     entered, cancelled = asyncio.Event(), asyncio.Event()
@@ -229,7 +229,7 @@ async def test_cancel_request_does_not_complete_job_that_swallows_cancellation()
 
 
 async def test_cancelling_waiter_does_not_cancel_actual_job() -> None:
-    from robot_agent_runtime.thread_runtime import LoopThread
+    from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
     caller = asyncio.get_running_loop()
     entered = asyncio.Event()
@@ -261,7 +261,7 @@ async def test_cancelling_waiter_does_not_cancel_actual_job() -> None:
 
 
 async def test_call_timeout_requests_actual_cancellation() -> None:
-    from robot_agent_runtime.thread_runtime import LoopThread
+    from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
     caller = asyncio.get_running_loop()
     cancelled = asyncio.Event()
@@ -283,7 +283,7 @@ async def test_call_timeout_requests_actual_cancellation() -> None:
 
 
 async def test_queued_cancel_prevents_factory_and_reclaims_registered_capacity() -> None:
-    from robot_agent_runtime.thread_runtime import LoopThread
+    from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
     caller = asyncio.get_running_loop()
     entered = asyncio.Event()
@@ -325,7 +325,7 @@ async def test_queued_cancel_prevents_factory_and_reclaims_registered_capacity()
 
 
 async def test_close_is_bounded_with_blocked_factory_and_does_not_replace_thread() -> None:
-    from robot_agent_runtime.thread_runtime import LoopThread
+    from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
     caller = asyncio.get_running_loop()
     entered = asyncio.Event()
@@ -361,7 +361,7 @@ async def test_close_is_bounded_with_blocked_factory_and_does_not_replace_thread
 
 
 async def test_loop_thread_catches_base_exception_and_keeps_running() -> None:
-    from robot_agent_runtime.thread_runtime import LoopThread
+    from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
     owner = LoopThread("base-exception")
 
@@ -382,7 +382,7 @@ async def test_loop_thread_catches_base_exception_and_keeps_running() -> None:
 
 
 async def test_factory_stop_iteration_is_mapped_before_cross_loop_delivery() -> None:
-    from robot_agent_runtime.thread_runtime import LoopThread
+    from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
     owner = LoopThread("factory-stop-iteration")
     caller = asyncio.get_running_loop()
@@ -405,7 +405,7 @@ async def test_factory_stop_iteration_is_mapped_before_cross_loop_delivery() -> 
 
 
 async def test_normal_close_exits_thread_and_is_idempotent() -> None:
-    from robot_agent_runtime.thread_runtime import LoopThread
+    from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
     owner = LoopThread("normal-close")
 
@@ -420,7 +420,7 @@ async def test_normal_close_exits_thread_and_is_idempotent() -> None:
 
 
 async def test_close_is_idempotent_while_loop_close_has_not_returned() -> None:
-    from robot_agent_runtime.thread_runtime import LoopThread
+    from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
     caller = asyncio.get_running_loop()
     loop_closed = asyncio.Event()
@@ -451,7 +451,7 @@ async def test_close_is_idempotent_while_loop_close_has_not_returned() -> None:
 
 
 async def test_start_close_race_does_not_leave_loop_thread() -> None:
-    from robot_agent_runtime.thread_runtime import LoopThread
+    from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
     for index in range(20):
         name = f"start-close-race-{index}"
@@ -464,7 +464,7 @@ async def test_start_close_race_does_not_leave_loop_thread() -> None:
 
 
 async def test_submit_requires_start_and_close_before_start_is_final() -> None:
-    from robot_agent_runtime.thread_runtime import LoopThread
+    from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
     owner = LoopThread("never-started")
 
@@ -481,7 +481,7 @@ async def test_submit_requires_start_and_close_before_start_is_final() -> None:
 
 
 async def test_timed_out_late_exception_is_consumed_before_loop_exit() -> None:
-    from robot_agent_runtime.thread_runtime import LoopThread
+    from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
     caller = asyncio.get_running_loop()
     entered = asyncio.Event()
@@ -524,7 +524,7 @@ async def test_timed_out_late_exception_is_consumed_before_loop_exit() -> None:
 
 
 async def test_close_keeps_cancellation_resistant_job_until_actual_completion() -> None:
-    from robot_agent_runtime.thread_runtime import LoopThread
+    from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
     caller = asyncio.get_running_loop()
     entered, cancelled = asyncio.Event(), asyncio.Event()
@@ -566,7 +566,7 @@ async def test_blocked_loop_thread_does_not_prevent_process_exit() -> None:
     script = """
 import asyncio
 import threading
-from robot_agent_runtime.thread_runtime import LoopThread
+from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
 async def main():
     loop = asyncio.get_running_loop()
@@ -604,7 +604,7 @@ async def test_fatal_job_completion_cannot_exit_the_callers_event_loop() -> None
     script = """
 import asyncio
 from robot_agent_runtime.errors import InternalError
-from robot_agent_runtime.thread_runtime import LoopThread
+from robot_agent_runtime.hosting.thread_runtime import LoopThread
 
 async def main():
     owner = LoopThread('fatal-completion')

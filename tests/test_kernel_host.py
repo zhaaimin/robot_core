@@ -1,6 +1,6 @@
 import asyncio
 import threading
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from concurrent.futures import Future
 
 import pytest
@@ -8,8 +8,21 @@ import pytest
 from robot_agent_runtime.adapters.simulator import Simulator
 from robot_agent_runtime.errors import EventStreamOverflow, ExtensionCapacityExceeded, ExtensionTimeout, InvalidRequest
 from robot_agent_runtime.models import Event, SkillCall, Task, TaskRequest, TaskState
-from robot_agent_runtime.repository import InMemoryTaskRepository
+from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 from robot_agent_runtime.sdk import RobotRuntime, RuntimeOptions
+from robot_agent_runtime.kernel.core import RuntimeCore
+from robot_agent_runtime.hosting.isolation import IsolatedPorts
+
+
+def configure_core(runtime: RobotRuntime, configure: Callable[[RuntimeCore], None]) -> None:
+    create = runtime._host._create_core
+
+    def factory(ports: IsolatedPorts) -> RuntimeCore:
+        core = create(ports)
+        configure(core)
+        return core
+
+    runtime._host._create_core = factory
 
 
 def request() -> TaskRequest:
@@ -21,20 +34,24 @@ async def test_embedded_core_lifecycle_runs_on_a_dedicated_thread() -> None:
     owner = threading.get_ident()
     starts: list[int] = []
     closes: list[int] = []
-    original_start = runtime._core.start
-    original_close = runtime._core.close
 
-    async def start() -> None:
-        if not runtime._core._started:
-            starts.append(threading.get_ident())
-        await original_start()
+    def configure(core: RuntimeCore) -> None:
+        original_start = core.start
+        original_close = core.close
 
-    async def close() -> None:
-        closes.append(threading.get_ident())
-        await original_close()
+        async def start() -> None:
+            if not core._started:
+                starts.append(threading.get_ident())
+            await original_start()
 
-    runtime._core.start = start
-    runtime._core.close = close
+        async def close() -> None:
+            closes.append(threading.get_ident())
+            await original_close()
+
+        core.start = start
+        core.close = close
+
+    configure_core(runtime, configure)
     try:
         await runtime.start()
         await runtime.start()
@@ -50,13 +67,16 @@ async def test_embedded_core_lifecycle_runs_on_a_dedicated_thread() -> None:
 async def test_blocking_async_listener_cannot_stall_the_kernel_thread() -> None:
     runtime = RobotRuntime(InMemoryTaskRepository(), Simulator().skills)
     query_threads: list[int] = []
-    original_get = runtime._core.get_task_status
+    def configure(core: RuntimeCore) -> None:
+        original_get = core.get_task_status
 
-    async def get_task_status(task_id: str) -> Task:
-        query_threads.append(threading.get_ident())
-        return await original_get(task_id)
+        async def get_task_status(task_id: str) -> Task:
+            query_threads.append(threading.get_ident())
+            return await original_get(task_id)
 
-    runtime._core.get_task_status = get_task_status
+        core.get_task_status = get_task_status
+
+    configure_core(runtime, configure)
     await runtime.start()
     entered = threading.Event()
     release = threading.Event()
@@ -265,8 +285,8 @@ async def test_shutdown_reports_a_stuck_stream_and_keeps_its_real_job_alive() ->
         if False:
             yield Event(event_id="unused", task_id=task_id, sequence=1, event_type="unused")
 
-    runtime._core.subscribe_task_events = stuck
     await runtime.start()
+    runtime._core.subscribe_task_events = stuck
     stream = runtime.subscribe_task_events("stuck")
     pending = asyncio.create_task(anext(stream))
     await asyncio.wait_for(asyncio.wrap_future(entered), 1)
@@ -337,16 +357,20 @@ async def test_concurrent_start_and_close_share_completion_across_caller_loops()
     entered: Future[None] = Future()
     release: Future[None] = Future()
     starts: list[int] = []
-    original_start = runtime._core.start
 
-    async def paused_start() -> None:
-        starts.append(threading.get_ident())
-        if not entered.done():
-            entered.set_result(None)
-        await asyncio.wrap_future(release)
-        await original_start()
+    def configure(core: RuntimeCore) -> None:
+        original_start = core.start
 
-    runtime._core.start = paused_start
+        async def paused_start() -> None:
+            starts.append(threading.get_ident())
+            if not entered.done():
+                entered.set_result(None)
+            await asyncio.wrap_future(release)
+            await original_start()
+
+        core.start = paused_start
+
+    configure_core(runtime, configure)
     first_done: Future[None] = Future()
 
     def start_on_another_loop() -> None:
@@ -395,8 +419,8 @@ async def test_shutdown_event_buffer_overflow_reports_the_delivered_watermark() 
                 event_type="SKILL_PROGRESS", data={"state": TaskState.RUNNING.value},
             )
 
-    runtime._core.subscribe_task_events = events
     await runtime.start()
+    runtime._core.subscribe_task_events = events
     stream = runtime.subscribe_task_events("overflow")
     assert (await anext(stream)).sequence == 1
     await runtime.close()
@@ -468,26 +492,30 @@ async def test_cancelled_close_waiter_during_start_does_not_duplicate_lifecycle(
     shutdown_entered: Future[None] = Future()
     starts: list[int] = []
     closes: list[int] = []
-    original_start, original_close = runtime._core.start, runtime._core.close
 
-    async def paused_start() -> None:
-        starts.append(threading.get_ident())
-        entered.set_result(None)
-        await asyncio.wrap_future(release)
-        await original_start()
+    def configure(core: RuntimeCore) -> None:
+        original_start, original_close = core.start, core.close
 
-    async def close_once() -> None:
-        closes.append(threading.get_ident())
-        await original_close()
+        async def paused_start() -> None:
+            starts.append(threading.get_ident())
+            entered.set_result(None)
+            await asyncio.wrap_future(release)
+            await original_start()
 
-    original_shutdown = runtime._host._shutdown
+        async def close_once() -> None:
+            closes.append(threading.get_ident())
+            await original_close()
 
-    async def shutdown() -> None:
-        shutdown_entered.set_result(None)
-        await original_shutdown()
+        original_shutdown = runtime._host._shutdown
 
-    runtime._core.start, runtime._core.close = paused_start, close_once
-    runtime._host._shutdown = shutdown
+        async def shutdown() -> None:
+            shutdown_entered.set_result(None)
+            await original_shutdown()
+
+        core.start, core.close = paused_start, close_once
+        runtime._host._shutdown = shutdown
+
+    configure_core(runtime, configure)
     starting = asyncio.create_task(runtime.start())
     await asyncio.wait_for(asyncio.wrap_future(entered), 1)
     closing = asyncio.create_task(runtime.close())
@@ -507,7 +535,6 @@ async def test_cancelled_close_before_thread_readiness_still_shuts_down() -> Non
     closed: Future[None] = Future()
     first = True
     original_ready = runtime._host._loop.start
-    original_close = runtime._core.close
 
     async def paused_readiness() -> None:
         nonlocal first
@@ -517,12 +544,17 @@ async def test_cancelled_close_before_thread_readiness_still_shuts_down() -> Non
             await asyncio.Event().wait()
         await original_ready()
 
-    async def close() -> None:
-        await original_close()
-        closed.set_result(None)
+    def configure(core: RuntimeCore) -> None:
+        original_close = core.close
+
+        async def close() -> None:
+            await original_close()
+            closed.set_result(None)
+
+        core.close = close
 
     runtime._host._loop.start = paused_readiness
-    runtime._core.close = close
+    configure_core(runtime, configure)
     closing = asyncio.create_task(runtime.close())
     await asyncio.wait_for(entered.wait(), 1)
     closing.cancel()
@@ -630,8 +662,8 @@ async def test_shutdown_timeout_marks_unvisited_streams_with_replay_watermarks()
             if task_id == blocked and not stopped.done():
                 stopped.set_result(None)
 
-    runtime._core.subscribe_task_events = source
     await runtime.start()
+    runtime._core.subscribe_task_events = source
     streams = {
         task_id: runtime.subscribe_task_events(task_id)
         for task_id in ("first", "second", "third")

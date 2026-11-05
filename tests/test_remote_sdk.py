@@ -13,17 +13,16 @@ from typing import Any
 
 import pytest
 
-import robot_agent_runtime.wire as wire_module
+import robot_agent_runtime.transport.wire as wire_module
 import robot_agent_runtime.sdk as sdk_module
-import robot_agent_runtime.server as server_module
+import robot_agent_runtime.transport.server as server_module
 from robot_agent_runtime.adapters.simulator import Simulator
 from robot_agent_runtime.errors import InvalidRequest
-from robot_agent_runtime.core import RuntimeCore
-from robot_agent_runtime.kernel_host import KernelHost
+from robot_agent_runtime.hosting.kernel_host import KernelHost
 from robot_agent_runtime.models import Event, SkillCall, Task, TaskRequest, TaskState
-from robot_agent_runtime.repository import InMemoryTaskRepository
+from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 from robot_agent_runtime.sdk import RemoteRuntime, RemoteRuntimeError, RemoteTransportError, RobotRuntime
-from robot_agent_runtime.server import RuntimeServer
+from robot_agent_runtime.transport.server import RuntimeServer
 
 
 class HostedCoreClient:
@@ -75,8 +74,7 @@ async def running_server(
     with tempfile.TemporaryDirectory(prefix="rar-", dir="/tmp") as directory:
         socket_path = str(Path(directory) / "s.sock")
         simulator = Simulator()
-        core = RuntimeCore(repository or InMemoryTaskRepository(), simulator.skills)
-        server = RuntimeServer(core, socket_path)
+        server = RuntimeServer(repository or InMemoryTaskRepository(), simulator.skills, socket_path)
         await server.start()
         try:
             yield server, HostedCoreClient(server._host), socket_path, simulator
@@ -479,8 +477,7 @@ async def test_client_close_does_not_stop_server_or_other_clients() -> None:
 async def test_server_close_cleans_active_subscriptions_and_socket_idempotently() -> None:
     with tempfile.TemporaryDirectory(prefix="rar-", dir="/tmp") as directory:
         socket_path = str(Path(directory) / "s.sock")
-        core = RuntimeCore(InMemoryTaskRepository(), Simulator().skills)
-        server = RuntimeServer(core, socket_path)
+        server = RuntimeServer(InMemoryTaskRepository(), Simulator().skills, socket_path)
         await server.start()
         remote = RemoteRuntime(socket_path)
         await remote.start()
@@ -500,14 +497,13 @@ async def test_server_close_cleans_active_subscriptions_and_socket_idempotently(
             await asyncio.wait_for(pending, timeout=1)
         await remote.close()
         with pytest.raises(RuntimeError):
-            await core.get_task_status(submitted.id)
+            await server._core.get_task_status(submitted.id)
 
 
 async def test_server_close_is_cancellation_safe() -> None:
     with tempfile.TemporaryDirectory(prefix="rar-", dir="/tmp") as directory:
         socket_path = str(Path(directory) / "s.sock")
-        core = RuntimeCore(InMemoryTaskRepository(), Simulator().skills)
-        server = RuntimeServer(core, socket_path)
+        server = RuntimeServer(InMemoryTaskRepository(), Simulator().skills, socket_path)
         await server.start()
         closing = asyncio.create_task(server.close())
         await asyncio.sleep(0)
@@ -516,28 +512,26 @@ async def test_server_close_is_cancellation_safe() -> None:
         await server.close()
         assert not os.path.exists(socket_path)
         with pytest.raises(RuntimeError):
-            await core.list_skills()
+            await server._core.list_skills()
 
 
 async def test_server_never_removes_preexisting_regular_file() -> None:
     with tempfile.TemporaryDirectory(prefix="rar-", dir="/tmp") as directory:
         path = Path(directory) / "s.sock"
         path.write_text("keep")
-        core = RuntimeCore(InMemoryTaskRepository(), Simulator().skills)
-        server = RuntimeServer(core, str(path))
+        server = RuntimeServer(InMemoryTaskRepository(), Simulator().skills, str(path))
         with pytest.raises(RuntimeError, match="not a socket"):
             await server.start()
         await server.close()
         assert path.read_text() == "keep"
-        await core.close()
+        await server._core.close()
 
 
 async def test_failed_start_does_not_remove_someone_elses_socket() -> None:
     with tempfile.TemporaryDirectory(prefix="rar-", dir="/tmp") as directory:
         socket_path = str(Path(directory) / "s.sock")
         existing = await asyncio.start_unix_server(lambda r, w: None, path=socket_path)
-        core = RuntimeCore(InMemoryTaskRepository(), Simulator().skills)
-        server = RuntimeServer(core, socket_path)
+        server = RuntimeServer(InMemoryTaskRepository(), Simulator().skills, socket_path)
         try:
             with pytest.raises(OSError):
                 await server.start()
@@ -546,7 +540,7 @@ async def test_failed_start_does_not_remove_someone_elses_socket() -> None:
         finally:
             existing.close()
             await existing.wait_closed()
-            await core.close()
+            await server._core.close()
 
 
 async def test_subscription_extra_input_is_bounded_and_terminates_without_eof() -> None:
@@ -621,8 +615,7 @@ async def test_server_chmod_failure_closes_listener_and_cleans_owned_socket(
 ) -> None:
     with tempfile.TemporaryDirectory(prefix="rar-", dir="/tmp") as directory:
         socket_path = str(Path(directory) / "s.sock")
-        core = RuntimeCore(InMemoryTaskRepository(), Simulator().skills)
-        server = RuntimeServer(core, socket_path)
+        server = RuntimeServer(InMemoryTaskRepository(), Simulator().skills, socket_path)
         listeners: list[asyncio.Server] = []
         real_start = server_module.asyncio.start_unix_server
 
@@ -648,13 +641,13 @@ async def test_server_chmod_failure_closes_listener_and_cleans_owned_socket(
             assert listeners and not listeners[0].is_serving()
             assert not os.path.lexists(socket_path)
             with pytest.raises(RuntimeError):
-                await core.list_skills()
+                await server._core.list_skills()
         finally:
             for listener in listeners:
                 listener.close()
                 await listener.wait_closed()
             await server.close()
-            await core.close()
+            await server._core.close()
 
 
 async def test_server_post_ownership_lstat_failure_cleans_startup(
@@ -662,8 +655,7 @@ async def test_server_post_ownership_lstat_failure_cleans_startup(
 ) -> None:
     with tempfile.TemporaryDirectory(prefix="rar-", dir="/tmp") as directory:
         socket_path = str(Path(directory) / "s.sock")
-        core = RuntimeCore(InMemoryTaskRepository(), Simulator().skills)
-        server = RuntimeServer(core, socket_path)
+        server = RuntimeServer(InMemoryTaskRepository(), Simulator().skills, socket_path)
         listeners: list[asyncio.Server] = []
         real_start = server_module.asyncio.start_unix_server
         real_lstat = server_module.os.lstat
@@ -700,14 +692,14 @@ async def test_server_post_ownership_lstat_failure_cleans_startup(
             assert listeners and not listeners[0].is_serving()
             assert not os.path.lexists(socket_path)
             with pytest.raises(RuntimeError):
-                await core.list_skills()
+                await server._core.list_skills()
         finally:
             injecting = False
             for listener in listeners:
                 listener.close()
                 await listener.wait_closed()
             await server.close()
-            await core.close()
+            await server._core.close()
 
 
 async def test_server_failed_start_cleanup_does_not_delete_replacement_file(
@@ -715,8 +707,7 @@ async def test_server_failed_start_cleanup_does_not_delete_replacement_file(
 ) -> None:
     with tempfile.TemporaryDirectory(prefix="rar-", dir="/tmp") as directory:
         socket_path = str(Path(directory) / "s.sock")
-        core = RuntimeCore(InMemoryTaskRepository(), Simulator().skills)
-        server = RuntimeServer(core, socket_path)
+        server = RuntimeServer(InMemoryTaskRepository(), Simulator().skills, socket_path)
         listeners: list[asyncio.Server] = []
         real_start = server_module.asyncio.start_unix_server
 
@@ -748,7 +739,7 @@ async def test_server_failed_start_cleanup_does_not_delete_replacement_file(
                 listener.close()
                 await listener.wait_closed()
             await server.close()
-            await core.close()
+            await server._core.close()
 
 
 async def test_remote_subscription_overflow_preserves_business_error() -> None:

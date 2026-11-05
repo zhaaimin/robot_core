@@ -5,7 +5,7 @@ from typing import Any
 from uuid import uuid4
 
 from robot_agent_runtime.errors import TaskCancelled
-from robot_agent_runtime.events import EventBus
+from robot_agent_runtime.kernel.events import EventBus
 from robot_agent_runtime.models import ErrorInfo, Event, Task, TaskState
 from robot_agent_runtime.ports import TaskRepository
 

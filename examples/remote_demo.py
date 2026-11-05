@@ -6,11 +6,10 @@ import tempfile
 from pathlib import Path
 
 from robot_agent_runtime.adapters.simulator import Simulator
-from robot_agent_runtime.core import RuntimeCore
 from robot_agent_runtime.models import SkillCall, TaskRequest, TaskState
-from robot_agent_runtime.repository import InMemoryTaskRepository
+from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 from robot_agent_runtime.sdk import RemoteRuntime
-from robot_agent_runtime.server import RuntimeServer
+from robot_agent_runtime.transport.server import RuntimeServer
 
 
 async def main() -> None:
@@ -18,7 +17,7 @@ async def main() -> None:
         socket_path = str(Path(directory) / "runtime.sock")
         simulator = Simulator(delay_s=0.01)
         server = RuntimeServer(
-            RuntimeCore(InMemoryTaskRepository(), simulator.skills), socket_path
+            InMemoryTaskRepository(), simulator.skills, socket_path
         )
         remote = RemoteRuntime(socket_path)
         await server.start()

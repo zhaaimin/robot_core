@@ -1,8 +1,8 @@
 import asyncio
 
-from robot_agent_runtime.events import EventBus
+from robot_agent_runtime.kernel.events import EventBus
 from robot_agent_runtime.models import Event
-from robot_agent_runtime.repository import InMemoryTaskRepository
+from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 
 
 async def test_event_replay_reads_bounded_pages_and_preserves_live_order() -> None:

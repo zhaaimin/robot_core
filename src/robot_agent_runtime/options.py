@@ -6,7 +6,11 @@ from robot_agent_runtime.errors import InvalidRequest
 
 @dataclass(frozen=True)
 class RuntimeOptions:
-    """Bound isolation capacity without replacing threads held by external code."""
+    """Bound actual owner loops, including validation, without replacing workers.
+
+    Shared/group objects count once per loop and share that loop's call limits.
+    The kernel and SDK callback executor have separate thread budgets.
+    """
 
     port_timeout_s: float = 5.0
     cancel_grace_s: float = 0.2

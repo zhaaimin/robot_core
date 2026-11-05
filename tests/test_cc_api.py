@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from robot_agent_runtime.models import SkillCall, SkillContext, Task, TaskRequest, TaskState
-from robot_agent_runtime.repository import InMemoryTaskRepository
+from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 from robot_agent_runtime.sdk import RobotRuntime
 
 

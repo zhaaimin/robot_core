@@ -4,15 +4,18 @@ import stat
 import sys
 from contextlib import suppress
 from typing import Any
+from collections.abc import Mapping
 
 from pydantic import ValidationError
 
-from robot_agent_runtime.core import RuntimeCore
+from robot_agent_runtime.kernel.core import RuntimeCore
 from robot_agent_runtime.errors import AgentRuntimeError, InvalidRequest
-from robot_agent_runtime.kernel_host import KernelHost
+from robot_agent_runtime.hosting.kernel_host import KernelHost
 from robot_agent_runtime.models import TaskRequest
 from robot_agent_runtime.options import RuntimeOptions
-from robot_agent_runtime.wire import (
+from robot_agent_runtime.ports import Reconciler, RobotStateProvider, Skill, TaskRepository
+from robot_agent_runtime.thread_binding import ThreadBinding
+from robot_agent_runtime.transport.wire import (
     MAX_MESSAGE_BYTES,
     SERVICE_NAME,
     SERVICE_VERSION,
@@ -24,11 +27,19 @@ from robot_agent_runtime.wire import (
 
 class RuntimeServer:
     def __init__(
-        self, core: RuntimeCore, socket_path: str, *, options: RuntimeOptions | None = None
+        self,
+        repository: TaskRepository | ThreadBinding[TaskRepository],
+        skills: Mapping[str, Skill | ThreadBinding[Skill]],
+        socket_path: str,
+        *,
+        reconciler: Reconciler | ThreadBinding[Reconciler] | None = None,
+        allowed_permissions: set[str] | None = None,
+        robot_state: RobotStateProvider | ThreadBinding[RobotStateProvider] | None = None,
+        options: RuntimeOptions | None = None,
     ) -> None:
-        self._core = core
         self._options = options or RuntimeOptions()
-        self._host = KernelHost(core, self._options)
+        self._host = KernelHost(repository, skills, reconciler, allowed_permissions, robot_state,
+                                options=self._options)
         self._socket_path = socket_path
         self._server: asyncio.Server | None = None
         self._handlers: set[asyncio.Task[None]] = set()
@@ -39,6 +50,13 @@ class RuntimeServer:
         self._lifecycle_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._close_task: asyncio.Task[None] | None = None
+
+    @property
+    def _core(self) -> RuntimeCore:
+        core = self._host._core
+        if core is None:
+            raise InvalidRequest("Server core has not been prepared")
+        return core
 
     async def start(self) -> None:
         async with self._lifecycle_lock:
@@ -96,7 +114,7 @@ class RuntimeServer:
         try:
             if server is not None:
                 server.close()
-            await self._host._begin_close()
+            await self._host.begin_close()
             handlers = list(self._handlers)
             for handler in handlers:
                 handler.cancel()

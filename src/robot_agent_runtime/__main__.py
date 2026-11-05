@@ -6,9 +6,8 @@ import signal
 from collections.abc import Sequence
 
 from robot_agent_runtime.adapters.simulator import Simulator
-from robot_agent_runtime.core import RuntimeCore
-from robot_agent_runtime.server import RuntimeServer
-from robot_agent_runtime.sqlite_repository import SQLiteTaskRepository
+from robot_agent_runtime.transport.server import RuntimeServer
+from robot_agent_runtime.repositories.sqlite import SQLiteTaskRepository
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -30,8 +29,7 @@ async def serve(socket_path: str, database_path: str, delay_s: float) -> None:
     if delay_s < 0:
         raise ValueError("--delay must be non-negative")
     simulator = Simulator(delay_s=delay_s)
-    core = RuntimeCore(SQLiteTaskRepository(database_path), simulator.skills)
-    server = RuntimeServer(core, socket_path)
+    server = RuntimeServer(SQLiteTaskRepository(database_path), simulator.skills, socket_path)
     stopped = asyncio.Event()
     loop = asyncio.get_running_loop()
     registered_signals: list[signal.Signals] = []

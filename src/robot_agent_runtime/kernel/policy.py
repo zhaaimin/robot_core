@@ -8,7 +8,7 @@ from robot_agent_runtime.errors import (
 )
 from robot_agent_runtime.models import SkillCall
 from robot_agent_runtime.ports import RobotStateProvider, Skill
-from robot_agent_runtime.registry import SkillRegistry
+from robot_agent_runtime.kernel.registry import SkillRegistry
 
 
 class PolicyEnforcer:
@@ -83,3 +83,13 @@ class PolicyEnforcer:
                 details={"skill": call.skill, "unsatisfied": sorted(blocked)},
             )
         return skill
+
+
+class LocalAdmissionValidator:
+    """Use the same policy rules directly for trusted low-level integrations."""
+
+    def __init__(self, policy: PolicyEnforcer) -> None:
+        self._policy = policy
+
+    async def validate(self, call: SkillCall, unsatisfied: frozenset[str]) -> None:
+        self._policy.validate(call, unsatisfied)

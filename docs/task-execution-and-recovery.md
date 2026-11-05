@@ -2,7 +2,7 @@
 
 本文以 CC API 语音播报为例，说明当前项目从提交任务到执行结束的完整流程，以及程序退出后能够和不能够恢复的内容。
 
-依据：2026-11-03 的项目实现，包含同进程线程隔离。本文中的“当前行为”描述已有代码，“后续需要补齐”描述尚未实现的能力。
+依据：2026-11-04 的项目实现，包含同进程线程隔离与外部对象线程选择。本文中的“当前行为”描述已有代码，“后续需要补齐”描述尚未实现的能力。
 
 最重要的边界：**SQLite 保存记录；Reconciler 负责核实真实状态；当前 recovery 处理重启时的遗留记录，不会自动接管机器人上仍在执行的任务。**
 
@@ -27,21 +27,23 @@
 | --- | --- |
 | [sdk/embedded.py](../src/robot_agent_runtime/sdk/embedded.py) | `RobotRuntime`：供同进程调用方使用的接口 |
 | [sdk/listeners.py](../src/robot_agent_runtime/sdk/listeners.py) | 统一注册事件与结果回调，内部按任务订阅和清理 |
-| [core.py](../src/robot_agent_runtime/core.py) | 启动、关闭、提交、取消、查询等运行时操作 |
-| [kernel_host.py](../src/robot_agent_runtime/kernel_host.py) | 托管独立内核线程，桥接 SDK/Server 请求和事件快照 |
-| [isolation.py](../src/robot_agent_runtime/isolation.py) | 技能、仓储、状态源、对账与校验的外部线程、期限和取消确认 |
-| [boundary.py](../src/robot_agent_runtime/boundary.py) | 在复制前限制快照体积和深度，净化外部结果与异常 |
-| [execution_context.py](../src/robot_agent_runtime/execution_context.py) | 将控制操作的预留容量传递到端口线程 |
-| [thread_runtime.py](../src/robot_agent_runtime/thread_runtime.py) | 区分取消请求和真实完成，限制在途调用并有限关闭 daemon 循环 |
-| [policy.py](../src/robot_agent_runtime/policy.py) | 提交时检查技能、参数 Schema、权限及前置条件 |
-| [executor.py](../src/robot_agent_runtime/executor.py) | 顺序执行各个技能步骤，处理超时、取消和结果 |
-| [resources.py](../src/robot_agent_runtime/resources.py) | 按资源名协调独占使用 |
-| [task_state.py](../src/robot_agent_runtime/task_state.py) | 管理本机执行记录，通过 `transition()` 统一更新任务状态 |
-| [events.py](../src/robot_agent_runtime/events.py) | 历史事件回放与实时事件推送 |
+| [kernel/core.py](../src/robot_agent_runtime/kernel/core.py) | 启动、关闭、提交、取消、查询等运行时操作 |
+| [hosting/kernel_host.py](../src/robot_agent_runtime/hosting/kernel_host.py) | 准备代理并创建内核，托管内核线程，分阶段关闭与请求/事件交接 |
+| [hosting/isolation.py](../src/robot_agent_runtime/hosting/isolation.py) | 技能、仓储、状态源、对账与校验的外部线程、期限和取消确认 |
+| [thread_binding.py](../src/robot_agent_runtime/thread_binding.py) | 注册外部对象时选择默认共享、指定组或独占线程 |
+| [hosting/boundary.py](../src/robot_agent_runtime/hosting/boundary.py) | 在复制前限制快照体积和深度，净化外部结果与异常 |
+| [hosting/execution_context.py](../src/robot_agent_runtime/hosting/execution_context.py) | 将控制操作的预留容量传递到端口线程 |
+| [hosting/thread_runtime.py](../src/robot_agent_runtime/hosting/thread_runtime.py) | 区分取消请求和真实完成，限制在途调用并有限关闭 daemon 循环 |
+| [kernel/policy.py](../src/robot_agent_runtime/kernel/policy.py) | 提交时检查技能、参数 Schema、权限及前置条件 |
+| [ports.py](../src/robot_agent_runtime/ports.py) 中的 `AdmissionValidator` | 将准入规则与其本地或隔离执行位置分开，校验不写任务状态 |
+| [kernel/executor.py](../src/robot_agent_runtime/kernel/executor.py) | 顺序执行各个技能步骤，处理超时、取消和结果 |
+| [kernel/resources.py](../src/robot_agent_runtime/kernel/resources.py) | 按资源名协调独占使用 |
+| [kernel/task_state.py](../src/robot_agent_runtime/kernel/task_state.py) | 管理本机执行记录，通过 `transition()` 统一更新任务状态 |
+| [kernel/events.py](../src/robot_agent_runtime/kernel/events.py) | 历史事件回放与实时事件推送 |
 | [adapters/cc_api.py](../src/robot_agent_runtime/adapters/cc_api.py) | 将 `audio.speak` 转成 CC API 请求，等待对应的完成事件 |
-| [repository.py](../src/robot_agent_runtime/repository.py) | 用内存保存任务和事件 |
-| [sqlite_repository.py](../src/robot_agent_runtime/sqlite_repository.py) | 用 SQLite 保存任务和事件 |
-| [recovery.py](../src/robot_agent_runtime/recovery.py) | 启动时处理遗留的非终态任务 |
+| [repositories/memory.py](../src/robot_agent_runtime/repositories/memory.py) | 用内存保存任务和事件 |
+| [repositories/sqlite.py](../src/robot_agent_runtime/repositories/sqlite.py) | 用 SQLite 保存任务和事件 |
+| [kernel/recovery.py](../src/robot_agent_runtime/kernel/recovery.py) | 启动时处理遗留的非终态任务 |
 | [ports.py](../src/robot_agent_runtime/ports.py) 中的 `Reconciler` | 供适配器实现的任务真实状态核对接口 |
 
 ## 3. 一次正常语音播报的完整流程
@@ -292,7 +294,7 @@ print(final.id, final.state, final.result, final.error)
 
 ```python
 from robot_agent_runtime.sdk import RobotRuntime
-from robot_agent_runtime.sqlite_repository import SQLiteTaskRepository
+from robot_agent_runtime.repositories.sqlite import SQLiteTaskRepository
 
 runtime = RobotRuntime(
     SQLiteTaskRepository("/workspace/robot_core/tasks.db"),
@@ -417,9 +419,25 @@ class Reconciler(Protocol):
 
 SDK 和服务端的内核循环独占一个线程；应用回调留在调用方，技能等外部实现由代理交给
 固定的外部循环。即使外部 async 函数内部同步阻塞，也不占用内核循环。外部仓储超过
-操作期限后停止后续访问，写入结果可能不确定，不能无条件重试。线程无法强制终止，
+操作期限且调用已开始时停止后续访问，写入结果可能不确定，不能无条件重试。排队中已确认
+撤销、从未开始的调用不会禁用仓储，也不会恢复后补执行。线程无法强制终止，
 原生扩展持有 GIL 或系统资源耗尽也不在此隔离保证内。低层 `RuntimeCore` 单独调用不提供
 托管边界；业务入口应使用 SDK 或 `RuntimeServer`。
+
+宿主在内核循环准备代理后才构造内核，所有依赖从构造时固定；低层 RuntimeCore 只接收
+普通端口。RuntimeServer(repository, skills, socket_path, ...) 与 RobotRuntime 都接收原始端口，
+并由同一个 KernelHost 执行装配。准入规则由内核 policy 实现，托管校验仍在独立校验线程。
+
+关闭时先 core.stop() 完成任务终态和事件生产，再由宿主排空已打开的事件订阅；仓储此时
+保持可读。随后 core.close() 关闭仓储并清理本机状态，再关闭外部线程与内核线程。
+begin_close() 仅发起共享关闭，close() 等待真实结果；失败时仍继续后续清理并汇总错误。
+
+外部对象默认各自独占线程。注册时可用 `ThreadBinding.shared(obj)` 共用默认外部线程，
+或 `ThreadBinding.group(obj, "name")` 按组共享；`ThreadBinding.dedicated(obj)` 显式独占。
+共享仅在同一运行时内生效，校验和内核仍独立；仓储和状态源建议默认独占。需要及时交付
+前置条件变化的状态源不得与可能阻塞的技能共用循环，否则 watch 无法及时交付变化。
+同组协程能交错运行，同步阻塞则拖住整组。每个对象的超时、故障状态、停止确认与资源隔离保持独立。
+这不改变对象构造线程，也不迁移适配器自行维护的应用循环。完整示例见 README。
 
 如果希望调用方退出后仍能正常记录任务结果，应让 Runtime 常驻，通过 `RemoteRuntime` 提交和查询任务。这能处理客户端退出，但服务端自己崩溃时仍然需要真实状态核对。
 

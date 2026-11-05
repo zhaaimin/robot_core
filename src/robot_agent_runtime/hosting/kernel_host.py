@@ -1,11 +1,11 @@
 import asyncio
 import threading
 from collections import deque
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from typing import Any
 
-from robot_agent_runtime.boundary import bounded_snapshot
-from robot_agent_runtime.core import RuntimeCore
+from robot_agent_runtime.hosting.boundary import bounded_snapshot
+from robot_agent_runtime.kernel.core import RuntimeCore
 from robot_agent_runtime.errors import (
     EventStreamOverflow,
     ExtensionCapacityExceeded,
@@ -14,7 +14,12 @@ from robot_agent_runtime.errors import (
 )
 from robot_agent_runtime.models import Event, TaskRequest
 from robot_agent_runtime.options import RuntimeOptions
-from robot_agent_runtime.thread_runtime import LoopJob, LoopThread
+from robot_agent_runtime.hosting.isolation import (
+    IsolatedAdmissionValidator, IsolatedPorts, isolate_ports,
+)
+from robot_agent_runtime.ports import Reconciler, RobotStateProvider, Skill, TaskRepository
+from robot_agent_runtime.thread_binding import ThreadBinding
+from robot_agent_runtime.hosting.thread_runtime import LoopJob, LoopThread
 
 
 _EMPTY = object()
@@ -154,8 +159,26 @@ class KernelHost:
     remains available when clients have filled all three budgets.
     """
 
-    def __init__(self, core: RuntimeCore, options: RuntimeOptions | None = None) -> None:
-        self._core = core
+    def __init__(
+        self,
+        repository: TaskRepository | ThreadBinding[TaskRepository],
+        skills: Mapping[str, Skill | ThreadBinding[Skill]],
+        reconciler: Reconciler | ThreadBinding[Reconciler] | None = None,
+        allowed_permissions: set[str] | None = None,
+        robot_state: RobotStateProvider | ThreadBinding[RobotStateProvider] | None = None,
+        *,
+        options: RuntimeOptions | None = None,
+    ) -> None:
+        self._skills = dict(skills)
+        if any(type(name) is not str for name in self._skills):
+            raise InvalidRequest("Skill registry names must be plain strings")
+        self._permissions = set(allowed_permissions) if allowed_permissions is not None else None
+        if self._permissions is not None and any(type(value) is not str for value in self._permissions):
+            raise InvalidRequest("Permissions must contain plain strings")
+        self._inputs = (repository, reconciler, robot_state)
+        self._core: RuntimeCore | None = None
+        self._ports: IsolatedPorts | None = None
+        self._prepare_failure: Exception | None = None
         self._options = options or RuntimeOptions()
         self._loop = LoopThread(
             "robot-kernel",
@@ -201,10 +224,34 @@ class KernelHost:
 
     async def _start_core(self) -> None:
         async with self._kernel_lifecycle_lock():
-            await self._core.isolate(self._options)
-            await self._core.start()
+            core = await self._prepare_core()
+            await core.start()
             with self._admission_lock:
                 self._started = True
+
+    def _create_core(self, ports: IsolatedPorts) -> RuntimeCore:
+        return RuntimeCore(
+            ports.repository, ports.skills, ports.reconciler, self._permissions, ports.robot_state,
+            options=self._options, validator=IsolatedAdmissionValidator(ports, self._permissions),
+        )
+
+    async def _prepare_core(self) -> RuntimeCore:
+        if self._prepare_failure is not None:
+            raise self._prepare_failure
+        if self._core is not None:
+            return self._core
+        repository, reconciler, robot_state = self._inputs
+        try:
+            self._ports = isolate_ports(repository, self._skills, reconciler, robot_state, self._options)
+            await self._ports.prepare()
+            self._core = self._create_core(self._ports)
+        except BaseException as error:
+            self._prepare_failure = (error if isinstance(error, Exception) else
+                                     InvalidRequest("Host preparation interrupted; workers cannot be replaced"))
+            if self._ports is not None:
+                await self._ports.close()
+            raise
+        return self._core
 
     async def _settle(self, job: LoopJob[Any]) -> None:
         try:
@@ -251,15 +298,35 @@ class KernelHost:
             if job.done():
                 await self._loop.close(self._options.cancel_grace_s)
 
+    async def begin_close(self) -> None:
+        await self._begin_close()
+
     async def _shutdown(self) -> None:
+        errors: list[Exception] = []
         try:
             async with self._kernel_lifecycle_lock():
-                await self._core.isolate(self._options)
-                self._core._event_drainer = self._drain_streams
+                core = await self._prepare_core()
                 try:
-                    await self._core.close()
+                    await core.stop()
+                except Exception:
+                    # close() shares and reports the same stop result once.
+                    pass
+                try:
+                    await self._drain_streams()
+                except Exception as error:
+                    errors.append(error)
+                try:
+                    await core.close()
+                except Exception as error:
+                    if isinstance(error, ExceptionGroup):
+                        errors.extend(error.exceptions)
+                    else:
+                        errors.append(error)
                 finally:
-                    self._core._event_drainer = None
+                    if self._ports is not None:
+                        await self._ports.close()
+                if errors:
+                    raise ExceptionGroup("Kernel host shutdown errors", errors)
         finally:
             with self._admission_lock:
                 self._loop_available = False

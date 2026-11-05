@@ -5,7 +5,7 @@ import json
 
 from robot_agent_runtime.adapters.simulator import Simulator
 from robot_agent_runtime.models import SkillCall, TaskRequest, TaskState
-from robot_agent_runtime.repository import InMemoryTaskRepository
+from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 from robot_agent_runtime.sdk import RobotRuntime
 
 
