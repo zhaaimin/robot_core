@@ -102,6 +102,10 @@ class ListenerCallbackTimeout(AgentRuntimeError):
     code = "LISTENER_CALLBACK_TIMEOUT"
 
 
+class ListenerCapacityExceeded(AgentRuntimeError):
+    code = "LISTENER_CAPACITY_EXCEEDED"
+
+
 class ExtensionCapacityExceeded(AgentRuntimeError):
     code = "EXTENSION_CAPACITY_EXCEEDED"
 

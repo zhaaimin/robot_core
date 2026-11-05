@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 from collections.abc import Sequence
+import time
 
 from robot_agent_runtime.adapters.cc_api import CcApiSpeechSkill
 from robot_agent_runtime.errors import RobotConnectionError, SkillExecutionError
@@ -12,6 +13,7 @@ from robot_agent_runtime.models import Event, SkillCall, Task, TaskRequest, Task
 from robot_agent_runtime.ports import CallbackRobotApi
 from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 from robot_agent_runtime.sdk import RobotRuntime
+from robot_agent_runtime.thread_binding import ThreadBinding
 
 
 async def speak(api: CallbackRobotApi, message: str) -> Task:
@@ -23,23 +25,40 @@ async def speak(api: CallbackRobotApi, message: str) -> Task:
     """
     skill = CcApiSpeechSkill(api)
     runtime = RobotRuntime(
-        InMemoryTaskRepository(), {skill.definition.name: skill},
+        InMemoryTaskRepository(), {skill.definition.name: ThreadBinding.group(skill, "audio")},
         allowed_permissions={"audio"},
     )
     completed: asyncio.Future[Task] = asyncio.get_running_loop().create_future()
 
     def on_event(event: Event) -> None:
-        print(event.model_dump_json(), flush=True)
+        print(f"[on_event1 EVENT] {event.model_dump_json()}", flush=True)
 
     async def on_done(task: Task) -> None:
+        print(f"[on_done1 DONE:] {task.model_dump_json()}", flush=True)
         if not completed.done():
             completed.set_result(task)
 
     async def on_error(task_id: str, error: Exception) -> None:
+        print(f"[on_error1 ERROR] {error}", flush=True)
         if not completed.done():
             completed.set_exception(error)
 
     runtime.add_task_listener(on_event=on_event, on_done=on_done, on_error=on_error)
+
+    def on_event2(event: Event) -> None:
+        print(f"[on_event2 EVENT] {event.model_dump_json()}", flush=True)
+
+    async def on_done2(task: Task) -> None:
+        print(f"[on_done2 DONE] {task.model_dump_json()}", flush=True)
+        # if not completed.done():
+        #     completed.set_result(task)
+
+    async def on_error2(task_id: str, error: Exception) -> None:
+        print(f"[on_error2 ERROR] {error}", flush=True)
+        if not completed.done():
+            completed.set_exception(error)
+
+    # runtime.add_task_listener(on_event=on_event2, on_done=on_done2, on_error=on_error2)
     await skill.start()
     try:
         await runtime.start()
@@ -86,7 +105,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "Speech task did not succeed",
                 details={"task_id": final.id, "error": final.error.to_dict() if final.error else None},
             )
-        print(json.dumps(final.result, ensure_ascii=False))
+        print(f"[RESULT] {json.dumps(final.result, ensure_ascii=False)}")
     finally:
         api.stop()
 

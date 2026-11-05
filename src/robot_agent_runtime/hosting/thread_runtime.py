@@ -79,6 +79,8 @@ class LoopThread:
     A blocked or cancellation-resistant invocation retains its thread and slot;
     close requests cancellation and waits only for a bounded grace period. The
     loop stays alive until real completion, and no replacement thread is made.
+    Self-closing callbacks may preserve their own job; the loop still stops
+    automatically after that job finishes, without needing its caller loop.
     """
 
     def __init__(self, name: str, max_pending: int = 256, control_capacity: int = 0) -> None:
@@ -97,6 +99,9 @@ class LoopThread:
         self._jobs: set[LoopJob[Any]] = set()
         self._tasks: set[asyncio.Task[None]] = set()
         self._closed = False
+
+    def stopped(self) -> bool:
+        return self._stopped.done()
 
     async def start(self) -> None:
         with self._lock:
@@ -140,7 +145,9 @@ class LoopThread:
             job.cancel()
             raise
 
-    async def close(self, grace_s: float = 0.2) -> None:
+    async def close(
+        self, grace_s: float = 0.2, *, preserve: LoopJob[Any] | None = None,
+    ) -> None:
         if (
             isinstance(grace_s, bool)
             or not isinstance(grace_s, (int, float))
@@ -154,9 +161,12 @@ class LoopThread:
             if self._thread is None and not self._stopped.done():
                 self._stopped.set_result(None)
         for job in jobs:
-            job.cancel()
+            if job is not preserve:
+                job.cancel()
         with self._lock:
             self._stop_when_idle()
+        if preserve is not None:
+            return
         try:
             await _wait_future(self._stopped, grace_s)
         except TimeoutError:

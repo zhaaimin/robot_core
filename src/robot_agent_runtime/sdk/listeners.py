@@ -12,7 +12,15 @@ from robot_agent_runtime.errors import (
     TaskEventStreamEnded,
 )
 from robot_agent_runtime.models import Event, Task, TaskState
+from robot_agent_runtime.options import RuntimeOptions
 from robot_agent_runtime.sdk.callback_executor import CallbackExecutor
+from robot_agent_runtime.sdk.listener_execution import (
+    CALLBACK_ORIGIN,
+    CallbackLoop,
+    ListenerExecution,
+    ListenerLoops,
+    on_callback_owner,
+)
 
 
 EventCallback = Callable[[Event], Awaitable[None] | None]
@@ -31,9 +39,10 @@ class TaskListener:
     """One registration watching future submissions through its owning SDK.
 
     Events are replayed before live delivery, then the terminal snapshot is
-    delivered once. Each task has its own coroutine, so a slow async callback
-    does not hold up other tasks. Async callbacks stay on their caller loop;
-    synchronous callbacks run on daemon workers. Callback/transport failures end
+    delivered once. Each task has its own coroutine, so callbacks that yield
+    allow other tasks to progress. Caller execution keeps async callbacks on the
+    submitting loop and sync callbacks on daemon workers. Group/dedicated
+    execution owns a stable callback loop for both kinds. Callback/transport failures end
     only that task's subscription; they never write business state or cancel
     robot execution.
 
@@ -49,18 +58,20 @@ class TaskListener:
         self,
         subscribe: EventSubscription,
         get_task: TaskLookup,
-        detach: Callable[["TaskListener"], None],
+        detach: Callable[["TaskListener"], Awaitable[None]],
         executor: CallbackExecutor,
         *,
         on_event: EventCallback | None,
         on_done: DoneCallback | None,
         on_error: ErrorCallback | None,
         cancel_grace_s: float = 0.2,
+        callback_loop: CallbackLoop | None = None,
     ) -> None:
         self._subscribe = subscribe
         self._get_task = get_task
         self._detach = detach
         self._executor = executor
+        self._callback_loop = callback_loop
         self._on_event = on_event
         self._on_done = on_done
         self._on_error = on_error
@@ -85,7 +96,9 @@ class TaskListener:
 
     async def wait(self) -> None:
         with self._lock:
-            if asyncio.current_task() in self._tasks.values():
+            origin = CALLBACK_ORIGIN.get()
+            if (origin is not None and origin[0] is self
+                    or asyncio.current_task() in self._tasks.values()):
                 raise InvalidRequest("A task callback cannot wait for its own listener")
             pending = tuple(self._completions.values())
         await asyncio.gather(
@@ -94,9 +107,14 @@ class TaskListener:
         )
 
     async def close(self) -> None:
+        if await on_callback_owner(self.close):
+            return
         await self._close(asyncio.current_task())
 
     async def _close(self, origin: asyncio.Task[Any] | None) -> None:
+        callback_origin = CALLBACK_ORIGIN.get()
+        if callback_origin is not None and callback_origin[0] is self:
+            origin = callback_origin[1]
         with self._lock:
             self._closed = True
             pending = [
@@ -106,7 +124,6 @@ class TaskListener:
             callbacks = tuple(self._pending_callbacks)
         for future in callbacks:
             self._executor.cancel(future)
-        self._detach(self)
         waiters: list[asyncio.Future[Any]] = []
         for task, completion in pending:
             try:
@@ -116,14 +133,15 @@ class TaskListener:
             wrapped = asyncio.wrap_future(completion)
             wrapped.add_done_callback(_consume)
             waiters.append(asyncio.shield(wrapped))
-        if waiters:
-            try:
+        try:
+            if waiters:
                 await asyncio.wait(waiters, timeout=self._cancel_grace_s)
-            finally:
-                for waiter in waiters:
-                    waiter.cancel()
-        with self._lock:
-            self._seen.clear()
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
+            with self._lock:
+                self._seen.clear()
+            await self._detach(self)
 
     async def _observe(self, task_id: str) -> None:
         try:
@@ -167,6 +185,9 @@ class TaskListener:
         if self._closed:
             return
         try:
+            if self._callback_loop is not None:
+                await self._callback_loop.invoke(self, callback, args, can_start=self._claim_callback)
+                return
             if inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(
                 getattr(callback, "__call__", None)
             ):
@@ -193,6 +214,10 @@ class TaskListener:
             if current is not None and current.cancelling():
                 raise
             raise ListenerCallbackError("Task callback cancelled itself") from error
+
+    def _claim_callback(self) -> bool:
+        with self._lock:
+            return not self._closed
 
     async def _report_error(self, task_id: str, error: Exception) -> None:
         if self._on_error is not None:
@@ -230,10 +255,12 @@ class TaskListeners:
 
     def __init__(
         self, subscribe: EventSubscription, get_task: TaskLookup, *, cancel_grace_s: float = 0.2,
+        options: RuntimeOptions | None = None,
     ) -> None:
         self._subscribe = subscribe
         self._get_task = get_task
         self._executor = CallbackExecutor()
+        self._loops = ListenerLoops(options or RuntimeOptions(cancel_grace_s=cancel_grace_s))
         self._listeners: set[TaskListener] = set()
         self._lock = threading.Lock()
         self._cancel_grace_s = cancel_grace_s
@@ -245,6 +272,8 @@ class TaskListeners:
         on_event: EventCallback | None = None,
         on_done: DoneCallback | None = None,
         on_error: ErrorCallback | None = None,
+        execution: ListenerExecution = "caller",
+        group: str | None = None,
     ) -> TaskListener:
         if self._closed:
             raise InvalidRequest("Cannot add a task listener to a closing SDK")
@@ -253,20 +282,25 @@ class TaskListeners:
             raise InvalidRequest("Provide at least one task callback")
         if any(callback is not None and not callable(callback) for callback in callbacks):
             raise InvalidRequest("Task callbacks must be callable")
-        listener = TaskListener(
-            self._subscribe, self._get_task, self._detach, self._executor,
-            on_event=on_event, on_done=on_done, on_error=on_error,
-            cancel_grace_s=self._cancel_grace_s,
-        )
         with self._lock:
             if self._closed:
                 raise InvalidRequest("Cannot add a task listener to a closing SDK")
+            owner = self._loops.acquire(execution, group)
+            listener = TaskListener(
+                self._subscribe, self._get_task, self._detach, self._executor,
+                on_event=on_event, on_done=on_done, on_error=on_error,
+                cancel_grace_s=self._cancel_grace_s, callback_loop=owner,
+            )
             self._listeners.add(listener)
         return listener
 
-    def _detach(self, listener: TaskListener) -> None:
+    async def _detach(self, listener: TaskListener) -> None:
         with self._lock:
-            self._listeners.discard(listener)
+            if listener not in self._listeners:
+                return
+            self._listeners.remove(listener)
+        if listener._callback_loop is not None:
+            await self._loops.release(listener._callback_loop)
 
     def track(self, task: Task) -> None:
         with self._lock:
@@ -281,3 +315,4 @@ class TaskListeners:
         current = asyncio.current_task()
         await asyncio.gather(*(listener._close(current) for listener in listeners))
         await self._executor.close()
+        await self._loops.close()

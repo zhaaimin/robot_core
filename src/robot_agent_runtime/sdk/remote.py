@@ -16,6 +16,7 @@ from robot_agent_runtime.sdk.listeners import (
     TaskListener,
     TaskListeners,
 )
+from robot_agent_runtime.sdk.listener_execution import ListenerExecution, on_callback_owner
 from robot_agent_runtime.transport.wire import read_message, write_message
 
 
@@ -47,6 +48,7 @@ class RemoteRuntime:
         self._listeners = TaskListeners(
             self.subscribe_task_events, self.get_task_status,
             cancel_grace_s=self._options.cancel_grace_s,
+            options=self._options,
         )
 
     def add_task_listener(
@@ -55,8 +57,11 @@ class RemoteRuntime:
         on_event: EventCallback | None = None,
         on_done: DoneCallback | None = None,
         on_error: ErrorCallback | None = None,
+        execution: ListenerExecution = "caller",
+        group: str | None = None,
     ) -> TaskListener:
-        return self._listeners.add(on_event=on_event, on_done=on_done, on_error=on_error)
+        return self._listeners.add(on_event=on_event, on_done=on_done, on_error=on_error,
+                                   execution=execution, group=group)
 
     async def start(self) -> None:
         health = await self._request("health")
@@ -69,6 +74,8 @@ class RemoteRuntime:
             raise RemoteTransportError("Invalid health response from runtime server")
 
     async def close(self) -> None:
+        if await on_callback_owner(self.close):
+            return
         self._closed = True
         async with self._close_lock:
             if self._close_task is None:

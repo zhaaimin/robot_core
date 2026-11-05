@@ -19,6 +19,7 @@ from robot_agent_runtime.sdk.listeners import (
     TaskListener,
     TaskListeners,
 )
+from robot_agent_runtime.sdk.listener_execution import ListenerExecution, on_callback_owner
 from robot_agent_runtime.thread_binding import ThreadBinding
 
 
@@ -39,6 +40,7 @@ class RobotRuntime:
         self._listeners = TaskListeners(
             self.subscribe_task_events, self.get_task_status,
             cancel_grace_s=self._options.cancel_grace_s,
+            options=self._options,
         )
         self._closing = False
 
@@ -55,8 +57,11 @@ class RobotRuntime:
         on_event: EventCallback | None = None,
         on_done: DoneCallback | None = None,
         on_error: ErrorCallback | None = None,
+        execution: ListenerExecution = "caller",
+        group: str | None = None,
     ) -> TaskListener:
-        return self._listeners.add(on_event=on_event, on_done=on_done, on_error=on_error)
+        return self._listeners.add(on_event=on_event, on_done=on_done, on_error=on_error,
+                                   execution=execution, group=group)
 
     async def start(self) -> None:
         if self._closing:
@@ -64,6 +69,8 @@ class RobotRuntime:
         await self._host.start()
 
     async def close(self) -> None:
+        if await on_callback_owner(self.close):
+            return
         self._closing = True
         await self._host.begin_close()
         try:

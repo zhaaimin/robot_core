@@ -90,7 +90,7 @@ finally:
 | `cancel_task(task_id)` | 请求取消并在有限停止确认期后返回终态；无法确认时进入待对账状态 |
 | `list_skills()` | 列出已注册技能定义 |
 | `subscribe_task_events(task_id, after_sequence=0)` | 分页回放历史后接续实时事件；订阅容量独立于查询和取消 |
-| `add_task_listener(on_event=..., on_done=..., on_error=...)` | 监听本 SDK 后续提交的任务，返回 `TaskListener`；异步回调在事件循环，同步回调在有界守护线程池 |
+| `add_task_listener(on_event=..., on_done=..., on_error=..., execution="caller", group=None)` | 监听本 SDK 后续提交的任务，返回 `TaskListener`；可选择调用方、分组或独立执行回调 |
 | `close()` | 嵌入式停止内核并限时清理监听；远程模式清理本客户端监听和连接 |
 
 `RobotRuntime(..., options=RuntimeOptions(...))` 与
@@ -124,6 +124,9 @@ options = RuntimeOptions(
     max_snapshot_depth=64,
     event_page_size=128,
     max_event_buffer=1000,
+    max_listener_threads=16,
+    max_pending_listener_callbacks=64,
+    listener_queue_timeout_s=5.0,
 )
 ```
 
@@ -134,8 +137,9 @@ options = RuntimeOptions(
 需要更长硬件停止确认时间的部署须相应增加 `cancel_grace_s`。
 普通调用、订阅与控制操作分别限额，查询、取消和关闭不被空闲订阅挤出；外部线程
 数量（含声明校验线程）有上限，卡住的线程不会补建。容量耗尽报告
-`EXTENSION_CAPACITY_EXCEEDED`。`RemoteRuntime(socket_path, options=...)` 仅使用本地
-监听的停止确认期限，不配置服务端限额。
+`EXTENSION_CAPACITY_EXCEEDED`。监听线程另有独立预算，超限报告
+`LISTENER_CAPACITY_EXCEEDED`。`RemoteRuntime(socket_path, options=...)` 使用本地监听的
+停止确认期限、监听线程与回调排队限额，不配置服务端限额。
 
 单个跨边界快照默认最多 1 MiB、嵌套深度 64，结果与错误在工作线程规范化后交接，
 超限报告 `SNAPSHOT_TOO_LARGE`。事件历史默认每页 128 条；内存和 SQLite 仓储提供
@@ -259,26 +263,71 @@ finally:
     await runtime.close()
 ```
 
-回调支持普通函数和 `async def` 函数，至少提供一个。每个任务内部按事件顺序调用，
-终态事件的 `on_event` 完成后，查询最终快照并调用一次 `on_done`。不同任务各自监听，
-异步回调（包括 `async __call__`）在调用方事件循环运行、可协作取消，函数内仍须避免同步
-阻塞代码。普通函数在 daemon 工作线程运行；若返回 awaitable，运行时会回到事件循环
-等待它。回调收到独立的深拷贝快照。
+回调支持普通函数和 `async def` 函数（包括 `async __call__`），至少提供一个。
+每个监听器对同一任务按事件顺序调用，终态事件的 `on_event` 完成后，查询最终快照并
+调用一次 `on_done`。不同任务各自监听；回调收到独立的深拷贝快照。
 
-异步回调即使阻塞调用方循环，也不在内核循环执行；该调用方自己的请求和 `close()` 仍可能
+一次注册的 `on_event`、`on_done`、`on_error` 使用同一执行模式：
+
+| `execution` | 回调执行位置 | 同步阻塞的影响 |
+|---|---|---|
+| `"caller"`（默认） | 异步回调在提交任务的业务循环，同步回调在 SDK 共享线程池 | 异步回调里的同步阻塞会卡住业务循环；同步回调占用共享线程槽位 |
+| `"group"` | 同一 SDK 内，同名组共用一个专用线程和事件循环 | 同组监听相互影响，其他组和调用方循环可继续 |
+| `"dedicated"` | 每次监听注册独占一个专用线程和事件循环 | 阻塞限制在本次注册，不直接卡住其他监听循环 |
+
+```python
+# 保持现有行为，适合要直接访问业务循环中异步对象的回调。
+runtime.add_task_listener(on_event=update_ui, execution="caller")
+
+# 同组共用一个循环，适合愿意共享阻塞影响的监听。
+runtime.add_task_listener(on_event=record_event, execution="group", group="reporting")
+runtime.add_task_listener(on_done=record_result, execution="group", group="reporting")
+
+# 可能执行同步网络等待的回调独占一个循环。
+runtime.add_task_listener(on_event=slow_callback, execution="dedicated")
+```
+
+只有 `group` 模式接受 `group` 参数，组名必须是非空白字符串；组名按原字符串匹配，
+作用域仅限当前 SDK 实例。不同 SDK 的同名组不共享线程，监听线程也不与技能或仓储线程共用。
+组内不同任务仍可协作并发，分组不保证跨任务串行。独立模式也以注册为单位，
+同一注册的多个任务共享其循环。
+
+`caller` 模式的普通函数返回 awaitable 时，回到提交方循环等待它。
+`group` / `dedicated` 模式的普通函数、异步函数，以及普通函数返回的 awaitable，
+都在所选循环中执行，不占用默认同步回调线程池。订阅和状态查询仍在提交方循环，
+仅用户回调跨线程交接。
+
+选择分组或独立模式后，异步客户端、连接及 asyncio Event/Queue/Future 必须在其所属循环
+创建和使用，不能直接操作业务循环里的对象。通知业务循环用 `loop.call_soon_threadsafe()`；
+调用依赖业务循环的异步接口用 `asyncio.run_coroutine_threadsafe()` 桥接，尤其是
+`RemoteRuntime` 的请求接口。监听句柄的 `wait()` / `close()` 支持跨循环调用，
+从隔离回调调用 SDK `close()` 时自动交接回提交方循环。
+
+默认模式的异步回调即使阻塞调用方循环，也不在内核循环执行；该调用方自己的请求和 `close()` 仍可能
 无法继续。可以从其他正常运行的调用方查询内核，不能把调用方循环停住等同于内核停住。
 
-同步回调不能直接操作 asyncio Future、Event 或 Queue，也不能直接调用 SDK 的异步方法；
+默认模式的同步回调不能直接操作 asyncio Future、Event 或 Queue，也不能直接调用 SDK 的异步方法；
 需要这些操作时使用 `async def` 回调，或通过 `loop.call_soon_threadsafe()` 通知事件循环。
 同一任务按事件顺序执行；不同任务或不同注册的同步回调可能并发，调用方共享的数据须自行同步。
 
-每个 SDK 实例共享 4 个工作线程，最多排队 64 个同步回调，排队期限 5 秒。队列满时报告
+默认模式下，每个 SDK 实例共享 4 个工作线程，最多排队 64 个同步回调，排队期限 5 秒。队列满时报告
 `LISTENER_CALLBACK_QUEUE_FULL`，排队过期报告 `LISTENER_CALLBACK_TIMEOUT`，结束对应任务
 的监听，不影响业务任务。同步 `on_error` 同样受容量与期限约束，无法执行时交给事件循环
-异常处理器；异步 `on_error` 不占线程槽位。这些是 SDK 内部限额，目前不提供公开配置。
+异常处理器；异步 `on_error` 不占线程槽位。这些默认同步线程池限额不提供公开配置。
+
+分组与独立模式默认最多保留 16 个监听线程位置，同名组计一次，每个独立注册计一次。
+线程在首次回调时启动；注册时预留位置。关闭最后一个组成员或独立注册后释放线程，
+但永久阻塞或抵抗取消的线程继续占用预算，直到真实退出，不补建替代线程。
+每个循环默认最多接纳 64 个回调（在途与排队合计），排队期限 5 秒；满额和过期分别报告
+`LISTENER_CALLBACK_QUEUE_FULL`、`LISTENER_CALLBACK_TIMEOUT`，结束对应任务的监听。
+`on_error` 同样在所选循环执行并受限，无法执行时交给提交方循环异常处理器。
+限额由 `RuntimeOptions.max_listener_threads`、`max_pending_listener_callbacks`、
+`listener_queue_timeout_s` 配置，与默认同步线程池及外部端口线程预算分开。
 
 嵌入式 `close()` 先启动内核关闭；两种 SDK 均限时注销监听、取消尚未被线程领取的工作，
-不等待已经领取的同步回调。
+不等待已经领取的同步回调。分组和独立模式也撤销未开始回调、请求取消在途回调，
+限时等待线程退出；无法停止的回调保留线程，丢弃迟到结果，不再交付后续事件。
+回调内可以关闭自身监听或 SDK，当前回调返回后自行退出其已关闭的专用循环。
 异步监听即使吞掉取消，也只能占用 `cancel_grace_s` 的清理等待；副作用可能继续，
 运行时会停止后续交付并遗弃迟到结果。
 已领取的回调视为在途：其外部副作用可能继续，运行时丢弃完成结果和异常，进程退出不会
@@ -325,6 +374,7 @@ CREATED → VALIDATING → QUEUED → RUNNING → SUCCEEDED
 
 注册式监听只观察这些状态，不增加新的状态或写入状态。`on_done` 包含所有终态，
 表示本次任务已结束，不等于成功；`on_error` 及回调队列满、排队超时也不改变机器人任务状态。
+监听的调用方/分组/独立执行方式只决定回调归属，不增加状态或改变业务任务的执行位置。
 线程选择不增加任务状态；共享组被阻塞时仍按原有期限、停止确认和资源隔离规则处理。
 尚未派发的技能在排队期间单步期限到期为 `FAILED / SKILL_TIMEOUT`，总期限到期为
 `FAILED / TASK_TIMEOUT`，撤销后不会补执行或隔离该技能实例。已开始且无法确认停止的
@@ -391,7 +441,8 @@ src/robot_agent_runtime/
 │   ├── embedded.py        RobotRuntime
 │   ├── remote.py          RemoteRuntime
 │   ├── listeners.py       TaskListener
-│   └── callback_executor.py  同步回调执行器
+│   ├── callback_executor.py  默认同步回调执行器
+│   └── listener_execution.py  监听分组/独立循环、容量与回调桥接
 └── adapters/              机器人能力实现
     ├── cc_api.py          CC API 语音适配器
     └── simulator.py       模拟技能、状态源与对账器
@@ -582,7 +633,8 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
 持久化、`test_embedded_sdk` / `test_remote_sdk` 两种接入形态、`test_contracts` 供后续适配器
 复用的契约测试、`test_cc_api` 语音事件匹配与取消/断连边界、`test_task_listeners`
 统一回调注册、任务隔离与监听生命周期、`test_callback_executor` 守护线程退出、容量、
-排队期限与取消竞态；`test_event_paging` 覆盖分页回放、实时去重和批次让出；`test_thread_runtime` / `test_isolation` / `test_kernel_host` /
+排队期限与取消竞态；`test_listener_execution` 覆盖监听执行位置、组内阻塞、独立隔离、
+线程预算、排队撤销、远程接入与自关闭；`test_event_paging` 覆盖分页回放、实时去重和批次让出；`test_thread_runtime` / `test_isolation` / `test_kernel_host` /
 `test_execution_boundaries` / `test_runtime_isolation` 覆盖线程归属、阻塞外部代码、有限取消、
 仓储故障关闭、快照和资源隔离；`test_thread_bindings` 覆盖共享/分组/独占、配置冲突、
 实际线程容量、SDK/Server 接入及组内阻塞和取消边界。
@@ -600,8 +652,9 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
 
 已实现：运行时内核、技能层框架、Python SDK（嵌入式 + 远程）、UDS 守护进程、SQLite
 持久化、模拟适配器、CC API 语音播报适配器、SDK 统一注册式任务监听（仅本客户端后续提交）、
-同步回调的有界守护线程隔离与排队期限、同进程内核专用线程和外部端口共享/分组/独占配置、有限停止
-确认与失控资源隔离、任务总期限、控制容量预留、快照限额、事件分页及有界关闭缓冲。
+同步回调的有界守护线程隔离与排队期限、监听回调调用方/分组/独立执行配置、
+同进程内核专用线程和外部端口共享/分组/独占配置、有限停止确认与失控资源隔离、
+任务总期限、控制容量预留、快照限额、事件分页及有界关闭缓冲。
 
 线程边界保护外部 Python 阻塞或不配合取消时的内核响应，不提供硬实时保证。原生扩展
 长期持有 GIL、进程退出或系统资源耗尽仍会影响整个进程；不能强制终止已经运行的线程。
