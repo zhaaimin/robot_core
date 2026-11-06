@@ -18,10 +18,10 @@ from robot_agent_runtime.errors import (
     TaskCancelled,
 )
 from robot_agent_runtime.models import SkillContext, SkillDefinition, SkillResult
-from robot_agent_runtime.ports import CallbackApiResponse, CallbackRobotApi
+from robot_agent_runtime.adapters.cc_api.contracts import CcApiClient
+from robot_agent_runtime.adapters.cc_api.driver import CcApiDriver
 
 
-_FINISHED = "cc.api.work.finished"
 _START = "cc.api.work.start"
 _CONTROL = "cc.api.work.ctrl"
 _MAX_EARLY_EVENTS = 128
@@ -37,7 +37,7 @@ class _Speech:
 
 
 class CcApiSpeechSkill:
-    """Speech on a dedicated, already connected CC API callback transport.
+    """CC speech semantics on an owned or shared communication driver.
 
     A matching work.finished means success regardless of its payload, per the
     initial integration contract. A local cancel still stops this exact work
@@ -48,12 +48,14 @@ class CcApiSpeechSkill:
     Lost connections or uncertain work ownership poison the instance: callers
     must establish that the old speech has stopped before creating another.
     Automatic reconnect/retry could otherwise overlap physical playback.
-    Start before the runtime and close after it; SDK connection lifecycle stays
-    with the application. Importing this module never imports the native SDK.
+    Passing an Api creates an owned driver for standalone usage.
+    Passing a CcApiDriver shares requests and notifications with other skills;
+    closing this skill then removes only its own subscriptions. Start before the
+    runtime and close after it. The application still owns the SDK connection.
     """
 
     def __init__(
-        self, api: CallbackRobotApi, *, stop_timeout_s: float = 5.0
+        self, api: CcApiClient | CcApiDriver, *, stop_timeout_s: float = 5.0
     ) -> None:
         if not 0 < stop_timeout_s < float("inf"):
             raise InvalidRequest("stop_timeout_s must be finite and positive")
@@ -72,7 +74,9 @@ class CcApiSpeechSkill:
             timeout_s=30.0,
             supports_cancel=True,
         )
-        self._api = api
+        self._owns_driver = not isinstance(api, CcApiDriver)
+        self._driver = api if isinstance(api, CcApiDriver) else CcApiDriver(api)
+        self._detach: list[Callable[[], None]] = []
         self._stop_timeout_s = stop_timeout_s
         self._loop: asyncio.AbstractEventLoop | None = None
         self._started = False
@@ -91,16 +95,15 @@ class CcApiSpeechSkill:
         self._loop = asyncio.get_running_loop()
         self._started = True
         try:
-            self._api.add_service(_FINISHED, self._on_finished)
-            self._api.set_disconnect_callback(self._on_disconnect)
-            self._api.notify("cc.api.work.subscribe")
+            self._detach.append(self._driver.subscribe_finished(self._finished))
+            self._detach.append(self._driver.subscribe_failure(self._abort))
+            await self._driver.start()
         except Exception as error:
             self._started = False
             self._broken = True
-            with suppress(Exception):
-                self._api.remove_service(_FINISHED)
-            with suppress(Exception):
-                self._api.set_disconnect_callback(lambda: None)
+            for detach in self._detach:
+                detach()
+            self._detach.clear()
             raise RobotConnectionError("Could not subscribe to CC API work events") from error
 
     async def close(self) -> None:
@@ -117,13 +120,7 @@ class CcApiSpeechSkill:
             results = await asyncio.gather(owner, return_exceptions=True)
             errors.extend(error for error in results
                           if isinstance(error, Exception) and not isinstance(error, TaskCancelled))
-        if not self._started:
-            return
-        for cleanup in (
-            lambda: self._api.notify("cc.api.work.unsubscribe"),
-            lambda: self._api.remove_service(_FINISHED),
-            lambda: self._api.set_disconnect_callback(lambda: None),
-        ):
+        for cleanup in self._detach:
             try:
                 cleanup()
             except Exception as error:
@@ -131,6 +128,12 @@ class CcApiSpeechSkill:
                     "Could not detach CC API speech callbacks",
                     details={"cause": type(error).__name__},
                 ))
+        self._detach.clear()
+        if self._owns_driver:
+            try:
+                await self._driver.close()
+            except Exception as error:
+                errors.append(error)
         self._started = False
         if len(errors) == 1:
             raise errors[0]
@@ -344,32 +347,12 @@ class CcApiSpeechSkill:
     async def _request(self, method: str, params: dict[str, Any]) -> Any:
         if self._broken:
             raise RobotConnectionError("CC API connection is no longer usable")
-        response = self._future()
 
-        def received(value: CallbackApiResponse) -> None:
-            self._post(self._resolve_response, response, value)
-
-        try:
+        def dispatched() -> None:
             if method == _START and self._speech is not None:
                 self._speech.dispatched = True
-            self._api.request(method, params, received)
-        except BaseException as error:
-            self._broken = True
-            response.cancel()
-            raise RobotConnectionError("CC API request dispatch failed", details={"method": method}) from error
-        value = await response
-        try:
-            if not value.is_success:
-                raise RobotRequestError(
-                    value.error_message or "CC API rejected request",
-                    details={"method": method, "vendor_code": value.error_code},
-                )
-            return value.result
-        except RobotRequestError:
-            raise
-        except BaseException as error:
-            self._broken = True
-            raise RobotResponseError("Malformed CC API response", details={"method": method}) from error
+
+        return await self._driver.request(method, params, on_dispatch=dispatched, control=method == _CONTROL)
 
     def _future(self) -> asyncio.Future[Any]:
         future = asyncio.get_running_loop().create_future()
@@ -382,22 +365,6 @@ class CcApiSpeechSkill:
         if not future.cancelled():
             future.exception()
 
-    def _post(self, callback: Callable[..., None], *args: Any) -> None:
-        loop = self._loop
-        if self._started and loop is not None:
-            with suppress(RuntimeError):
-                loop.call_soon_threadsafe(callback, *args)
-
-    @staticmethod
-    def _resolve_response(future: asyncio.Future[Any], value: CallbackApiResponse) -> None:
-        if not future.done():
-            future.set_result(value)
-
-    def _on_finished(self, request_id: Any, params: Any) -> None:
-        work_id = params.get("workId") if isinstance(params, dict) else None
-        if isinstance(work_id, str) and work_id:
-            self._post(self._finished, work_id)
-
     def _finished(self, work_id: str) -> None:
         speech = self._speech
         if speech is None:
@@ -406,12 +373,9 @@ class CcApiSpeechSkill:
             speech.finished.set_result(None)
         elif speech.work_id is None:
             if len(speech.early_finished) >= _MAX_EARLY_EVENTS:
-                self._abort(RobotResponseError("Too many work events before start acknowledgement"))
+                self._driver.invalidate(RobotResponseError("Too many work events before start acknowledgement"))
             else:
                 speech.early_finished.add(work_id)
-
-    def _on_disconnect(self) -> None:
-        self._post(self._abort, RobotConnectionError("CC API disconnected during speech"))
 
     def _abort(self, error: AgentRuntimeError) -> None:
         self._broken = True

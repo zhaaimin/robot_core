@@ -93,8 +93,20 @@ finally:
 | `add_task_listener(on_event=..., on_done=..., on_error=..., execution="caller", group=None)` | 监听本 SDK 后续提交的任务，返回 `TaskListener`；可选择调用方、分组或独立执行回调 |
 | `close()` | 嵌入式停止内核并限时清理监听；远程模式清理本客户端监听和连接 |
 
+嵌入式另提供 `RobotRuntime.from_platform(repository, platform, *, allowed_permissions=None,
+options=None)`，消费 `RobotPlatform` 并一次装配技能、状态源和对账器；显式线程绑定原样
+交给宿主，权限与选项传给同一个运行时构造入口。平台启动和关闭继续由应用负责。
+
 `RobotRuntime(..., options=RuntimeOptions(...))` 与
 `RuntimeServer(repository, skills, socket_path, options=RuntimeOptions(...))` 可以配置隔离边界。
+厂商接入包通过 `ports.RobotPlatform` 汇总既有端口，应用负责选择工厂和生命周期：
+
+| 平台接口 | 行为 |
+|---|---|
+| `skills` | 稳定的只读 `Mapping[str, Skill \| ThreadBinding[Skill]]`，保留每个技能的线程选择 |
+| `robot_state` / `reconciler` | 各自的原始端口或 `ThreadBinding[端口类型]`；没有对应能力时返回 `None` |
+| `start()` / `close()` | 启动驱动和技能、确认停止并释放订阅；重复等待共享真实结果 |
+
 服务端直接接收端口，不再接收已创建的 `RuntimeCore`：
 
 ```python
@@ -221,7 +233,7 @@ runtime = RobotRuntime(
 实例和资源，不关闭同组其他对象的线程。
 组内其他调用若也因阻塞而到期，仍分别遵守原有超时和故障关闭规则。
 
-绑定只控制运行时后续调用，`MySkill(...)` 构造仍在调用方线程；不提供工厂构造或自动迁移
+绑定只控制运行时后续调用，`MySkill(...)` 构造仍在调用方线程；运行时不提供线程内工厂构造或自动迁移
 已绑定的 asyncio 对象。CC API 仍会将厂商操作交回适配器 `start()` 所在循环。
 低层 `RuntimeCore` 只接收普通端口对象并在当前循环执行；线程绑定交给 SDK/Server。
 
@@ -230,8 +242,8 @@ runtime = RobotRuntime(
 避免不确定提交之后继续写入；仅排队且已确认撤销、从未开始的调用不会禁用仓储，也不会
 在队列恢复后补执行。仓储不可用时，任务最终状态可能无法落盘，应在恢复仓储后对账。
 
-接入 CC API 语音时，应用先调用 `CcApiSpeechSkill.start()` 注册回调，再启动运行时；
-退出时先关闭运行时，再关闭技能适配器，最后停止 SDK 连接。
+接入 CC API 时，应用先调用 `platform.start()` 启动驱动和技能，再启动运行时；
+退出时先关闭运行时，再关闭平台，最后停止应用拥有的 SDK 连接。
 
 ### 统一注册任务监听
 
@@ -375,6 +387,8 @@ CREATED → VALIDATING → QUEUED → RUNNING → SUCCEEDED
 注册式监听只观察这些状态，不增加新的状态或写入状态。`on_done` 包含所有终态，
 表示本次任务已结束，不等于成功；`on_error` 及回调队列满、排队超时也不改变机器人任务状态。
 监听的调用方/分组/独立执行方式只决定回调归属，不增加状态或改变业务任务的执行位置。
+`from_platform` 从厂商平台装配原有端口并保留线程分组，不增加任务状态；驱动断连、响应不可信或停止未确认，仍通过
+技能错误进入现有失败、停止确认和待对账流程。
 线程选择不增加任务状态；共享组被阻塞时仍按原有期限、停止确认和资源隔离规则处理。
 尚未派发的技能在排队期间单步期限到期为 `FAILED / SKILL_TIMEOUT`，总期限到期为
 `FAILED / TASK_TIMEOUT`，撤销后不会补执行或隔离该技能实例。已开始且无法确认停止的
@@ -412,7 +426,7 @@ CC API 的 `audio.speak` 在启动受理后保持 `RUNNING`，收到匹配 `work
 src/robot_agent_runtime/
 ├── models.py              任务、事件、技能数据模型
 ├── errors.py              结构化错误
-├── ports.py               外部能力 Protocol
+├── ports.py               外部能力与 RobotPlatform 装配契约
 ├── options.py             运行时容量、期限和快照配置
 ├── thread_binding.py      外部对象线程归属配置
 ├── __main__.py            命令行组装入口
@@ -438,13 +452,18 @@ src/robot_agent_runtime/
 │   ├── server.py          RuntimeServer
 │   └── wire.py            NDJSON 成帧与编解码
 ├── sdk/                   应用调用接口
-│   ├── embedded.py        RobotRuntime
+│   ├── embedded.py        RobotRuntime 与保留线程绑定的 from_platform 装配
 │   ├── remote.py          RemoteRuntime
 │   ├── listeners.py       TaskListener
 │   ├── callback_executor.py  默认同步回调执行器
 │   └── listener_execution.py  监听分组/独立循环、容量与回调桥接
 └── adapters/              机器人能力实现
-    ├── cc_api.py          CC API 语音适配器
+    ├── cc_api/            CC 厂商接入包
+    │   ├── __init__.py    导出类和工厂，不创建连接
+    │   ├── contracts.py   CcApiClient / CcApiResponse 厂商 SDK 协议
+    │   ├── platform.py    CcApiPlatform 与 create_cc_api_platform
+    │   ├── driver.py      请求响应、订阅分发和 SDK 回调桥接
+    │   └── speech.py      语音参数、完成与停止确认
     └── simulator.py       模拟技能、状态源与对账器
 ```
 
@@ -482,9 +501,60 @@ SkillDefinition(
 
 实现 `ports.Skill` Protocol 即可接入：`definition` 属性 + `async execute(context, params)`。
 
+## 厂商接入包
+
+任务内核通过 `Skill`、`RobotStateProvider`、`Reconciler` 执行机器人操作。SDK 的
+`RobotRuntime.from_platform(...)` 消费 `RobotPlatform`，从中取得这三个端口并构造运行时。
+厂商包提供实现该契约的平台、工厂、驱动和技能。新增厂商可放在
+`adapters/vendor_x/` 或独立 Python 包中；应用选择相应工厂并传入配置，运行时和其他
+厂商模块不需要添加分支。原生 SDK 依赖留在对应部署环境，普通导入不加载原生库。
+
+```python
+from robot_agent_runtime.adapters.cc_api import create_cc_api_platform
+from robot_agent_runtime.ports import RobotPlatform
+
+# api 由应用创建并连接；不同厂商的工厂可以接受自己的 SDK 或配置。
+platform: RobotPlatform = create_cc_api_platform(api, skill_thread_group="audio")
+try:
+    await platform.start()
+    runtime = RobotRuntime.from_platform(repository, platform, allowed_permissions={"audio"})
+    try:
+        await runtime.start()
+        task = await runtime.submit_task(request)
+        # 业务代码查询状态或监听任务事件。
+    finally:
+        await runtime.close()
+finally:
+    await platform.close()
+```
+
+工厂在调用方装配对象，不改变运行时的线程绑定机制。平台启动、关闭与驱动操作应在
+同一应用循环进行；厂商 SDK 的回调通过驱动桥接。平台生命周期由应用负责，
+`RobotRuntime` / `RuntimeServer` 不自动启动或关闭它。资源停止无法确认时，先保留
+运行时的待对账与隔离结果，再释放通信资源，不能用释放连接表示物理动作已经停止。
+
+平台可在 `skills` 中混合提供裸技能与 `ThreadBinding.shared/group/dedicated`，状态源和
+对账器也可声明绑定。`from_platform` 将这些值原样传给宿主，不解包或重新选择线程。
+裸对象保持独占，同组对象共用一个线程且共享同步阻塞的影响；不同组和独占线程各自运行。
+容量按实际线程加声明校验线程计算。绑定只决定运行时的调用位置，平台启停仍操作原始对象。
+需及时交付前置条件的状态源应保持独占，避免与可能阻塞的技能共用循环。
+
+`RobotPlatform` 不规定厂商必须有 request、callback 或 workId；HTTP、原生同步 SDK、
+ROS 2 都可在自己的驱动和技能里转换。`adapters.cc_api.contracts` 中的 `CcApiClient` /
+`CcApiResponse` 描述 CC SDK 边界，通用 `ports.py` 只保留厂商无关的运行时契约。
+未实现状态源或对账器时明确返回 `None`，不推测设备可用或动作已经完成。
+
 ## CC API 语音播报
 
-`CcApiSpeechSkill` 接受已连接、专用的 `ubt_robot.Api` 实例，实现 `audio.speak`：
+`create_cc_api_platform` 接受已连接、专用的 `ubt_robot.Api` 实例，装配驱动和
+`audio.speak` 技能。首版无状态源和对账器。平台管理请求、订阅和技能，应用继续管理
+SDK 的 initialize/start/stop，不自动重连。
+
+工厂参数 `skill_thread_group` 默认为 `None`，保持技能独占；显式传入非空组名时，
+平台返回 `ThreadBinding.group(skill, name)`。语音 demo 显式使用 `"audio"`，保留示例原有
+分组。技能本身仍把厂商通信交回驱动所属的应用循环，此分组配置不迁移 SDK 连接。
+
+直接构造 `CcApiSpeechSkill(api)` 时会创建独占驱动：
 
 ```python
 from robot_agent_runtime.adapters.cc_api import CcApiSpeechSkill
@@ -511,8 +581,19 @@ CC API 适配器保留 `start()` 时所属的应用循环，跨线程执行会�
 回调不会在内核循环执行。应用循环阻塞也可能拖住适配器的停止确认，此时按上述规则隔离。
 
 运行示例使用底层异步回调接口，将回调转回 asyncio；不调用 `cc_api/` 中包含阻塞等待的
-`RobotClient`。SDK 的连接启动和停止放在事件循环之外。适配器独占该连接的 finished
-和 disconnect 回调，不能和其他代码在同一 Api 实例上覆盖这些处理器。
+`RobotClient`。SDK 的连接启动和停止放在事件循环之外。
+`CcApiDriver` 独占该连接的 finished 和 disconnect 回调。多个技能共用同一个驱动时，
+通过 `subscribe_finished` / `subscribe_failure` 订阅；返回的函数仅注销本次订阅。
+`CcApiSpeechSkill(driver)` 不拥有共享驱动，关闭技能只删除自己的订阅，驱动由平台或
+应用最后关闭。直接操作同一 Api 对象覆盖这些回调仍不受支持。
+
+驱动把回调响应净化为快照后交接，不把厂商响应对象带到运行时。普通请求与控制请求
+分别受 `RuntimeOptions.max_pending_calls` / `max_control_calls` 限制，停止请求使用
+保留的控制容量；响应等待受 `port_timeout_s` 限制。SDK 回调缓冲受 `max_event_buffer`
+限制，满额报告 `EVENT_STREAM_OVERFLOW` 并关闭该驱动的后续准入。响应超时、断连和
+无效响应也会失败关闭，已发送动作可能仍在执行，需要停止确认或对账。
+已下发请求的等待被取消时同样拒绝后续准入，防止丢弃启动响应后重复发送物理动作。
+请求被厂商明确拒绝时保留 `vendor_code`，允许应用之后另行提交，不自动重试。
 
 完整入口为 `examples/cc_api_speech_demo.py`。在装好 `ubt_robot` 的 Linux ARM64
 环境中执行（`CC_API_TOKEN` 通过部署环境传入）：
@@ -642,7 +723,10 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
 超时撤销后可复用，以及线程名的配置归属。
 `test_package_layout` 覆盖新模块导入、旧入口移除、当前路径补丁及独立进程导入顺序。
 `test_runtime_ownership` 覆盖内核依赖方向、构造线程、分阶段停止、异常释放与校验隔离；
-`test_contracts` 包含本地和托管准入校验器的可复用契约。
+`test_contracts` 包含本地和托管准入校验器的可复用契约，也用 CC 和非回调假厂商验证
+`RobotPlatform` 的共同装配契约。`test_cc_platform` 覆盖共享驱动、响应关联和快照、
+断连和过载、控制容量、平台启停及取消等待者后的真实清理，以及 CC 分组和 demo 策略。
+平台契约和嵌入式用例还验证混合绑定、实际线程容量、组内阻塞范围、状态源和对账器绑定。
 
 ## 当前范围
 
@@ -651,9 +735,10 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
 外部代理装配与整体关闭次序由托管层负责，内核支持保留仓储的停止阶段。
 
 已实现：运行时内核、技能层框架、Python SDK（嵌入式 + 远程）、UDS 守护进程、SQLite
-持久化、模拟适配器、CC API 语音播报适配器、SDK 统一注册式任务监听（仅本客户端后续提交）、
+持久化、模拟适配器、厂商接入包契约、SDK 通用平台装配入口与 CC 平台工厂、共享 CC 驱动和语音技能、
+SDK 统一注册式任务监听（仅本客户端后续提交）、
 同步回调的有界守护线程隔离与排队期限、监听回调调用方/分组/独立执行配置、
-同进程内核专用线程和外部端口共享/分组/独占配置、有限停止确认与失控资源隔离、
+同进程内核专用线程和外部端口共享/分组/独占配置、平台端口线程绑定透传、有限停止确认与失控资源隔离、
 任务总期限、控制容量预留、快照限额、事件分页及有界关闭缓冲。
 
 线程边界保护外部 Python 阻塞或不配合取消时的内核响应，不提供硬实时保证。原生扩展

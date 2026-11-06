@@ -16,8 +16,9 @@
 
 - **pip 装不上东西**，代理返回 403。`pytest`、`jsonschema`、`aiosqlite` 都没有。
 - **`python3` 是系统自带的 3.9.6，不要用它**（`X | None` 注解在运行时就会炸）。
-  用 **`python3.13`** —— 它是唯一装了 `pydantic` 2.13.4 的解释器。`python3.11` / `python3.12`
-  存在但没有依赖。
+  以前用 **`python3.13`** —— 它是唯一装了 `pydantic` 2.13.4 的解释器。**2026-11-06 实测这台机器
+  上 `python3.13` 已不存在**（`python3.11` / `python3.12` 还在，但都没有依赖），
+  宿主离线回归暂时跑不了，验证一律进容器。
 - **`/tmp` 不可写**。临时文件放 session scratchpad 或项目内的 scratch 目录。
 - **Docker Desktop 只能人手点图标启动**，所有程序化路径都失败（`open -a Docker`、
   `launchctl asuser`、`docker desktop start` 全试过）。需要容器时请用户点一下。
@@ -53,7 +54,9 @@ python -m pytest -q
 
 ### sweep 的已知基线
 
-2026-11-05 在当前工作树（含未提交的线程绑定、按职责分目录与托管装配重构）上：**302 passed, 3 failed, 42 skipped**。
+2026-11-05 在当前工作树（含未提交的线程绑定、按职责分目录、托管装配重构与厂商接入包
+`RobotPlatform` / `adapters/cc_api/`）上：**348 passed, 3 failed, 42 skipped**。
+（2026-11-06 容器里又多了 7 个用例，宿主因缺 `python3.13` 未复跑这组数字。）
 
 - 3 个 fail 固定是 `aiosqlite` 被 stub 掉的后果，不是回归：
   `test_sqlite_repository.py` 的 `test_sqlite_memory_start_and_close_are_idempotent`、
@@ -61,11 +64,15 @@ python -m pytest -q
   `test_contracts.py` 的 `test_sqlite_paged_event_repository_contract`（报
   `RuntimeError: aiosqlite is stubbed in .verify; run the SQLite tests in the container`）。
 - 42 个 skip 是需要 `tmp_path` / `monkeypatch` / `parametrize` 的用例，替身提供不了。
+- sweep 只收集**模块级、无参数、名字以 `test_` 开头**的函数（`.verify/sweep.py:69-73`）。
+  `test_contracts.py` 里 unittest 风格的 `class TestSimulatorSkillContract` 在宿主**根本不跑**，
+  只有容器里的 pytest 会收集。新的可复用契约检查请写成模块级 `async def check_*` + 一个模块级用例。
 
 **除这 3 个以外的任何 fail 都是真回归。** 改完代码请对比这组数字，而不是只看“跑完了”。
 
-数字会随用例增加往上走，历史基线（2026-10-26：95 / 2 / 42；2026-11-04：286 / 3 / 42）不要再拿来对账。
-容器完整套件的同期基线是 **414 passed**（`python3 -m pytest -q`，约 11 秒）。
+数字会随用例增加往上走，历史基线（2026-10-26：95 / 2 / 42；2026-11-04：286 / 3 / 42；
+2026-11-05 上午：302 / 3 / 42）不要再拿来对账。
+容器完整套件的同期基线是 **467 passed**（`python3 -m pytest -q`，约 10 秒）。
 
 ### 容器
 
@@ -99,9 +106,21 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
   内核不得依赖 `hosting` 或 `ThreadBinding`；宿主准备代理后在内核循环创建 RuntimeCore。
   依赖在构造时确定，禁止创建后替换其他对象的私有依赖。准入规则仍由 kernel/policy.py
   实现，通过 AdmissionValidator 端口选择本地或有界隔离执行。
+  厂商接入包放 adapters/<vendor>/：platform.py 装配既有端口，driver.py 管 SDK 请求和
+  回调分发，技能文件解释完成和停止语义。RobotPlatform 仅聚合 skills/state/reconciler
+  与生命周期，内核和 SDK 不依赖具体平台。CC 传入已连接的应用自有 Api，驱动独占 SDK
+  回调后多订阅者分发，技能注销只删自己的订阅；先关闭运行时，再关闭平台和原生连接。
+  CC 专属 SDK 协议 CcApiClient / CcApiResponse 放 adapters/cc_api/contracts.py，
+  通用 ports.py 不放厂商协议，不提供旧名称兼容别名。
+  SDK 通过 RobotRuntime.from_platform(repository, platform, ...) 消费 RobotPlatform，
+  创建时一次装配平台端口。skills/state/reconciler 的契约均接受对应 ThreadBinding，
+  显式绑定原样交给宿主，裸对象仍独占；平台启停操作原始对象。CC 平台可显式指定
+  skill_thread_group，语音 demo 保留 audio 分组。平台生命周期仍由应用管理，
+  不在内核中启动/关闭厂商连接。
 - **绝对导入**：`from robot_agent_runtime.models import Task`，不用相对导入。
 - **全量类型注解**，PEP 585/604 风格（`dict[str, Any]`、`Task | None`、`frozenset[str]`）。
-- **端口用 `typing.Protocol`** 声明在 `ports.py`，适配器靠结构匹配，不继承、不注册。
+- **通用端口用 `typing.Protocol`** 声明在 `ports.py`，厂商 SDK 协议放各自接入包的
+  `contracts.py`；适配器靠结构匹配，不继承、不注册。
 - **错误走 `errors.py`**：每个失败模式一个 `AgentRuntimeError` 子类 + 一个 `code` 字符串常量。
   不要裸 `raise RuntimeError`，也不要在业务代码里硬编码错误码字符串。
 - **docstring 写“为什么”和边界**，放在类/Protocol 级别，解释不变量与降级行为（看

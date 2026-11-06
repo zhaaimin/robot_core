@@ -40,7 +40,7 @@
 | [kernel/resources.py](../src/robot_agent_runtime/kernel/resources.py) | 按资源名协调独占使用 |
 | [kernel/task_state.py](../src/robot_agent_runtime/kernel/task_state.py) | 管理本机执行记录，通过 `transition()` 统一更新任务状态 |
 | [kernel/events.py](../src/robot_agent_runtime/kernel/events.py) | 历史事件回放与实时事件推送 |
-| [adapters/cc_api.py](../src/robot_agent_runtime/adapters/cc_api.py) | 将 `audio.speak` 转成 CC API 请求，等待对应的完成事件 |
+| [adapters/cc_api/](../src/robot_agent_runtime/adapters/cc_api/) | CC 厂商接入包：`contracts.py` 定义 SDK 协议，`driver.py` 管请求与回调分发，`speech.py` 把 `audio.speak` 转成 CC API 请求并等待完成事件，`platform.py` 装配成 `RobotPlatform` |
 | [repositories/memory.py](../src/robot_agent_runtime/repositories/memory.py) | 用内存保存任务和事件 |
 | [repositories/sqlite.py](../src/robot_agent_runtime/repositories/sqlite.py) | 用 SQLite 保存任务和事件 |
 | [kernel/recovery.py](../src/robot_agent_runtime/kernel/recovery.py) | 启动时处理遗留的非终态任务 |
@@ -53,11 +53,15 @@
 当前 [cc_api_speech_demo.py](../examples/cc_api_speech_demo.py) 按以下顺序工作：
 
 1. 应用初始化并连接 `ubt_robot.Api`。
-2. `CcApiSpeechSkill.start()` 注册 finished、断连回调并订阅任务结束通知。
-3. `RobotRuntime.start()` 启动仓储，先处理仓储中的遗留任务，再允许提交新任务。
-4. 调用 `submit_task()` 提交 `audio.speak`。
-5. 若提供了幂等键，先查询同一键对应的原任务；找到就返回原任务，不再次执行。
-6. 新请求创建任务，完成校验后交给执行器。
+2. `create_cc_api_platform(api)` 装配驱动与语音技能；`RobotRuntime.from_platform(repository, platform, allowed_permissions={"audio"})` 从平台取端口构造运行时，此时平台还没启动。
+3. `platform.start()`：技能先向驱动领订阅令牌，再由驱动独占注册 finished、断连回调并订阅任务结束通知。
+4. `runtime.start()` 启动仓储，先处理仓储中的遗留任务，再允许提交新任务。
+5. 调用 `submit_task()` 提交 `audio.speak`。
+6. 若提供了幂等键，先查询同一键对应的原任务；找到就返回原任务，不再次执行。
+7. 新请求创建任务，完成校验后交给执行器。
+
+关闭顺序与启动相反：先 `runtime.close()`，再 `platform.close()`（先技能后驱动），
+原生 SDK 连接的断开仍由应用负责。
 
 提交示例，假设 `runtime` 已启动：
 

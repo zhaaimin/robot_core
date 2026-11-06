@@ -13,9 +13,11 @@
 | `docs/plans/*.md` | 每次改造的决策记录与验收结果（含被否决的方案） |
 
 > 阅读前提：本文描述的是**当前工作树**（截至 2026-11-05，线程隔离改造、`ThreadBinding`
-> 共享/分组配置，以及随后的按职责分目录与"装配归托管层、生命周期分阶段关闭"重构，
+> 共享/分组配置、按职责分目录与"装配归托管层、生命周期分阶段关闭"重构，以及随后的
+> **厂商接入包**改造（`ports.RobotPlatform` + `adapters/cc_api/` 拆包 + `RobotRuntime.from_platform`，
+> 通用 `ports.py` 已删除 `CallbackRobotApi` 且不留兼容别名），
 > 都已落地但未提交）。本文的行号一律使用新路径（`kernel/` `hosting/` `repositories/`
-> `transport/`），根目录旧模块已删除且不留兼容入口。
+> `transport/` `adapters/cc_api/`），根目录旧模块与旧的单文件适配器都已删除且不留兼容入口。
 > 若某处与 `git HEAD` 不一致，以工作树为准。
 
 ---
@@ -28,7 +30,7 @@
 四条设计目标决定了整个架构的形状：
 
 1. **内核零领域知识**。运行时不认识"急停""电量""导航"，只做集合求交
-   （[ports.py:101-124](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/ports.py#L101-L124)）。
+   （[ports.py:103-126](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/ports.py#L103-L126)）。
    领域模型全在适配器里。这条决定了内核可以长期不换。
 2. **硬件/依赖可替换**。内核不 import 任何厂商 SDK、ROS 2 或云 SDK；外部能力一律实现
    `ports.py` 的 Protocol，靠结构匹配注入，不注册、不继承。
@@ -176,8 +178,8 @@ flowchart TB
 | 文件 | LOC | 一句话职责 |
 | --- | --- | --- |
 | `models.py` | 116 | 7 个 pydantic 模型 + `TaskState` 枚举 + `SkillContext` dataclass |
-| `errors.py` | 118 | 每个失败模式一个异常子类 + 一个 `code` 字符串 |
-| `ports.py` | 167 | 包含 AdmissionValidator 的 Protocol：`Skill` / `TaskRepository` / `PagedEventRepository` / `Reconciler` / `RobotStateProvider` / `CallbackRobotApi` |
+| `errors.py` | 122 | 每个失败模式一个异常子类 + 一个 `code` 字符串 |
+| `ports.py` | 153 | **只放运行时自己消费的 Protocol**：`AdmissionValidator` / `Skill` / `TaskRepository` / `PagedEventRepository` / `Reconciler` / `RobotStateProvider` / `RobotPlatform`。厂商协议一律不进这里 |
 | `kernel/core.py` | 414 | 生命周期、公开 API、提交准入、状态源打断 |
 | `kernel/task_state.py` | 236 | **状态唯一写入点** + 本机任务归属（6 个按 task id 的字典） |
 | `kernel/executor.py` | 350 | 单任务步骤编排：锁资源 → 检查前置条件 → 带期限执行 → 恰好一次终态 |
@@ -190,16 +192,17 @@ flowchart TB
 | `transport/wire.py` | 57 | NDJSON 成帧，1 MiB 上限 |
 | `transport/server.py` | 305 | UDS 守护进程：请求分发 + 订阅流 |
 | `hosting/kernel_host.py` | 466 | 代理/内核装配、线程托管、请求/事件交接、分阶段关闭 |
-| `hosting/thread_runtime.py` | 277 | `LoopThread` / `LoopJob`：固定 daemon 循环、容量、真实完成 |
+| `hosting/thread_runtime.py` | 287 | `LoopThread` / `LoopJob`：固定 daemon 循环、容量、真实完成 |
 | `thread_binding.py` | 55 | `ThreadBinding`：调用方声明外部对象的 loop 归属（shared / group / dedicated） |
 | `hosting/isolation.py` | 622 | 6 类端口的代理：线程归属、期限、取消/进度桥接、故障关闭 |
 | `hosting/boundary.py` | 151 | 有界快照：计量后构建，拒绝外部对象钩子 |
-| `options.py` | 43 | `RuntimeOptions` 10 个限额 |
+| `options.py` | 48 | `RuntimeOptions` 13 个限额 |
 | `hosting/execution_context.py` | 4 | 控制操作 `ContextVar` |
-| `sdk/embedded.py` / `remote.py` | 95 / 257 | 两种同签名门面 |
-| `sdk/listeners.py` / `callback_executor.py` | 283 / 212 | 统一注册监听 + 同步回调的有界线程池 |
+| `sdk/embedded.py` / `remote.py` | 120 / 264 | 两种同签名门面；`embedded` 另有 `from_platform` 平台装配入口 |
+| `sdk/listeners.py` / `callback_executor.py` | 318 / 212 | 统一注册监听 + 同步回调的有界线程池 |
 | `sdk/__init__.py` | 25 | 公开门面：`RobotRuntime` / `RemoteRuntime` / `RuntimeOptions` / `TaskListener` / `ThreadBinding` |
-| `adapters/simulator.py` / `cc_api.py` | 373 / 420 | 无硬件自测实现 + CC API 语音适配器 |
+| `adapters/simulator.py` | 373 | 无硬件自测实现：技能、两个状态源、对账器 |
+| `adapters/cc_api/` | 840 | CC 厂商接入包：`contracts.py`(40) SDK 协议 + `driver.py`(291) 请求与回调分发 + `platform.py`(113) 装配与生命周期 + `speech.py`(384) 语音语义 |
 
 ### 2.5 打包与依赖
 
@@ -209,8 +212,11 @@ flowchart TB
 **运行时依赖只有三个**：`pydantic>=2`、`jsonschema>=4`（`kernel/policy.py` 用）、`aiosqlite>=0.20`
 （`repositories/sqlite.py` 用）。测试依赖 `pytest>=8` + `pytest-asyncio>=0.24`（`asyncio_mode=auto`）。
 
-厂商包 `ubt_robot` **不在依赖里**——`adapters/cc_api.py` 只依赖 `ports.py` 的
-`CallbackRobotApi` 结构契约，所以宿主上常规导入不需要它（[ports.py:141-167](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/ports.py#L141-L167)）。
+厂商包 `ubt_robot` **不在依赖里**——CC 专属的 SDK 协议 `CcApiClient` / `CcApiResponse` 定义在
+厂商包自己的 [adapters/cc_api/contracts.py:5-40](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/contracts.py#L5-L40)，
+通用 `ports.py` 里没有任何厂商协议，所以宿主上常规导入不需要 `ubt_robot`。
+`adapters/cc_api/__init__.py` 只导出类和工厂，导入时不创建对象、不加载原生 SDK
+（[adapters/cc_api/\_\_init\_\_.py:1-12](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/__init__.py#L1-L12)）。
 AGENTS.md 的"不加依赖"是硬约束：宿主 pip 装不上东西，加一个依赖就等于让所有人只能进容器干活。
 
 ---
@@ -286,9 +292,9 @@ stateDiagram-v2
 | `PagedEventRepository` | `+ list_events_page(task_id, after, limit)` | `EventBus.history` | 可选；没有则代理在工作线程裁页兼容 |
 | `Reconciler` | `async reconcile(task) -> TaskState \| None` | `kernel/recovery.py`（仅 `start()`） | 异常/不确定 → `RECONCILIATION_REQUIRED` |
 | `RobotStateProvider` | `async unsatisfied()` / `watch()` | `PolicyEnforcer`、`WorkflowExecutor`、`core._watch_robot_state` | 读失败 → 提交 `INTERNAL_ERROR`（失败关闭） |
-| `CallbackRobotApi` | `request/notify/add_service/remove_service/set_disconnect_callback` | `adapters/cc_api.py` | 厂商回调可能在 SDK 自有线程 |
+| `RobotPlatform` | `skills` / `robot_state` / `reconciler`（均可带 `ThreadBinding`）/ `async start()` / `async close()` | 只有 `RobotRuntime.from_platform` 读它；绑定**原样**交给宿主，内核拿到的仍是拆开的既有端口 | 没有状态源或对账器时**明确返回 None**，不虚构能力；`start`/`close` 共享真实结果，等待者取消不重复清理。SDK 连接生命周期归应用 |
 
-定义见 [ports.py:27-167](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/ports.py#L27-L167)。
+定义见 [ports.py:15-153](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/ports.py#L15-L153)。
 每个 Protocol 的 docstring 都写了宿主语义（在线程隔离下谁拥有它、什么算不确定），
 这些 docstring 是本项目最主要的"契约文档"，比 README 更精确。
 
@@ -708,41 +714,95 @@ sequenceDiagram
 - `__main__.py` 的 `serve` 是 `Simulator().skills` + `SQLiteTaskRepository` + `RuntimeServer`
   （[__main__.py:30-36](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/__main__.py#L30-L36)）。
 
-### `cc_api.py`（真实硬件，第一个厂商适配）
+### `adapters/cc_api/`（真实硬件，第一个厂商接入包）
+
+一个厂商一个目录，四个文件各司其职：`contracts.py` 放厂商 SDK 协议、`driver.py` 放请求与
+回调分发、`speech.py` 放动作语义、`platform.py` 放装配与生命周期。内核与 SDK 不认得这个包，
+只认它交出来的既有端口。
 
 - `CcApiSpeechSkill` 实现 `audio.speak`：`resources={"speaker"}`、`permissions={"audio"}`、
-  `preconditions=set()`、`timeout_s=30`、`supports_cancel=True`（[cc_api.py:60-74](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api.py#L60-L74)）。
+  `preconditions=set()`、`timeout_s=30`、`supports_cancel=True`（[speech.py:62-76](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/speech.py#L62-L76)）。
   **注意它故意不声明任何电量前置条件**——AGENTS.md 不变量 5。
 - 端到端机制（值得单独读一遍，它是"回调式厂商 SDK 怎么变成 async 技能"的模板）：
-  `start()` 注册 `add_service("cc.api.work.finished")` + `notify("cc.api.work.subscribe")`
-  并记下**当时的应用循环**为 `_loop`（[cc_api.py:86-104](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api.py#L86-L104)）；
+  技能 `start()` 只订阅驱动的 `subscribe_finished` / `subscribe_failure`，再 `await driver.start()`
+  （[speech.py:90-107](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/speech.py#L90-L107)）；
+  驱动 `start()` 才独占注册 SDK 回调（`add_service("cc.api.work.finished")` +
+  `set_disconnect_callback` + `notify("cc.api.work.subscribe")`）并固定 owner 循环
+  （[driver.py:98-122](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/driver.py#L98-L122)）。
+  订阅返回的是 detach 闭包，容量按 `max_subscriptions` 计
+  （[driver.py:83-96](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/driver.py#L83-L96)）——这就是"多技能共用一个驱动不覆盖全局回调"的实现方式。
   每次播报发 `cc.api.work.start`（`skillCode="A000001"`，`speed/volume=50`，独立 `traceId`），
   启动回调回填 `workId`，缺失即置 `_broken` 并抛 `RobotResponseError`
-  （[:305-318](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api.py#L305-L318)）；
-  `finished` 回调在厂商线程触发，先 marshal 回 `_loop`，按 `workId` 匹配才结算，
-  **finished 早于启动回调到达**时缓存进 `early_finished`（上限 128）等 `_launch` 回放
-  （[:396-411](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api.py#L396-L411)）；
-  取消/超时/关闭走 `_stop_work`：发 `cc.api.work.ctrl {workCtrl:"stop"}` 后
-  **继续等 `finished`**，自身带 5 秒 `stop_timeout_s`，超时/异常置 `_broken` 并抛
-  `RobotStopError`（[:320-342](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api.py#L320-L342)）；
-  断连时 `_abort` 给所有在途 future 注入 `RobotConnectionError`，此后实例拒绝再用
-  （[:413-420](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api.py#L413-L420)）。
-- **它不感知隔离层**：只比较"当前循环是不是 `_loop`"，不同就走 `_execute_on_owner`——
-  用 `concurrent.futures.Future` 交接、`deepcopy(params)` 跨循环、`call_soon_threadsafe`
-  在 owner 循环建 task、`asyncio.wrap_future` 包回工作线程，并转发取消信号
-  （[cc_api.py:140-227](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api.py#L140-L227)）。
-  也就是说适配器**自己实现了第二套线程桥**，与 `hosting/isolation.py` 无关——这是回调型 SDK 的必要条件
-  （厂商回调只能回到它自己的循环），但也意味着新增回调型适配器要重复这段代码，
-  值得以后抽公共基类。
+  （[speech.py:308-321](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/speech.py#L308-L321)）；
+  `finished` 在厂商线程触发，`_on_finished` 只 marshal 不回话
+  （[driver.py:246-256](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/driver.py#L246-L256)），
+  回到 owner 循环后按 `workId` 匹配才结算；**finished 早于启动回调到达**时缓存进 `early_finished`
+  （上限 `_MAX_EARLY_EVENTS = 128`），超限直接 `driver.invalidate` 失败关闭
+  （[speech.py:368-378](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/speech.py#L368-L378)）；
+  取消/超时/关闭走 `_stop_work`：先 shield 启动任务，启动被厂商拒绝（`RobotRequestError`）就直接返回——
+  **没有物理动作就无需停止**；否则发 `cc.api.work.ctrl {workCtrl:"stop"}` 后**继续等 `finished`**，
+  整段套 5 秒 `stop_timeout_s`，超时/异常置 `_broken` 并抛 `RobotStopError`
+  （[speech.py:328-345](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/speech.py#L328-L345)）；
+  断连时驱动 `_on_disconnect` 通知所有失败订阅者，技能 `_abort` 给每个在途 future 注入
+  `RobotConnectionError`，此后实例拒绝再用
+  （[driver.py:257-259](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/driver.py#L257-L259)、
+  [speech.py:380-384](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/speech.py#L380-L384)）。
+- 驱动把**厂商线程 → owner 循环**这条桥抽出来了（`_post` / `_deliver`，
+  [driver.py:224-245](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/driver.py#L224-L245)），
+  请求侧的容量与快照也在这里：`control` 标志分别用 `max_control_calls` 和 `max_pending_calls`
+  限额、入参与响应都过 `bounded_snapshot`、字段类型不符即 `RobotResponseError`
+  （[driver.py:124-155](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/driver.py#L124-L155)）。
+  但**工作线程 → owner 循环**的技能级 handoff（`_execute_on_owner`）还留在语音技能里
+  （[speech.py:151-247](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/speech.py#L151-L247)）：
+  适配器只比较"当前循环是不是 `_loop`"，不同就用 `concurrent.futures.Future` 交接、`deepcopy(params)`
+  跨循环、`call_soon_threadsafe` 在 owner 循环建 task、`asyncio.wrap_future` 包回工作线程并转发取消。
+  也就是说与 `hosting/isolation.py` 无关的**第二套线程桥仍然存在**，只是缩短了一半；
+  等出现第二个回调型动作技能再合并，比现在凭一个样本抽基类靠谱。
 - 内核只等 `cancel_grace_s`（默认 0.2 秒），适配器自己的清理期限是 5 秒，
   所以**内核通常先判待对账**，此时 `speaker` 资源保持隔离；应用必须先确认旧播报已停，
-  再建新连接和新实例（[README.md:455-464](file:///Users/zhazha/Documents/robot_core/README.md#L455-L464)）。
-- 不调用 `cc_api/` 里带阻塞等待的 `RobotClient`；SDK 连接生命周期归应用，适配器独占
-  `finished` 与 `disconnect` 回调，不允许别人在同一个 `Api` 实例上覆盖处理器。
+  再建新连接和新实例（[README.md:559-567](file:///Users/zhazha/Documents/robot_core/README.md#L559-L567)）。
+- 不调用厂商 SDK 自己 `cc_api` 命名空间里带阻塞等待的 `RobotClient`；SDK 物理连接生命周期归应用，
+  驱动独占 `finished` 与 `disconnect` 回调，不允许别人在同一个 `Api` 实例上覆盖处理器。
+- `CcApiPlatform` 只做装配，不引入新概念：`skills` 用 `MappingProxyType` 交出只读映射，
+  没有真实状态源和对账器时 `robot_state` / `reconciler` **明确返回 None**
+  （[platform.py:44-57](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/platform.py#L44-L57)）；
+  生命周期钉在 `start()` 所在循环，换循环调用直接 `InvalidRequest`（[:58-63](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/platform.py#L58-L63)）；
+  启动只调技能 `start()`，由技能先领订阅令牌、再 `await driver.start()` 注册 SDK 回调，
+  这样第一个 finished 事件不会落在没人监听的时候；启动失败会连驱动一起关
+  （[speech.py:97-107](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/speech.py#L97-L107)、
+  [platform.py:73-81](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/platform.py#L73-L81)）；
+  关闭按 speech → driver，技能停止失败**仍然**释放驱动订阅
+  （[platform.py:90-106](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/platform.py#L90-L106)）；
+  `asyncio.shield` 包住 start/close 任务，所以等待者被取消不会重做清理（[:65-71](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/platform.py#L65-L71)、
+  [:83-89](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/platform.py#L83-L89)）。
+  工厂 `create_cc_api_platform(api, *, stop_timeout_s=5.0, options=None, skill_thread_group=None)`
+  的返回类型是 `RobotPlatform` 契约（[:108-113](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/platform.py#L108-L113)）；`skill_thread_group` 非空时
+  `skills` 交出 `ThreadBinding.group(技能, 组名)`（[:27-40](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/adapters/cc_api/platform.py#L27-L40)），只改变宿主调用技能时的线程归属，
+  `start`/`close` 仍在应用循环上直接操作原始技能对象。
+- SDK 侧唯一的消费入口是 `RobotRuntime.from_platform(repository, platform, *, allowed_permissions=None, options=None)`
+  （[sdk/embedded.py:49-63](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/embedded.py#L49-L63)）：
+  它把 `platform.skills` / `robot_state` / `reconciler` 拆开喂给原构造函数，**不新增状态、不启动平台**。
+  平台生命周期仍由应用管——示例里的顺序是 `platform.start()` → `runtime.start()` → 提交任务 →
+  `runtime.close()` → `platform.close()`（[examples/cc_api_speech_demo.py:60-72](file:///Users/zhazha/Documents/robot_core/examples/cc_api_speech_demo.py#L60-L72)）。
+
+### 新增厂商包的做法
+
+目标是**只新增文件**：`adapters/<vendor>/` 里放 `contracts.py`（厂商 SDK 协议，若需要）、
+`driver.py`（可选，多个技能共享连接时才需要）、动作技能文件、`platform.py` 与工厂；
+再加一个 `tests/test_<vendor>*.py`，把文件名加进 `.verify/sweep.py` 的 `FILES`。
+`ports.py`、`kernel/`、`hosting/`、`sdk/` 与其他厂商包都不动——`RobotPlatform` 只聚合既有端口，
+端口值可以带 `ThreadBinding`（`skills` / `robot_state` / `reconciler` 的标注都接受），绑定原样交给宿主，
+也能像 CC 包那样用一个 `skill_thread_group` 参数替应用生成组绑定；不规定厂商必须有 request、callback
+或 `workId`（[ports.py:129-153](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/ports.py#L129-L153)）。
+这条不是口头约定：`test_contracts.py` 里有一个**非回调式的假厂商**平台走同一个
+`from_platform` 装配并通过同一份 `check_robot_platform_contract`
+（[:26-59](file:///Users/zhazha/Documents/robot_core/tests/test_contracts.py#L26-L59)、
+[:61](file:///Users/zhazha/Documents/robot_core/tests/test_contracts.py#L61)），它证明通用接口不需要任何 CC SDK 协议；
+`[:115](file:///Users/zhazha/Documents/robot_core/tests/test_contracts.py#L115)` 再覆盖 group / shared / dedicated / 裸对象四种绑定都原样穿过 `from_platform`。
 
 ### 新增适配器的检查清单
 
-1. 实现 `ports.py` 的 Protocol，**不继承、不注册**，结构匹配即可。
+1. 实现 `ports.py` 的 Protocol，**不继承、不注册**，结构匹配即可；厂商私有协议留在自己的包里，不进 `ports.py`。
 2. 显式声明完整 `SkillDefinition`（7 个字段），技能内部不做自己的校验/超时/取消。
 3. 不配合取消就老实写 `supports_cancel=False`；确认不了停止时抛 `RobotStopError` 而不是
    假装 `TaskCancelled`。
@@ -751,7 +811,10 @@ sequenceDiagram
 6. 想清楚它该和谁共用 loop（[thread_binding.py](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/thread_binding.py)）：
    会给不出停止信号、或者需要按时交付变化（状态源）的实现保持默认独占；只有**确认不会同步阻塞**
    的轻量实现才合并成组。
-7. 在 `test_contracts.py` 加契约测试。
+7. 用 `test_contracts.py` 的可复用检查跑一遍：技能行为照 `SkillAdapterContract`
+   （[:272-306](file:///Users/zhazha/Documents/robot_core/tests/test_contracts.py#L272-L306)，现由
+   `TestSimulatorSkillContract` 用 `Simulator().skills` 兑现），整体装配照 `check_robot_platform_contract`，
+   回调型 SDK 照 `check_cc_api_speech_contract`（[:358](file:///Users/zhazha/Documents/robot_core/tests/test_contracts.py#L358)）。
 
 ---
 
@@ -759,26 +822,32 @@ sequenceDiagram
 
 | 手段 | 命令 | 覆盖 |
 | --- | --- | --- |
-| **容器完整套件**（主力） | `docker start robot_core_ubuntu24` 然后 `python3 -m pytest -q` | 全部，含 SQLite 与 fixture 用例。2026-11-05 基线：**414 passed**（约 11 秒） |
-| 宿主离线回归 | `PYTHONPATH=.verify:src python3.13 .verify/sweep.py` | 免 fixture 用例；2026-11-05 基线 **302 passed / 3 failed / 42 skipped**，3 个 fail 全是 `aiosqlite` 被 stub（`test_sqlite_repository` 两个 + `test_contracts.py::test_sqlite_paged_event_repository_contract`） |
+| **容器完整套件**（主力） | `docker start robot_core_ubuntu24` 然后 `python3 -m pytest -q` | 全部，含 SQLite 与 fixture 用例。2026-11-06 基线：**467 passed**（约 10 秒） |
+| 宿主离线回归 | `PYTHONPATH=.verify:src python3.13 .verify/sweep.py` | 免 fixture 用例；2026-11-05 基线 **348 passed / 3 failed / 42 skipped**，3 个 fail 全是 `aiosqlite` 被 stub（`test_sqlite_repository` 两个 + `test_contracts.py::test_sqlite_paged_event_repository_contract`） |
 | 语法体检 | `python3.13 -m compileall -q src/robot_agent_runtime` | — |
 
 `.verify/` 只是宿主环境（pip 装不上、`/tmp` 不可写、`python3` 是 3.9.6）的变通，
 **不属于发布包，`src/` 不许 import 它**。
 
-测试按关注点分文件，不往 `test_core.py` 堆（AGENTS.md 测试约定）：
-契约 `test_models`、执行 `test_core`、故障 `test_faults`、重启 `test_recovery`、
-前置条件 `test_preconditions`、持久化 `test_sqlite_repository`、
-接入形态 `test_embedded_sdk` / `test_remote_sdk`、适配器复用 `test_contracts`、
-CC 语音 `test_cc_api`(528)、监听 `test_task_listeners`(967)、回调线程 `test_callback_executor`(263)、
+测试按关注点分文件，不往 `test_core.py` 堆（AGENTS.md 测试约定）。24 个文件的分工与行数：
+契约 `test_models`(242)、执行 `test_core`(455)、故障 `test_faults`(854)、重启 `test_recovery`(511)、
+前置条件 `test_preconditions`(472)、持久化 `test_sqlite_repository`(635)、
+接入形态 `test_embedded_sdk`(321) / `test_remote_sdk`(851)、
+端口与厂商复用 `test_contracts`(467)、CC 语音 `test_cc_api`(528)、
+厂商平台装配 `test_cc_platform`(580)、监听 `test_task_listeners`(967) /
+监听执行 `test_listener_execution`(627)、回调线程 `test_callback_executor`(263)、
 分页 `test_event_paging`(58)、线程隔离 `test_thread_runtime`(641) / `test_isolation`(1163) /
 `test_kernel_host`(699) / `test_execution_boundaries`(386) / `test_runtime_isolation`(193)、
 线程绑定 `test_thread_bindings`(469) / `test_thread_binding_boundaries`(301)、
-职责边界 `test_runtime_ownership`(313) / 目录布局 `test_package_layout`(84)。
-合计 10530 行，比源码（6018 行）还多——这个比例是刻意的：**隔离语义只能靠故障注入来钉住**。
+职责边界 `test_runtime_ownership`(313) / 目录布局 `test_package_layout`(96)。
+合计 12092 行，比源码（6727 行）还多——这个比例是刻意的：**隔离语义只能靠故障注入来钉住**。
 
 新测试尽量免 fixture（`tmp_path` / `monkeypatch` / `parametrize` 在宿主只能 skip），
 新增测试文件要加进 `.verify/sweep.py` 的 `FILES`。
+还有一条收集规则要记住：sweep 只跑**模块级、无参数、名字以 `test_` 开头**的函数
+（[.verify/sweep.py:69-73](file:///Users/zhazha/Documents/robot_core/.verify/sweep.py#L69-L73)），
+所以 `test_contracts.py` 里 unittest 风格的 `class TestSimulatorSkillContract` 在宿主**根本不跑**，
+只有容器里 pytest 会收集它——想让新厂商的契约检查在宿主也有效，就写成模块级函数。
 
 ---
 

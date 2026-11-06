@@ -36,6 +36,18 @@ def test_only_canonical_import_paths_are_available() -> None:
         assert caught.value.name == f"robot_agent_runtime.{old}"
 
 
+def test_cc_sdk_contracts_are_owned_by_the_vendor_package() -> None:
+    ports = importlib.import_module("robot_agent_runtime.ports")
+    assert not hasattr(ports, "CallbackRobotApi")
+    assert not hasattr(ports, "CallbackApiResponse")
+    contracts = importlib.import_module("robot_agent_runtime.adapters.cc_api.contracts")
+    package = importlib.import_module("robot_agent_runtime.adapters.cc_api")
+    for name in ("CcApiClient", "CcApiResponse"):
+        contract = getattr(contracts, name)
+        assert contract.__module__ == "robot_agent_runtime.adapters.cc_api.contracts"
+        assert getattr(package, name) is contract
+
+
 def test_canonical_patch_points_reach_hosted_and_transport_consumers() -> None:
     embedded = importlib.import_module("robot_agent_runtime.sdk.embedded")
     remote = importlib.import_module("robot_agent_runtime.sdk.remote")

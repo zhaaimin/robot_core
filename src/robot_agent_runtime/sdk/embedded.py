@@ -1,5 +1,6 @@
 from collections.abc import AsyncGenerator, Mapping
 from contextlib import aclosing
+from typing import Self
 
 from robot_agent_runtime.kernel.core import RuntimeCore
 from robot_agent_runtime.errors import InvalidRequest
@@ -8,6 +9,7 @@ from robot_agent_runtime.models import Event, SkillDefinition, Task, TaskRequest
 from robot_agent_runtime.options import RuntimeOptions
 from robot_agent_runtime.ports import (
     Reconciler,
+    RobotPlatform,
     RobotStateProvider,
     Skill,
     TaskRepository,
@@ -43,6 +45,22 @@ class RobotRuntime:
             options=self._options,
         )
         self._closing = False
+
+    @classmethod
+    def from_platform(
+        cls,
+        repository: TaskRepository | ThreadBinding[TaskRepository],
+        platform: RobotPlatform,
+        *,
+        allowed_permissions: set[str] | None = None,
+        options: RuntimeOptions | None = None,
+    ) -> Self:
+        """Preserve platform port bindings; the application owns its lifecycle."""
+        return cls(
+            repository, platform.skills, reconciler=platform.reconciler,
+            allowed_permissions=allowed_permissions, robot_state=platform.robot_state,
+            options=options,
+        )
 
     @property
     def _core(self) -> RuntimeCore:

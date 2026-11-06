@@ -1,10 +1,11 @@
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import json
 import os
 import signal
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -12,11 +13,172 @@ import jsonschema
 import pytest
 
 from robot_agent_runtime.adapters.simulator import Simulator
+from robot_agent_runtime.adapters.cc_api.contracts import CcApiClient, CcApiResponse
 from robot_agent_runtime.models import SkillCall, SkillContext, TaskRequest, TaskState
 from robot_agent_runtime.sdk import RemoteRuntime
+from robot_agent_runtime.options import RuntimeOptions
+from robot_agent_runtime.thread_binding import ThreadBinding, unwrap_thread_binding
 from robot_agent_runtime.ports import (
-    AdmissionValidator, CallbackApiResponse, CallbackRobotApi, PagedEventRepository, Skill,
+    AdmissionValidator, PagedEventRepository, RobotPlatform, Skill,
 )
+
+
+async def check_robot_platform_contract(
+    platform: RobotPlatform, successful_params: dict[str, dict[str, Any]],
+    *, options: RuntimeOptions | None = None,
+) -> None:
+    from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
+    from robot_agent_runtime.sdk import RobotRuntime
+
+    skills = platform.skills
+    assert set(successful_params) <= set(skills)
+    await platform.start()
+    runtime = RobotRuntime.from_platform(InMemoryTaskRepository(), platform, options=options)
+    try:
+        await platform.start()
+        assert all(platform.skills[name] is skill for name, skill in skills.items())
+        await runtime.start()
+        for name, params in successful_params.items():
+            skill = unwrap_thread_binding(skills[name])
+            assert skill.definition.name == name
+            jsonschema.validate(params, skill.definition.input_schema)
+            task = await runtime.submit_task(TaskRequest(
+                task_type="platform-contract", steps=[SkillCall(skill=name, params=params)],
+            ))
+            async with asyncio.timeout(1):
+                async for _ in runtime.subscribe_task_events(task.id):
+                    pass
+            final = await runtime.get_task_status(task.id)
+            assert final.state == TaskState.SUCCEEDED, final.error
+    finally:
+        try:
+            await runtime.close()
+        finally:
+            await platform.close()
+            await platform.close()
+
+
+async def test_non_callback_vendor_platform_uses_the_same_runtime_contract() -> None:
+    from types import MappingProxyType
+    from robot_agent_runtime.models import SkillDefinition, SkillResult
+    from robot_agent_runtime.ports import Reconciler, RobotStateProvider
+
+    class Client:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def say(self, text: str) -> dict[str, str]:
+            self.messages.append(text)
+            return {"said": text}
+
+    class Speech:
+        definition = SkillDefinition(
+            name="audio.speak", version="1", input_schema={"type": "object"},
+            resources={"speaker"}, permissions=set(), preconditions=set(),
+            timeout_s=1, supports_cancel=False,
+        )
+
+        def __init__(self, client: Client) -> None:
+            self._client = client
+
+        async def execute(self, context: SkillContext, params: dict[str, Any]) -> SkillResult:
+            return SkillResult(success=True, output=await self._client.say(params["message"]))
+
+    class Platform:
+        def __init__(self) -> None:
+            self.client = Client()
+            self._skills: Mapping[str, Skill] = MappingProxyType({"audio.speak": Speech(self.client)})
+
+        @property
+        def skills(self) -> Mapping[str, Skill]:
+            return self._skills
+
+        @property
+        def robot_state(self) -> RobotStateProvider | None:
+            return None
+
+        @property
+        def reconciler(self) -> Reconciler | None:
+            return None
+
+        async def start(self) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+    platform = Platform()
+    await check_robot_platform_contract(platform, {"audio.speak": {"message": "different SDK"}})
+    assert platform.client.messages == ["different SDK"]
+
+
+async def test_platform_contract_preserves_shared_group_dedicated_and_plain_skills() -> None:
+    from types import MappingProxyType
+    from robot_agent_runtime.models import SkillDefinition, SkillResult
+    from robot_agent_runtime.ports import Reconciler, RobotStateProvider
+
+    owners: dict[str, int] = {}
+
+    class Probe:
+        def __init__(self, name: str) -> None:
+            self.definition = SkillDefinition(
+                name=name, version="1", input_schema={"type": "object"}, resources=set(),
+                permissions=set(), preconditions=set(), timeout_s=1, supports_cancel=False,
+            )
+
+        async def execute(self, context: SkillContext, params: dict[str, Any]) -> SkillResult:
+            owners[self.definition.name] = threading.get_ident()
+            return SkillResult(success=True)
+
+    class Platform:
+        def __init__(self) -> None:
+            self._skills: Mapping[str, Skill | ThreadBinding[Skill]] = MappingProxyType({
+                "group-a": ThreadBinding.group(Probe("group-a"), "audio"),
+                "group-b": ThreadBinding.group(Probe("group-b"), "audio"),
+                "shared-a": ThreadBinding.shared(Probe("shared-a")),
+                "shared-b": ThreadBinding.shared(Probe("shared-b")),
+                "dedicated": ThreadBinding.dedicated(Probe("dedicated")),
+                "plain": Probe("plain"),
+            })
+
+        @property
+        def skills(self) -> Mapping[str, Skill | ThreadBinding[Skill]]:
+            return self._skills
+
+        @property
+        def robot_state(self) -> RobotStateProvider | None:
+            return None
+
+        @property
+        def reconciler(self) -> Reconciler | None:
+            return None
+
+        async def start(self) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+    platform: RobotPlatform = Platform()
+    await check_robot_platform_contract(
+        platform, {name: {} for name in platform.skills},
+        options=RuntimeOptions(max_extension_threads=6),
+    )
+    assert owners["group-a"] == owners["group-b"]
+    assert owners["shared-a"] == owners["shared-b"]
+    assert len({owners[name] for name in ("group-a", "shared-a", "dedicated", "plain")}) == 4
+    assert threading.get_ident() not in owners.values()
+
+
+async def test_cc_grouped_platform_uses_the_same_contract() -> None:
+    from robot_agent_runtime.adapters.cc_api import create_cc_api_platform
+
+    api = ContractCallbackApi()
+    await check_robot_platform_contract(
+        create_cc_api_platform(api, skill_thread_group="audio"),
+        {"audio.speak": {"message": "grouped CC"}},
+    )
+    assert not api.services
 
 
 async def check_admission_validator_contract(validator: AdmissionValidator) -> None:
@@ -174,7 +336,7 @@ class ContractCallbackApi:
 
     def request(
         self, method: str, params: dict[str, Any],
-        callback: Callable[[CallbackApiResponse], None],
+        callback: Callable[[CcApiResponse], None],
     ) -> None:
         loop = asyncio.get_running_loop()
         loop.call_soon(callback, ContractApiResponse(result={"workId": "contract"}))
@@ -193,7 +355,7 @@ class ContractCallbackApi:
         self.disconnect = callback
 
 
-async def check_callback_api_speech_contract(api: CallbackRobotApi) -> None:
+async def check_cc_api_speech_contract(api: CcApiClient) -> None:
     from robot_agent_runtime.adapters.cc_api import CcApiSpeechSkill
 
     adapter = CcApiSpeechSkill(api)
@@ -217,7 +379,18 @@ async def check_callback_api_speech_contract(api: CallbackRobotApi) -> None:
 
 async def test_cc_api_callback_port_and_speech_skill_contract() -> None:
     api = ContractCallbackApi()
-    await check_callback_api_speech_contract(api)
+    await check_cc_api_speech_contract(api)
+    assert not api.services
+    assert api.notifications == ["cc.api.work.subscribe", "cc.api.work.unsubscribe"]
+
+
+async def test_cc_vendor_platform_contract() -> None:
+    from robot_agent_runtime.adapters.cc_api import create_cc_api_platform
+
+    api = ContractCallbackApi()
+    await check_robot_platform_contract(create_cc_api_platform(api), {
+        "audio.speak": {"message": "CC platform contract"},
+    })
     assert not api.services
     assert api.notifications == ["cc.api.work.subscribe", "cc.api.work.unsubscribe"]
 

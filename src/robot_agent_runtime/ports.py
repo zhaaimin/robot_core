@@ -1,4 +1,4 @@
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Mapping
 from typing import Any, Protocol
 
 from robot_agent_runtime.models import (
@@ -10,6 +10,7 @@ from robot_agent_runtime.models import (
     Task,
     TaskState,
 )
+from robot_agent_runtime.thread_binding import ThreadBinding
 
 
 class AdmissionValidator(Protocol):
@@ -125,43 +126,28 @@ class RobotStateProvider(Protocol):
     def watch(self) -> AsyncIterator[frozenset[str]]: ...
 
 
-class CallbackApiResponse(Protocol):
-    @property
-    def is_success(self) -> bool: ...
+class RobotPlatform(Protocol):
+    """A vendor-owned assembly injected through existing runtime ports.
 
-    @property
-    def result(self) -> Any: ...
-
-    @property
-    def error_code(self) -> int: ...
-
-    @property
-    def error_message(self) -> str: ...
-
-
-class CallbackRobotApi(Protocol):
-    """An already connected, application-owned callback transport.
-
-    Methods enqueue work without waiting for network responses. Callbacks may
-    run on SDK-owned threads; adapters marshal them onto their asyncio loop.
-    The application owns connection startup and shutdown, and gives the speech
-    adapter exclusive ownership of its finished and disconnect handlers.
-    No vendor package is required to import this contract.
+    Platforms determine how to connect to their vendor and expose stable skill
+    objects. An unimplemented state source or reconciler is explicitly None.
+    Applications start the platform before the runtime and close it afterwards;
+    the runtime never imports vendor drivers or manages their SDK lifecycle.
+    start/close share their actual outcome when callers retry or cancel waiting.
+    Hosted ports may include explicit thread bindings. The SDK passes those
+    bindings unchanged to the host; bare objects retain dedicated ownership.
+    Bindings configure the host, never the kernel's skill/state contracts.
     """
 
-    def request(
-        self,
-        method: str,
-        params: dict[str, Any],
-        callback: Callable[[CallbackApiResponse], None],
-    ) -> None: ...
+    @property
+    def skills(self) -> Mapping[str, Skill | ThreadBinding[Skill]]: ...
 
-    def notify(self, method: str) -> None: ...
+    @property
+    def robot_state(self) -> RobotStateProvider | ThreadBinding[RobotStateProvider] | None: ...
 
-    def add_service(
-        self, name: str, callback: Callable[[Any, Any], None]
-    ) -> None: ...
+    @property
+    def reconciler(self) -> Reconciler | ThreadBinding[Reconciler] | None: ...
 
-    def remove_service(self, name: str) -> None: ...
+    async def start(self) -> None: ...
 
-    def set_disconnect_callback(self, callback: Callable[[], None]) -> None: ...
+    async def close(self) -> None: ...
