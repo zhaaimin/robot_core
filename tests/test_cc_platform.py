@@ -578,3 +578,41 @@ async def test_cc_speech_demo_keeps_explicit_audio_thread_group() -> None:
         with pytest.raises(InvalidRequest):
             await demo["speak"](Api(), "audio grouping")
     assert captured == ["audio"]
+
+
+async def test_cc_speech_demo_returns_final_result_with_either_listener_execution() -> None:
+    demo = runpy.run_path(str(Path(__file__).resolve().parents[1] / "examples/cc_api_speech_demo.py"))
+    for execution in ("caller", "dedicated"):
+        api = Api()
+        speaking = asyncio.create_task(demo["speak"](
+            api, "hello demo", listener1_execution=execution, listener2_execution=execution,
+        ))
+        try:
+            method, params, respond = await api.next_request()
+            assert method == "cc.api.work.start" and params["params"]["text"] == "hello demo"
+            respond(Response(result={"workId": "demo-work"}))
+            api.finish("demo-work")
+            final = await asyncio.wait_for(speaking, 1)
+            assert final.state == TaskState.SUCCEEDED
+            assert final.result is not None
+            assert final.result["steps"][0]["output"]["work_id"] == "demo-work"
+            assert not api.services and api.stops == 0
+        finally:
+            speaking.cancel()
+            await asyncio.gather(speaking, return_exceptions=True)
+
+
+async def test_cc_speech_demo_returns_vendor_failure_in_final_task() -> None:
+    demo = runpy.run_path(str(Path(__file__).resolve().parents[1] / "examples/cc_api_speech_demo.py"))
+    api = Api()
+    speaking = asyncio.create_task(demo["speak"](api, "rejected"))
+    try:
+        _, _, respond = await api.next_request()
+        respond(Response(False, error_code=17, error_message="not_in_work_mode"))
+        final = await asyncio.wait_for(speaking, 1)
+        assert final.state == TaskState.FAILED
+        assert final.error is not None and final.error.details["vendor_code"] == 17
+        assert not api.services and api.stops == 0
+    finally:
+        speaking.cancel()
+        await asyncio.gather(speaking, return_exceptions=True)

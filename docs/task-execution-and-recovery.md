@@ -50,13 +50,14 @@
 
 ### 3.1 启动与提交
 
-当前 [cc_api_speech_demo.py](../examples/cc_api_speech_demo.py) 按以下顺序工作：
+最小入口 [cc_api_speech_minimal_demo.py](../examples/cc_api_speech_minimal_demo.py)
+按以下顺序工作；回调与线程实验入口见 [示例索引](../examples/README.md)：
 
 1. 应用初始化并连接 `ubt_robot.Api`。
 2. `create_cc_api_platform(api)` 装配驱动与语音技能；`RobotRuntime.from_platform(repository, platform, allowed_permissions={"audio"})` 从平台取端口构造运行时，此时平台还没启动。
 3. `platform.start()`：技能先向驱动领订阅令牌，再由驱动独占注册 finished、断连回调并订阅任务结束通知。
 4. `runtime.start()` 启动仓储，先处理仓储中的遗留任务，再允许提交新任务。
-5. 调用 `submit_task()` 提交 `audio.speak`。
+5. 调用 `submit_and_wait()`，内部通过 `submit_task()` 提交 `audio.speak` 并等待终态。
 6. 若提供了幂等键，先查询同一键对应的原任务；找到就返回原任务，不再次执行。
 7. 新请求创建任务，完成校验后交给执行器。
 
@@ -212,6 +213,25 @@ execution_finished() → 清理本机执行记录
 
 ### 5.1 通过运行时接口
 
+只需要最终任务快照时，嵌入式和远程 SDK 均可直接使用：
+
+```python
+final = await runtime.submit_and_wait(request, timeout_s=None)
+print(final.state, final.result, final.error)
+```
+
+不需要先注册监听或创建 Future。内部提交后按任务 ID 回放历史并接续实时事件，
+任务在订阅前完成也不会漏掉终态；提交直接返回终态时无需再订阅。所有终态均返回
+`Task`，失败仍检查 `final.error`；提交、订阅、查询错误继续抛出。
+
+`timeout_s` 是提交返回后订阅与最终查询的等待期限，`None` 表示无限等待。到期抛
+`errors.TaskWaitTimeout`（`TASK_WAIT_TIMEOUT`），详情带 `task_id` 与 `timeout_s`。
+等待超时或调用方取消只关闭本次订阅，不取消机器人动作；总执行期限继续通过
+`TaskRequest.timeout_s` 指定，需要停止动作时显式调用 `cancel_task(task_id)`。
+已有注册监听独立执行，方法返回不保证这些回调已经全部交付。
+
+需要展示执行过程时仍可分开提交、订阅和查询：
+
 ```python
 task = await runtime.submit_task(request)
 
@@ -250,12 +270,12 @@ print(final.error)
 
 任务失败通过 `final.error.code`、`message`、`details` 获取原因。例如机器人拒绝启动时，`details["vendor_code"]` 保留厂商错误码。
 
-### 5.2 通过当前 demo 的 speak()
+### 5.2 通过示例的 speak()
 
 在项目根目录的 Python 调用方中，假设 `api` 已连接：
 
 ```python
-from examples.cc_api_speech_demo import speak
+from examples.cc_api_speech_minimal_demo import speak
 
 final = await speak(api, "你好")
 print(final.id, final.state, final.result, final.error)
@@ -263,7 +283,17 @@ print(final.id, final.state, final.result, final.error)
 
 `speak()` 等待终态、清理运行时与适配器后返回 `Task`。任务执行失败或参数校验失败也返回任务快照；启动、清理异常仍会抛出，外层协程取消也不会变成普通返回值。SDK 连接由调用方管理。
 
-函数通过统一注册的事件回调打印过程，结果回调把最终 Task 交给等待中的 Future，监听异常也通过 Future 传回调用方。返回的是运行时整理后的结果，当前不对外返回 CC API 的完整原始响应。命令行入口读取这个返回值，成功时打印结果，任务失败时抛异常退出。
+三个入口各自展示一个场景：
+
+| 入口 | 结果和通知方式 |
+| --- | --- |
+| `cc_api_speech_minimal_demo.py` | `submit_and_wait()` 直接返回最终 Task，没有用户任务回调 |
+| `cc_api_speech_callback_demo.py` | 提交前注册单个监听，`submit_task()` 后等待通知完成，再查询最终 Task；监听异常向调用方抛出 |
+| 原 `cc_api_speech_demo.py` | 保留双监听线程实验、旧参数和行为；等待结果后收齐两个监听，监听异常只打印 |
+
+完整命令与阅读顺序见 [示例索引](../examples/README.md)。示例不维护结果 Future 或
+跨线程完成通知。返回的是运行时整理后的结果，当前不对外返回 CC API 的完整原始响应。
+命令行入口读取这个返回值，成功时打印结果，任务失败时抛异常退出。
 
 ### 5.3 await 与 asyncio.run()
 
@@ -487,7 +517,7 @@ docker exec -it -w /workspace/robot_core robot_core_ubuntu24 bash -l
 在容器里运行语音示例，连接参数使用机器人已授权的配置，Token 通过 `CC_API_TOKEN` 环境变量提供：
 
 ```bash
-python3 examples/cc_api_speech_demo.py \
+python3 examples/cc_api_speech_minimal_demo.py \
   --api-id YOUR_API_ID \
   --address ROBOT_IP:PORT \
   --message '你好，我是机器人'

@@ -22,6 +22,7 @@ from robot_agent_runtime.sdk.listeners import (
     TaskListeners,
 )
 from robot_agent_runtime.sdk.listener_execution import ListenerExecution, on_callback_owner
+from robot_agent_runtime.sdk.task_waiting import submit_and_wait
 from robot_agent_runtime.thread_binding import ThreadBinding
 
 
@@ -102,6 +103,20 @@ class RobotRuntime:
         task = await self._host.call("submit_task", request)
         self._listeners.track(task)
         return task
+
+    async def submit_and_wait(
+        self, request: TaskRequest, *, timeout_s: float | None = None,
+    ) -> Task:
+        """Return any terminal task; a local wait timeout never cancels its action.
+
+        The optional deadline starts after submission. TaskWaitTimeout retains
+        the task ID for querying or explicit cancellation. Registered callbacks
+        complete independently; use their listener.wait() to drain delivery.
+        """
+        return await submit_and_wait(
+            request, submit=self.submit_task, subscribe=self.subscribe_task_events,
+            get_task=self.get_task_status, timeout_s=timeout_s,
+        )
 
     async def get_task_status(self, task_id: str) -> Task:
         return await self._host.call("get_task_status", task_id)

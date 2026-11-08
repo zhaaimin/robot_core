@@ -322,7 +322,7 @@ svg.diagram { width: 100%; height: auto; border: 1px solid var(--border);
 </tr>
 <tr>
 <td><code>errors.py</code></td>
-<td>122</td>
+<td>126</td>
 <td>每个失败模式一个异常子类 + 一个 <code>code</code> 字符串</td>
 </tr>
 <tr>
@@ -422,13 +422,18 @@ svg.diagram { width: 100%; height: auto; border: 1px solid var(--border);
 </tr>
 <tr>
 <td><code>sdk/embedded.py</code> / <code>remote.py</code></td>
-<td>120 / 264</td>
+<td>135 / 279</td>
 <td>两种同签名门面；<code>embedded</code> 另有 <code>from_platform</code> 平台装配入口</td>
 </tr>
 <tr>
 <td><code>sdk/listeners.py</code> / <code>callback_executor.py</code></td>
 <td>318 / 212</td>
 <td>统一注册监听 + 同步回调的有界线程池</td>
+</tr>
+<tr>
+<td><code>sdk/task_waiting.py</code></td>
+<td>66</td>
+<td>两种 SDK 共用的 <code>submit_and_wait</code>，历史回放等待终态与独立等待期限</td>
 </tr>
 <tr>
 <td><code>sdk/__init__.py</code></td>
@@ -692,13 +697,32 @@ Event(event_id, task_id, sequence, event_type, timestamp, data)
   这样"内核停了但客户端还没被唤醒"的窗口里的事件不丢。</li>
 </ul>
 <h3 id="h-18">流程 6：SDK 统一任务监听</h3>
+<p>只需要一个任务的最终结果时，两种 SDK 都提供 <code>submit_and_wait(request, *, timeout_s=None)</code>。
+内部复用 <code>submit_task</code>，直接返回已终态快照，否则按任务 ID 回放历史并接续实时事件，
+收到终态后关闭订阅并查询最终快照，不注册临时全局监听。快速完成、幂等重提和并发等待
+沿用现有任务与事件语义，不修改内核或 UDS 协议。</p>
+<p>等待期限在提交返回后开始，覆盖订阅和最终查询；到期抛 <code>TaskWaitTimeout</code>
+（<code>TASK_WAIT_TIMEOUT</code>，详情包含任务 ID），不会取消机器人任务。取消调用方也只结束
+本次观察。已注册的回调独立交付，需要收齐时继续等待 <code>listener.wait()</code>。</p>
+<p>示例按用途分开：<code>cc_api_speech_minimal_demo.py</code> 展示终态等待，
+<code>cc_api_speech_callback_demo.py</code> 展示单监听的注册、交付和结果查询；原
+<code>cc_api_speech_demo.py</code> 保留双监听与同步阻塞实验。入口与命令见
+<a href="../examples/README.md">示例索引</a>。</p>
 <p><code>add_task_listener</code> 是<strong>注册式</strong>的：只观察本 SDK 实例注册之后提交的任务，不扫历史、
 不收别的 SDK 实例的任务。</p>
 <table class="seq"><tr><th>#</th><th>谁调用谁</th><th>做什么</th></tr><tr><td class="step">1</td><td class="who"><b>App</b><i class="edge-arrow">→</i><b>TaskListener(应用循环)</b></td><td>add_task_listener(on_event,on_done,on_error)</td></tr><tr><td class="step">2</td><td class="who"><b>App</b><i class="edge-arrow">→</i><b>subscribe_task_events</b></td><td>submit_task → track(task.id)</td></tr><tr><td class="step">3</td><td class="who"><b>TaskListener(应用循环)</b><i class="edge-arrow">→</i><b>TaskListener(应用循环)</b></td><td>_track: 建 watcher 协程 + concurrent Future</td></tr><tr class="grp"><td colspan="3"><b>loop</b> 每个事件</td></tr><tr><td class="step">4</td><td class="who">&nbsp;<b>TaskListener(应用循环)</b><i class="edge-arrow">→</i><b>subscribe_task_events</b></td><td>取事件（经 KernelHost 快照）</td></tr><tr><td class="step">5</td><td class="who">&nbsp;<b>TaskListener(应用循环)</b><i class="edge-arrow">→</i><b>CallbackExecutor</b></td><td>同步回调 submit / 异步回调直接 await</td></tr><tr><td class="step">6</td><td class="who">&nbsp;<b>CallbackExecutor</b><i class="edge-arrow">⇢</i><b>App</b></td><td>工作线程 call_soon_threadsafe 投递结果</td></tr><tr><td class="step">7</td><td class="who"><b>TaskListener(应用循环)</b><i class="edge-arrow">→</i><b>TaskListener(应用循环)</b></td><td>见终态 → get_task_status → on_done(task) 恰好一次</td></tr><tr><td class="step">8</td><td class="who"><b>TaskListener(应用循环)</b><i class="edge-arrow">⇢</i><b>App</b></td><td>on_error(task_id, exc) 只结束该任务监听，不改业务状态</td></tr></table>
 <p>要点（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/listeners.py#L30-L222">listeners.py:30-222</a>）：</p>
 <ul>
 <li><strong>每个任务一个协程</strong>，慢回调只拖住那个任务；<code>_track</code> 里对同一 task id 去重，幂等重复提交不会重复通知。</li>
-<li>异步回调留在调用方循环（可协作取消）；<strong>普通函数交给 <code>CallbackExecutor</code></strong>：惰性创建
+<li>异步回调留在调用方循环（可协作取消）；<code>execution="caller"</code>（默认）下<strong>同一循环里的
+  多个监听因此互相牵连</strong>：一个异步 <code>on_event</code> 里做同步阻塞，另一个监听的事件也发不出去，
+  直到它返回（原线程实验 <code>cc_api_speech_demo.py</code> 的 <code>--listener-block</code> 复现这一点）。<code>execution="group"</code> / <code>"dedicated"</code>
+  把回调挪到 <code>rar-listener-group-*</code> / <code>rar-listener-dedicated</code> 线程，阻塞只留在自己那条
+  线程（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/listener_execution.py#L178-L202">listener_execution.py:178-202</a>），
+  但<strong>必须挪的是制造阻塞的那条</strong>：事件仍从提交方循环投递，只把被牵连的监听改成
+  <code>dedicated</code>，它照样要等上游循环空出来。示例用 <code>--listener1-execution</code> /
+  <code>--listener2-execution</code> 可以逐条切换，四种组合的结果见 README。</li>
+<li><strong>普通函数交给 <code>CallbackExecutor</code></strong>：惰性创建
   <code>rar-callback-{index}</code> 守护线程，4 个工作线程、64 个排队名额、5 秒排队期限，不可配置
   （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/callback_executor.py#L49-L51">callback_executor.py:49-51</a>、
   <a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/callback_executor.py#L84-L86">:84-86</a>）。
@@ -1167,7 +1191,7 @@ Event(event_id, task_id, sequence, event_type, timestamp, data)
   （<a class="ref" href="file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/embedded.py#L49-L63">sdk/embedded.py:49-63</a>）：
   它把 <code>platform.skills</code> / <code>robot_state</code> / <code>reconciler</code> 拆开喂给原构造函数，<strong>不新增状态、不启动平台</strong>。
   平台生命周期仍由应用管——示例里的顺序是 <code>platform.start()</code> → <code>runtime.start()</code> → 提交任务 →
-  <code>runtime.close()</code> → <code>platform.close()</code>（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/examples/cc_api_speech_demo.py#L60-L72">examples/cc_api_speech_demo.py:60-72</a>）。</li>
+  <code>runtime.close()</code> → <code>platform.close()</code>（<a class="ref" href="file:///Users/zhazha/Documents/robot_core/examples/cc_api_speech_demo.py#L133-L151">examples/cc_api_speech_demo.py:133-151</a>）。</li>
 </ul>
 <h3 id="h-29a">新增厂商包的做法</h3>
 <p>目标是<strong>只新增文件</strong>：<code>adapters/&lt;vendor&gt;/</code> 里放 <code>contracts.py</code>（厂商 SDK 协议，若需要）、

@@ -36,7 +36,7 @@ simulator = Simulator()
 runtime = RobotRuntime(InMemoryTaskRepository(), simulator.skills)
 await runtime.start()
 try:
-    task = await runtime.submit_task(
+    final = await runtime.submit_and_wait(
         TaskRequest(
             task_type="announcement",
             steps=[
@@ -45,8 +45,7 @@ try:
             ],
         )
     )
-    async for event in runtime.subscribe_task_events(task.id):
-        print(event.event_type, event.data)
+    print(final.state, final.result, final.error)
 finally:
     await runtime.close()
 ```
@@ -67,13 +66,14 @@ from robot_agent_runtime.sdk import RemoteRuntime
 runtime = RemoteRuntime("/tmp/runtime.sock")
 await runtime.start()
 try:
-    task = await runtime.submit_task(request)
+    final = await runtime.submit_and_wait(request)
 finally:
     await runtime.close()
 ```
 
 可运行的完整示例见 `examples/embedded_demo.py`、`examples/remote_demo.py` 和
-`examples/precondition_demo.py`。
+`examples/precondition_demo.py`。CC 语音的最小调用、回调监听和线程实验分别见
+[示例索引](examples/README.md)。
 
 ## 公开 API
 
@@ -86,12 +86,32 @@ finally:
 | --- | --- |
 | `start()` | 嵌入式按对象的线程绑定启动并完成重启恢复；远程模式确认服务可用 |
 | `submit_task(request)` | 提交任务，返回快照；校验失败直接返回 `FAILED` 任务 |
+| `submit_and_wait(request, *, timeout_s=None)` | 提交并等待终态，返回最终快照；等待超时或调用方取消不取消业务任务 |
 | `get_task_status(task_id)` | 读取持久化的任务状态 |
 | `cancel_task(task_id)` | 请求取消并在有限停止确认期后返回终态；无法确认时进入待对账状态 |
 | `list_skills()` | 列出已注册技能定义 |
 | `subscribe_task_events(task_id, after_sequence=0)` | 分页回放历史后接续实时事件；订阅容量独立于查询和取消 |
 | `add_task_listener(on_event=..., on_done=..., on_error=..., execution="caller", group=None)` | 监听本 SDK 后续提交的任务，返回 `TaskListener`；可选择调用方、分组或独立执行回调 |
 | `close()` | 嵌入式停止内核并限时清理监听；远程模式清理本客户端监听和连接 |
+
+只需要最终结果时，两种 SDK 都可以直接调用：
+
+```python
+final = await runtime.submit_and_wait(request, timeout_s=None)
+print(final.state, final.result, final.error)
+```
+
+无需注册监听或创建 Future。方法内部复用提交、历史回放订阅和最终查询，任务即使在
+订阅前完成也能取得结果；准入失败或幂等重提已返回终态时直接返回。所有终态都返回
+`Task`，包括 `FAILED`、`CANCELED`、`UNKNOWN`、`RECONCILIATION_REQUIRED`，不代表成功。
+提交、订阅、查询失败仍抛异常，事件流提前结束不冒充完成。
+
+`timeout_s` 必须为有限正数或 `None`，从提交返回后开始计算，覆盖订阅与最终查询；
+`None` 表示无限等待。到期抛出 `errors.TaskWaitTimeout`，错误码 `TASK_WAIT_TIMEOUT`，
+`error.info.details["task_id"]` 可用于后续查询或显式取消。等待超时、调用方取消只结束
+本次等待并关闭订阅，不自动取消机器人动作。业务任务总期限仍由 `TaskRequest.timeout_s`
+控制，主动取消仍使用 `cancel_task(task_id)`。已有注册监听独立交付；需要收齐回调时，
+在关闭 SDK 前继续 `await listener.wait()`。
 
 嵌入式另提供 `RobotRuntime.from_platform(repository, platform, *, allowed_permissions=None,
 options=None)`，消费 `RobotPlatform` 并一次装配技能、状态源和对账器；显式线程绑定原样
@@ -386,6 +406,8 @@ CREATED → VALIDATING → QUEUED → RUNNING → SUCCEEDED
 
 注册式监听只观察这些状态，不增加新的状态或写入状态。`on_done` 包含所有终态，
 表示本次任务已结束，不等于成功；`on_error` 及回调队列满、排队超时也不改变机器人任务状态。
+`submit_and_wait` 只等待现有终态，不增加任务状态；`TASK_WAIT_TIMEOUT` 是调用方等待错误，
+不把业务任务改为超时或取消，区别于任务总期限的 `TASK_TIMEOUT`。
 监听的调用方/分组/独立执行方式只决定回调归属，不增加状态或改变业务任务的执行位置。
 `from_platform` 从厂商平台装配原有端口并保留线程分组，不增加任务状态；驱动断连、响应不可信或停止未确认，仍通过
 技能错误进入现有失败、停止确认和待对账流程。
@@ -455,6 +477,7 @@ src/robot_agent_runtime/
 │   ├── embedded.py        RobotRuntime 与保留线程绑定的 from_platform 装配
 │   ├── remote.py          RemoteRuntime
 │   ├── listeners.py       TaskListener
+│   ├── task_waiting.py    两种 SDK 共用的提交与终态等待、独立等待期限
 │   ├── callback_executor.py  默认同步回调执行器
 │   └── listener_execution.py  监听分组/独立循环、容量与回调桥接
 └── adapters/              机器人能力实现
@@ -595,18 +618,60 @@ CC API 适配器保留 `start()` 时所属的应用循环，跨线程执行会�
 已下发请求的等待被取消时同样拒绝后续准入，防止丢弃启动响应后重复发送物理动作。
 请求被厂商明确拒绝时保留 `vendor_code`，允许应用之后另行提交，不自动重试。
 
-完整入口为 `examples/cc_api_speech_demo.py`。在装好 `ubt_robot` 的 Linux ARM64
-环境中执行（`CC_API_TOKEN` 通过部署环境传入）：
+语音示例按用途分为三个独立入口，原入口的参数和行为保持不变：
+
+| 入口 | 用途 |
+| --- | --- |
+| [cc_api_speech_minimal_demo.py](examples/cc_api_speech_minimal_demo.py) | 首次接入：`submit_and_wait()` 直接取得终态，不注册任务监听 |
+| [cc_api_speech_callback_demo.py](examples/cc_api_speech_callback_demo.py) | 回调监听：提交前注册一个监听，等待通知完成后查询结果；监听异常向调用方抛出 |
+| [cc_api_speech_demo.py](examples/cc_api_speech_demo.py) | 原有双监听 caller/dedicated 与阻塞实验，保留所有旧命令行参数；监听异常只打印 |
+
+三份均提供 `speak(api, message) -> Task`，原入口还保留线程实验的关键字参数。
+完整阅读顺序见 [示例索引](examples/README.md)。在装好 `ubt_robot` 的 Linux ARM64
+环境中，首次调用可以执行（`CC_API_TOKEN` 通过部署环境传入）：
 
 ```bash
-python3 examples/cc_api_speech_demo.py \
+python3 examples/cc_api_speech_minimal_demo.py \
   --api-id YOUR_API_ID --address ROBOT_IP:48159 --message '你好，我是机器人'
 ```
+
+查看回调时执行 `examples/cc_api_speech_callback_demo.py`，使用相同连接参数。它打印
+`[EVENT]`、`[DONE]` 和 `[LISTENER ERROR]`，采用默认调用方执行，不包含线程切换或阻塞。
+业务失败仍通过最终 Task 表达，监听失败在 `listener.wait()` 后抛出。
+
+原 `cc_api_speech_demo.py` 专门保留线程实验：注册两条任务监听，两条的 `execution`
+可以分别指定。`--listener-block` 让监听1 在
+第一条事件里同步 `time.sleep(N)`，`[REPORT]` 给出监听2 相邻事件的最大间隔：
+
+| 监听1（阻塞） | 监听2（测量） | 监听2 的 `longest_gap` | 原因 |
+| --- | --- | --- | --- |
+| `caller` | `caller` | ≈ N | 两条异步回调共用一个提交方循环 |
+| `caller` | `dedicated` | ≈ N | 回调虽在独立线程，事件仍经提交方循环投递 |
+| `dedicated` | `caller` | 毫秒级 | 阻塞留在监听1 自己的线程 |
+| `dedicated` | `dedicated` | 毫秒级 | 两条各占一个回调线程 |
+
+```bash
+# 默认组合：监听2 被一起卡住约 2 秒。
+python3 examples/cc_api_speech_demo.py --api-id YOUR_API_ID --address ROBOT_IP:48159 \
+  --message '你好' --listener-block 2
+
+# 只把监听2 挪到独立线程：仍然会被卡住，因为上游投递还在提交方循环。
+python3 examples/cc_api_speech_demo.py --api-id YOUR_API_ID --address ROBOT_IP:48159 \
+  --message '你好' --listener-block 2 --listener2-execution dedicated
+
+# 把阻塞的监听1 挪到独立线程：监听2 不再受影响。
+python3 examples/cc_api_speech_demo.py --api-id YOUR_API_ID --address ROBOT_IP:48159 \
+  --message '你好' --listener-block 2 --listener1-execution dedicated
+```
+
+每次回调打印 `[秒] 监听名 事件名 thread=线程名#id`；`dedicated` 的线程名是
+`rar-listener-dedicated`，两条监听各一个线程 id。示例在报告和关闭前等待两个监听
+交付完成，`listener2_events` 统计第二个监听实际收到的事件数。
 
 在项目根目录的 Python 调用方中，可以直接取得最终 `Task` 快照（`api` 须已连接）：
 
 ```python
-from examples.cc_api_speech_demo import speak
+from examples.cc_api_speech_minimal_demo import speak
 from robot_agent_runtime.models import TaskState
 
 final = await speak(api, "你好，我是机器人")
@@ -620,9 +685,11 @@ elif final.error is not None:
 
 `speak()` 等待任务终态并清理运行时和适配器后返回；任务执行或参数校验失败也会返回
 `Task`，通过 `state` 和 `error` 判断原因，连接初始化与清理异常仍向调用方抛出。
-SDK 连接继续由调用方管理。函数通过统一注册的 `on_event` 打印过程，`on_done` 将最终
-快照交给等待中的 Future，`on_error` 将监听异常交给调用方；命令行入口保留最终结果输出，
-任务失败时以异常退出。返回值为运行时整理后的结果，不包含 CC API 的完整原始响应。
+SDK 连接继续由调用方管理。最小示例通过 `submit_and_wait()` 取得最终快照，无需监听或
+结果 Future；回调示例使用 `submit_task()`、`listener.wait()` 和最终查询。
+原线程实验的两条监听打印事件、终态和监听异常，第二条作为共享循环阻塞实验的对照，
+该实验的监听异常不替代业务任务结果。三个命令行入口都保留最终结果输出，任务失败时以异常退出。
+返回值为运行时整理后的结果，不包含 CC API 的完整原始响应。
 
 运行在机器人本机时可省略 `--address`。SDK 不属于内核依赖，宿主常规导入不需要它。
 容器中的自动测试使用假回调 API，不连接机器人；真实发声和机器人结束事件仍需现场验证。
@@ -713,7 +780,8 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
 `test_recovery` 重启恢复、`test_preconditions` 机器人状态前置条件、`test_sqlite_repository`
 持久化、`test_embedded_sdk` / `test_remote_sdk` 两种接入形态、`test_contracts` 供后续适配器
 复用的契约测试、`test_cc_api` 语音事件匹配与取消/断连边界、`test_task_listeners`
-统一回调注册、任务隔离与监听生命周期、`test_callback_executor` 守护线程退出、容量、
+统一回调注册、任务隔离与监听生命周期、`test_submit_and_wait` 两种 SDK 的终态等待、
+历史回放、幂等与并发、等待超时和取消隔离、`test_callback_executor` 守护线程退出、容量、
 排队期限与取消竞态；`test_listener_execution` 覆盖监听执行位置、组内阻塞、独立隔离、
 线程预算、排队撤销、远程接入与自关闭；`test_event_paging` 覆盖分页回放、实时去重和批次让出；`test_thread_runtime` / `test_isolation` / `test_kernel_host` /
 `test_execution_boundaries` / `test_runtime_isolation` 覆盖线程归属、阻塞外部代码、有限取消、
@@ -726,6 +794,8 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
 `test_contracts` 包含本地和托管准入校验器的可复用契约，也用 CC 和非回调假厂商验证
 `RobotPlatform` 的共同装配契约。`test_cc_platform` 覆盖共享驱动、响应关联和快照、
 断连和过载、控制容量、平台启停及取消等待者后的真实清理，以及 CC 分组和 demo 策略。
+`test_cc_api_demos` 验证最小与回调示例的结果、事件交付、监听异常、启动失败清理，
+以及命令行的连接配置、错误退出和 SDK 连接释放。
 平台契约和嵌入式用例还验证混合绑定、实际线程容量、组内阻塞范围、状态源和对账器绑定。
 
 ## 当前范围
@@ -737,9 +807,13 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
 已实现：运行时内核、技能层框架、Python SDK（嵌入式 + 远程）、UDS 守护进程、SQLite
 持久化、模拟适配器、厂商接入包契约、SDK 通用平台装配入口与 CC 平台工厂、共享 CC 驱动和语音技能、
 SDK 统一注册式任务监听（仅本客户端后续提交）、
+两种 SDK 的 `submit_and_wait` 终态等待与独立等待期限、
 同步回调的有界守护线程隔离与排队期限、监听回调调用方/分组/独立执行配置、
 同进程内核专用线程和外部端口共享/分组/独占配置、平台端口线程绑定透传、有限停止确认与失控资源隔离、
 任务总期限、控制容量预留、快照限额、事件分页及有界关闭缓冲。
+
+CC 语音示例按最小终态等待、单监听回调、双监听线程实验分开，入口与阅读顺序见
+[示例索引](examples/README.md)；原线程实验入口及参数保持不变。
 
 线程边界保护外部 Python 阻塞或不配合取消时的内核响应，不提供硬实时保证。原生扩展
 长期持有 GIL、进程退出或系统资源耗尽仍会影响整个进程；不能强制终止已经运行的线程。

@@ -50,6 +50,10 @@ class TaskTimeout(AgentRuntimeError):
     code = "TASK_TIMEOUT"
 
 
+class TaskWaitTimeout(AgentRuntimeError):
+    code = "TASK_WAIT_TIMEOUT"
+
+
 class SnapshotTooLarge(AgentRuntimeError):
     code = "SNAPSHOT_TOO_LARGE"
 

@@ -178,7 +178,7 @@ flowchart TB
 | 文件 | LOC | 一句话职责 |
 | --- | --- | --- |
 | `models.py` | 116 | 7 个 pydantic 模型 + `TaskState` 枚举 + `SkillContext` dataclass |
-| `errors.py` | 122 | 每个失败模式一个异常子类 + 一个 `code` 字符串 |
+| `errors.py` | 126 | 每个失败模式一个异常子类 + 一个 `code` 字符串 |
 | `ports.py` | 153 | **只放运行时自己消费的 Protocol**：`AdmissionValidator` / `Skill` / `TaskRepository` / `PagedEventRepository` / `Reconciler` / `RobotStateProvider` / `RobotPlatform`。厂商协议一律不进这里 |
 | `kernel/core.py` | 414 | 生命周期、公开 API、提交准入、状态源打断 |
 | `kernel/task_state.py` | 236 | **状态唯一写入点** + 本机任务归属（6 个按 task id 的字典） |
@@ -198,8 +198,9 @@ flowchart TB
 | `hosting/boundary.py` | 151 | 有界快照：计量后构建，拒绝外部对象钩子 |
 | `options.py` | 48 | `RuntimeOptions` 13 个限额 |
 | `hosting/execution_context.py` | 4 | 控制操作 `ContextVar` |
-| `sdk/embedded.py` / `remote.py` | 120 / 264 | 两种同签名门面；`embedded` 另有 `from_platform` 平台装配入口 |
+| `sdk/embedded.py` / `remote.py` | 135 / 279 | 两种同签名门面；`embedded` 另有 `from_platform` 平台装配入口 |
 | `sdk/listeners.py` / `callback_executor.py` | 318 / 212 | 统一注册监听 + 同步回调的有界线程池 |
+| `sdk/task_waiting.py` | 66 | 两种 SDK 共用的 `submit_and_wait`，历史回放等待终态与独立等待期限 |
 | `sdk/__init__.py` | 25 | 公开门面：`RobotRuntime` / `RemoteRuntime` / `RuntimeOptions` / `TaskListener` / `ThreadBinding` |
 | `adapters/simulator.py` | 373 | 无硬件自测实现：技能、两个状态源、对账器 |
 | `adapters/cc_api/` | 840 | CC 厂商接入包：`contracts.py`(40) SDK 协议 + `driver.py`(291) 请求与回调分发 + `platform.py`(113) 装配与生命周期 + `speech.py`(384) 语音语义 |
@@ -467,6 +468,20 @@ sequenceDiagram
 
 ### 流程 6：SDK 统一任务监听
 
+只需要一个任务的最终结果时，两种 SDK 都提供 `submit_and_wait(request, *, timeout_s=None)`。
+内部复用 `submit_task`，直接返回已终态快照，否则按任务 ID 回放历史并接续实时事件，
+收到终态后关闭订阅并查询最终快照，不注册临时全局监听。快速完成、幂等重提和并发等待
+沿用现有任务与事件语义，不修改内核或 UDS 协议。
+
+等待期限在提交返回后开始，覆盖订阅和最终查询；到期抛 `TaskWaitTimeout`
+（`TASK_WAIT_TIMEOUT`，详情包含任务 ID），不会取消机器人任务。取消调用方也只结束
+本次观察。已注册的回调独立交付，需要收齐时继续等待 `listener.wait()`。
+
+示例按用途分开：`cc_api_speech_minimal_demo.py` 展示终态等待，
+`cc_api_speech_callback_demo.py` 展示单监听的注册、交付和结果查询；原
+`cc_api_speech_demo.py` 保留双监听与同步阻塞实验。入口与命令见
+[示例索引](../examples/README.md)。
+
 `add_task_listener` 是**注册式**的：只观察本 SDK 实例注册之后提交的任务，不扫历史、
 不收别的 SDK 实例的任务。
 
@@ -491,7 +506,15 @@ sequenceDiagram
 要点（[listeners.py:30-222](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/listeners.py#L30-L222)）：
 
 - **每个任务一个协程**，慢回调只拖住那个任务；`_track` 里对同一 task id 去重，幂等重复提交不会重复通知。
-- 异步回调留在调用方循环（可协作取消）；**普通函数交给 `CallbackExecutor`**：惰性创建
+- 异步回调留在调用方循环（可协作取消）；`execution="caller"`（默认）下**同一循环里的
+  多个监听因此互相牵连**：一个异步 `on_event` 里做同步阻塞，另一个监听的事件也发不出去，
+  直到它返回（原线程实验 `cc_api_speech_demo.py` 的 `--listener-block` 复现这一点）。`execution="group"` / `"dedicated"`
+  把回调挪到 `rar-listener-group-*` / `rar-listener-dedicated` 线程，阻塞只留在自己那条
+  线程（[listener_execution.py:178-202](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/listener_execution.py#L178-L202)），
+  但**必须挪的是制造阻塞的那条**：事件仍从提交方循环投递，只把被牵连的监听改成
+  `dedicated`，它照样要等上游循环空出来。示例用 `--listener1-execution` /
+  `--listener2-execution` 可以逐条切换，四种组合的结果见 README。
+- **普通函数交给 `CallbackExecutor`**：惰性创建
   `rar-callback-{index}` 守护线程，4 个工作线程、64 个排队名额、5 秒排队期限，不可配置
   （[callback_executor.py:49-51](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/callback_executor.py#L49-L51)、
   [:84-86](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/callback_executor.py#L84-L86)）。
@@ -783,7 +806,7 @@ sequenceDiagram
   （[sdk/embedded.py:49-63](file:///Users/zhazha/Documents/robot_core/src/robot_agent_runtime/sdk/embedded.py#L49-L63)）：
   它把 `platform.skills` / `robot_state` / `reconciler` 拆开喂给原构造函数，**不新增状态、不启动平台**。
   平台生命周期仍由应用管——示例里的顺序是 `platform.start()` → `runtime.start()` → 提交任务 →
-  `runtime.close()` → `platform.close()`（[examples/cc_api_speech_demo.py:60-72](file:///Users/zhazha/Documents/robot_core/examples/cc_api_speech_demo.py#L60-L72)）。
+  `runtime.close()` → `platform.close()`（[examples/cc_api_speech_demo.py:133-151](file:///Users/zhazha/Documents/robot_core/examples/cc_api_speech_demo.py#L133-L151)）。
 
 ### 新增厂商包的做法
 
