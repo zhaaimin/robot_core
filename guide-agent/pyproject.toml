@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robot-agent-guide"
+version = "0.1.0"
+description = "Wakeup and conversation driven venue guide over robot-agent-runtime"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["robot-agent-core>=0.1.0", "robot-agent-runtime>=0.1.0", "PyYAML>=6"]
+
+[project.scripts]
+guide-agent = "guide_agent.app:main"
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.24"]
+mcp = ["robot-agent-mcp>=0.1.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+guide_agent = ["skills/*/SKILL.md", "skills/*/references/*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

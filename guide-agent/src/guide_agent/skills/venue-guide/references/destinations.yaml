@@ -1,0 +1,11 @@
+destinations:
+  - id: exhibition_hall
+    name: 演示展厅
+    aliases: [展厅, 展区]
+    map_target: null
+    introduction: 这里是演示展厅，示例内容用于展示产品与发展历程。实际展陈资料尚未配置。
+  - id: service_desk
+    name: 演示服务台
+    aliases: [服务台, 咨询台]
+    map_target: null
+    introduction: 这里是演示服务台，可作为咨询和导览的示例目的地。实际服务内容尚未配置。

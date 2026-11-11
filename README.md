@@ -75,7 +75,57 @@ finally:
 `examples/precondition_demo.py`。CC 语音的最小调用、回调监听和线程实验分别见
 [示例索引](examples/README.md)。
 
+## Agent 验证项目
+
+Agent 层由共享内核和三个独立应用组成，靠入口区分：
+
+- [agent-core/](agent-core/README.md)（dist `robot-agent-core`，import `robot_agent_core`）：共享内核，
+  提供 LangGraph 决策循环、工具端口、Agent Skill 宿主、shell 与存储身份解析，不含任何业务领域。
+- [agent/](agent/README.md)（dist `robot-agent-app`，入口 `robot-agent`）：通用机器人 agent，
+  后端 `simulator|cc`，通过嵌入式 SDK 或厂商平台验证机器人工具；本身不携带 Skill 内容，
+  要用 Skill 必须给 `--skills-dir`。
+- [hotel-agent/](hotel-agent/README.md)（dist `robot-agent-hotel`，入口 `hotel-agent`）：酒店接待与带房 agent，
+  后端 `simulator|mcp`，MCP 后端通过独立的 [MCP 桥接项目](mcp_bridge/README.md) 连接既有 UDS runtime，
+  调用链为 HotelTools → HotelWorkflow → MCP → RemoteRuntime；自带接待、交接、护送三个 Agent Skill 包。
+- [guide-agent/](guide-agent/README.md)（dist `robot-agent-guide`，入口 `guide-agent`）：导览 Agent，
+  接收唤醒/最终话语事件，从 `venue-guide` Skill 配置地点与介绍，确认后导航并自动播报介绍；后端 `simulator|mcp`。
+
+各项目的框架依赖都只声明在各自 `pyproject.toml`，不加入 runtime 发布包；`src/robot_agent_runtime` 与 `mcp_bridge`
+一行未改。存储策略不再查全局注册表：每个项目自带一份 `StorageProfile` 模块常量（`ROBOT_PROFILE` /
+`HOTEL_PROFILE` / `GUIDE_PROFILE`），由 `configuration.resolve_storage` 在装配时解析，`AppConfig.scenario` 字段与
+`scenarios/` 包一起删除。`skillkit/host.py` 集中实现 Skills 协议，图只编排模型与动作批次；
+`cli.py` 提供参数校验、状态目录约定、错误脱敏与退出码，应用入口各自实现。
+已实现决策、执行与观察闭环，模型接口只有一种（兼容 OpenAI 的工具调用，必须提供凭据），
+支持模拟器与 CC 语音、交互输入、任务查询和取消、SQLite 图检查点与幂等恢复。
+容器独立环境的运行命令与验证边界见各子项目说明。
+酒店项目用 `/skills` 查看、`/skill NAME` 按需选择技能包，`--skill NAME` 可限制可见目录；
+包内 references 和注册 Python scripts 保留，不按业务阶段强制加载。
+它使用模拟入住凭据、可信客人确认、单机器人租约、后台导航与扬声器播报，
+完整操作见 [hotel-agent/README.md](hotel-agent/README.md)。
+
 ## 公开 API
+
+Agent 应用入口为各自独立包提供的 `robot-agent` / `hotel-agent` / `guide-agent`（也可 `python -m robot_agent`、
+`python -m hotel_agent`、`python -m guide_agent`），通过下方公开 SDK 调用 runtime，不增加内核 API。
+导览支持 `--input text|events`、`--skills-dir PATH` 和 `--backend mcp --runtime-socket PATH`；
+唤醒/ASR 适配器通过 `guide_agent.ports.InteractionSource` 输入稳定 ID 的事件，只有最终话语进入模型。
+地点资料来自 `venue-guide/references/destinations.yaml` 与 `introductions.md`；地图目标为空可问答及模拟导航，MCP 不提交移动。
+`--scenario` 参数已删除：通用验证用 `robot-agent`，酒店接待/带房模拟验证用 `hotel-agent`。
+`hotel-agent` 可指定 `--backend mcp --runtime-socket PATH`，由应用启动 stdio 桥接进程；
+`robot-agent` 只有 `simulator` 与 `cc` 两个后端。`--skills-dir` 可指定 Agent Skill 目录。
+`robot-runtime-mcp --socket PATH` 也可供其他本机 MCP 客户端连接；工具为 list_skills、submit_task、get_task_status、cancel_task 和有界 read_task_events。
+MCP 桥接及客户端位于独立包 `robot_runtime_mcp`；酒店通过应用层 `TaskRuntime` 端口消费它，内核无 MCP 依赖。
+酒店装配入口是 `hotel_agent.application`，业务模块使用 `hotel_agent.*` 路径：
+`HotelWorkflow`、`ServicePhase`、`SimulatedHotel` 分别从 `hotel_agent.service`、`hotel_agent.models`、
+`hotel_agent.backend` 导入；机器人装配入口是 `robot_agent.application`。
+公共类型、单轮图调用与 CLI 骨架分别使用 `robot_agent_core.config`、`robot_agent_core.shell`、
+`robot_agent_core.cli`；三个应用都不被内核反向依赖。
+影响存储/身份的配置变化通过 `robot_agent_core.configuration.rebuild_config` 重建；
+启动一致性校验会拒绝旧解析结果，也会拒绝携带另一个 agent profile 的快照，
+数据库文件名和既有 runtime_id 保持不变。
+通用宿主提供 load_skill / read_skill_resource / run_skill_script，脚本需应用注册；机器人自定义目录不自动批准脚本。
+共享 `/skills`、`/skill NAME` 命令不调用模型或业务，显式选择不会代替客人确认或启动机器人。
+酒店自定义目录中的脚本是可选能力：只有可见且与发布指纹一致的入口才绑定，缺失或变化不阻断文档加载与查询/取消；调用未批准脚本仍被拒绝。
 
 `RobotRuntime` 与 `RemoteRuntime` 均提供：
 
@@ -387,6 +437,21 @@ SDK `close()` 会停止监听，不保证交付尚未完成的回调，要收齐
 
 ## 任务状态机
 
+Agent 的图节点、会话检查点和本轮暂停只属于应用状态，不增加 `TaskState`；
+任务完成、取消和待对账仍以下述 runtime 状态为准。
+酒店的接待、等待同意、交接、护送、客人到达确认及服务完成也属于独立业务状态，由 `hotel_agent.service` 管理。
+播报只交付一次扬声器任务结果，既不是业务阶段，也不占用机器人租约。
+导航成功不等于客人到达；机器人已停止但未确认回到会合点时仍保留业务占用，不增加内核状态。
+未批准脚本调用只返回 Agent 工具失败观察，不创建机器人任务或增加 `TaskState`。
+共享 shell 和场景描述符只属于应用层；酒店错误归位保持错误码，脚本指纹变化仍拒绝恢复旧 pending，不改变任务状态机。
+SkillHost 保留执行批次开始前的加载集合与决策时的脚本指纹，不写 runtime 任务状态；宿主参数格式错误仍返回 INVALID_REQUEST。
+通用期限参数校验失败返回应用配置错误；导入酒店错误或业务数据类型仅加载对应契约。
+MCP 提交保留调用方的非空幂等键，真实事件保留原序号；等待超时、请求取消和连接断开不表示机器人已停止。
+酒店 MCP 后端关闭时先让 workflow 请求停止并保存实际结果，再关闭桥接连接；独立 runtime 服务继续运行。
+导览的等待确认、导航、介绍和完成属于 `guide_agent.service` 的业务状态；导航成功后才自动提交一次配置介绍。
+导览停止先撤销旧对话的动作权限，再请求 runtime 停止；未知提交/停止保留占用并待核对，重启不重放动作。
+重复唤醒不重置导览；ASR 中间结果不进入模型，最终输入事件持久化去重；麦克风与 ASR 引擎由外部适配器提供。
+
 目录按职责归类，任务状态、持久化与停止确认语义保持一致。
 `stop()` / `close()` 是运行时生命周期阶段，不增加业务任务状态；停止未确认仍落待对账。
 
@@ -441,6 +506,85 @@ CC API 的 `audio.speak` 在启动受理后保持 `RUNNING`，收到匹配 `work
 这条规则用于避免重复执行非幂等的物理动作。
 
 ## 模块结构
+
+仓库包含共享内核 `agent-core/`、三个 Agent 应用 `agent/`、`hotel-agent/` 与 `guide-agent/`、
+`mcp_bridge/` 接入包与 `src/robot_agent_runtime/` 运行时包，分别打包。
+先列 Agent 模块，其后为 runtime 模块；接入边界见各子项目说明。
+
+```text
+agent-core/src/robot_agent_core/
+├── graph.py         LangGraph 决策、执行、观察与路由
+├── state.py         图状态与稳定动作标识
+├── models.py        决策模型 Protocol 与 ChatOpenAI 适配
+├── ports.py         ToolSet、TaskRuntime 端口与 Observation 事实记录
+├── errors.py        应用结构化错误
+├── validation.py    与装配无关的通用期限校验
+├── shell.py         输入、单轮图调用、结果基础信封、错误状态与公共循环
+├── config.py        标准库依赖的不可变配置快照（携带 profile）
+├── configuration.py StorageProfile、存储/身份解析、重建与启动一致性校验
+├── cli.py           参数校验、状态目录约定、模型生命周期、错误脱敏与退出码
+└── skillkit/        Agent Skills 宿主，按模块导入不做统一装配
+    ├── catalog.py   Skills 目录、校验、受控文档加载与 bundled(package)
+    ├── host.py      宿主 schema/指导/handler、脚本指纹与批次状态
+    ├── scripts.py   注册脚本执行、指纹与期限校验
+    ├── selection.py 用户查看目录与显式技能选择
+    └── versions.py  图执行与显式选择共用的正文/版本校验
+```
+
+```text
+agent/src/robot_agent/          # 通用机器人 agent，入口 robot-agent
+├── app.py                      CLI、凭据前提、CC 原生连接所有权与启动装配
+├── profiles.py                 ROBOT_PROFILE：后端白名单与固定库文件名
+├── application.py              机器人装配、SDK/平台生命周期与交互错误策略
+├── robot_tools.py              把白名单 runtime 技能翻译成模型工具
+└── __main__.py                 模块入口
+```
+
+```text
+hotel-agent/src/hotel_agent/    # 酒店 agent，入口 hotel-agent
+├── app.py                      CLI、凭据前提、profile 归属校验与启动装配
+├── profiles.py                 HOTEL_PROFILE：后端白名单与七个库文件名
+├── application.py              酒店装配、可信确认、客人会话与关闭顺序
+├── models.py                   酒店服务阶段与业务记录
+├── errors.py                   酒店业务错误，保持 HOTEL_WORKFLOW_REJECTED
+├── repository.py               业务持久化、版本与机器人租约
+├── service.py                  接待门禁、阶段规则、回位、播报和恢复
+├── task_coordination.py        带期限的提交、查询、取消与观察原语
+├── tools.py                    模型可用酒店工具与业务事实
+├── simulator.py                从大厅初始化的酒店导航与播报模拟器
+├── backend.py                  HotelBackend 端口、已核验入住凭据与 SimulatedHotel
+├── script_bindings.py          按活跃资源指纹选择可批准的发布脚本
+├── adapters/
+│   └── mcp.py                  MCP 连接装配、必需技能检查与连接生命周期
+├── skills/                     三个独立酒店 Skill，含资料和酒店专属脚本
+└── __main__.py                 模块入口
+```
+
+```text
+guide-agent/src/guide_agent/
+├── app.py           CLI、配置与模型生命周期
+├── profiles.py      独立的导览存储与后端策略
+├── application.py   对话队列、停止优先处理与共享图装配
+├── ports.py         唤醒/最终话语输入事件端口
+├── interaction.py   文本与 NDJSON 有界输入
+├── catalog.py       Skill 地点目录、事实快照与地图目标校验
+├── tools.py         查找、介绍、带路建议、查询与取消工具
+├── service.py       确认、导航、自动介绍、停止与恢复
+├── models.py        导览业务快照
+├── repository.py    SQLite 事件去重、动作意图与机器人租约
+├── runtime.py       模拟器和 MCP 连接装配
+├── errors.py        导览结构化错误
+├── skills/venue-guide/ 导览方法与可配置资料
+└── __main__.py      模块入口
+```
+
+```text
+mcp_bridge/src/robot_runtime_mcp/
+├── server.py        MCP 工具、真实事件批次与 UDS 客户端装配
+├── client.py        MCP 任务客户端、事件回放与 stdio 生命周期
+├── errors.py        结构化远端错误与传输结果不确定错误
+└── __main__.py      robot-runtime-mcp stdio 入口
+```
 
 实现按职责归类；根目录只保留公共契约、配置与命令行入口。
 
@@ -800,6 +944,29 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
 
 ## 当前范围
 
+Agent 层由共享内核 `agent-core/` 与三个独立应用 `agent/`、`hotel-agent/`、`guide-agent/` 组成：
+LangGraph 工具闭环、模型接口适配、装配层存储/身份解析与被动配置快照、独立 SkillHost、
+固定加载边界的工具批次与 CLI 骨架都在内核；通用项目只剩 RobotTools 与 CC 装配，
+酒店项目只剩 HotelTools、业务确认、租约与三个 Skill 包；导览项目使用独立 GuideTools 与可配置的 venue-guide Skill。
+导览支持唤醒/最终话语输入、地点问答、可信带路确认、后台导航、到达自动介绍和停止；
+内置地点仅为演示，真实 MCP 导航需要部署方填入地图目标，尚未连接真实麦克风/ASR 或跟随检测。
+`--scenario` 与场景描述符注册表已删除，三个应用各自携带 `StorageProfile` 常量并在启动时
+核对快照归属，因此配置快照不能跨 agent 复用；后端白名单收窄为 robot `simulator|cc`、
+hotel/guide `simulator|mcp`，通用 agent 不再自带酒店 Skill，要用 Skill 必须给 `--skills-dir`。
+酒店可经 stdio MCP 桥接访问既有 runtime，保留原 HotelTools、业务确认和租约；
+独立接入包提供技能发现、稳定幂等提交、查询/取消和真实事件批次。本轮只支持本机 stdio，不提供 HTTP 服务。
+发布代码没有离线演示决策实现，命令行测试用的脚本替身分别留在 `agent/tests/scripted_models.py`
+与 `hotel-agent/tests/scripted_models.py`。
+已加载 Skill 正文与版本只由内核一份共享校验检查；通用模型、工具与脚本执行器的期限校验
+独立于任何应用常量，酒店业务实现按需导入。
+三份酒店脚本因包名与错误归位改写而指纹变化，旧 pending 脚本拒绝自动恢复；
+数据路径、任务身份和 JSON 错误码保持原样。
+Agent Skills 通用宿主保留三个独立业务包，用户可选择按需加载、读资料并执行注册脚本；
+酒店同名自定义技能可以只有文档；未批准脚本被跳过，控制命令及其他已批准能力继续可用。
+不合并整包，也不由酒店阶段硬编码切换正文。酒店应用保留模拟接待到护送闭环、独立客人确认与单机器人占用、
+后台导航与独立回位结果；未知停止和待人工归位保留占用。真实 PMS、导航硬件、随行感知与电梯尚未接入。
+真实模型协议使用本地 HTTP 测试服务验证，尚未使用真实模型凭据或硬件验证规划质量与动作效果。
+
 源码按 `kernel`、`hosting`、`repositories`、`transport`、`sdk`、`adapters` 职责归类，
 根目录只保留公共契约和配置，旧模块入口已删除。
 外部代理装配与整体关闭次序由托管层负责，内核支持保留仓储的停止阶段。
@@ -818,6 +985,6 @@ CC 语音示例按最小终态等待、单监听回调、双监听线程实验�
 线程边界保护外部 Python 阻塞或不配合取消时的内核响应，不提供硬实时保证。原生扩展
 长期持有 GIL、进程退出或系统资源耗尽仍会影响整个进程；不能强制终止已经运行的线程。
 
-尚未实现：Agent 集成层（计划生成与重规划）、调度器（`priority` 字段已持久化但不参与
+尚未实现：复杂 Agent 规划、多 Agent 协作与失败动作自动重规划、调度器（`priority` 字段已持久化但不参与
 排序，无并发上限与抢占）、有限重试、结构化日志、其他真实机器人能力适配（导航、
 ROS 2 等）、CC API 结束原因解析与重启对账、回调进程隔离与强制终止、云端管理平面。

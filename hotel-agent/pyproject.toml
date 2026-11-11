@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robot-agent-hotel"
+version = "0.1.0"
+description = "Hotel reception, handoff and escort agent built on the shared agent kernel"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "robot-agent-runtime>=0.1.0",
+    "robot-agent-core>=0.1.0",
+    "langgraph>=1,<2",
+    "langchain-openai>=1,<2",
+    "langgraph-checkpoint-sqlite>=3,<4",
+    "PyYAML>=6",
+]
+
+[project.scripts]
+hotel-agent = "hotel_agent.app:main"
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.24"]
+mcp = ["robot-agent-mcp>=0.1.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+hotel_agent = ["skills/*/SKILL.md", "skills/*/references/*", "skills/*/scripts/*.py", "skills/*/assets/*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

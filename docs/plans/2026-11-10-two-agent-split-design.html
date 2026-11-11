@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>两个 agent 拆开：共享内核包 + 通用 robot agent + 酒店 agent</title>
+<style>
+:root{--fg:#1b1f24;--dim:#57606a;--line:#d8dee4;--bg:#fff;--soft:#f6f8fa;--accent:#0b5cad}
+@media (prefers-color-scheme:dark){:root{--fg:#e6edf3;--dim:#9198a1;--line:#30363d;--bg:#0d1117;--soft:#161b22;--accent:#6cb6ff}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+ font:16px/1.75 -apple-system,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}
+main{max-width:960px;margin:0 auto;padding:56px 28px 96px}
+h1{font-size:30px;line-height:1.35;margin:0 0 24px;letter-spacing:-.2px}
+h2{font-size:21px;margin:44px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+p{margin:0 0 14px}
+p.meta{background:var(--soft);border-left:3px solid var(--accent);padding:12px 16px;border-radius:0 6px 6px 0;color:var(--dim)}
+code{background:var(--soft);border:1px solid var(--line);border-radius:4px;padding:1px 5px;
+ font:13.5px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace}
+pre{background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:16px;overflow:auto;margin:0 0 18px}
+pre code{background:none;border:0;padding:0;font-size:13px;line-height:1.65;white-space:pre}
+table{width:100%;border-collapse:collapse;margin:6px 0 22px;font-size:14.5px}
+th,td{border:1px solid var(--line);padding:9px 12px;text-align:left;vertical-align:top}
+th{background:var(--soft);font-weight:600}
+ul,ol{margin:0 0 18px;padding-left:24px} li{margin:0 0 7px}
+a{color:var(--accent)}
+strong{font-weight:650}
+footer{margin-top:56px;padding-top:16px;border-top:1px solid var(--line);color:var(--dim);font-size:13px}
+</style></head><body><main>
+<h1>两个 agent 拆开：共享内核包 + 通用 robot agent + 酒店 agent</h1><p class="meta"><strong>Goal:</strong> 把 hotel agent 与通用 robot agent 拆成两个独立项目，靠"哪个入口"区分，不再靠 <code>--scenario</code> 参数区分；真正共用的部分收进一个共享内核包。</p><p class="meta"><strong>Architecture:</strong> 三项目结构 —— <code>agent-core/</code>（图、状态、模型端口、shell、配置解析、Skill 宿主、CLI 骨架）、<code>agent/</code>（只剩通用 robot agent：RobotTools + cc 连接）、<code>hotel-agent/</code>（酒店领域模型、工作流、三个 bundled Skill、MCP 适配器）。场景描述符 <code>ScenarioDescriptor</code> 被每个项目自带的 <code>StorageProfile</code> 常量取代，<code>AppConfig.scenario</code> 字段与 <code>scenarios/registry.py</code> 一起删除。runtime 与 mcp_bridge 一行不改。</p><p class="meta"><strong>Tech Stack:</strong> 现有 LangGraph / SQLite / asyncio；不新增依赖；验证全部在 <code>robot_core_ubuntu24</code> 的 <code>/opt/robot_agent_venv/bin/python</code>。</p><h2>结论先说</h2><ol><li>布局按你选的"两个独立项目 + 共享内核包"落地，共享包 import 名 <code>robot_agent_core</code>、dist 名 <code>robot-agent-core</code>（跟 <code>robot-agent-runtime</code> 同族前缀）。通用 agent 保留 dist <code>robot-agent-app</code> 与 import <code>robot_agent</code>，入口仍是 <code>robot-agent</code>；新项目 dist <code>robot-agent-hotel</code>、import <code>hotel_agent</code>、入口 <code>hotel-agent</code>。</li><li>删除 <code>--scenario</code>。存储策略与后端白名单成为各项目的常量，不再运行时查表；两个 agent 各自的 <code>--backend</code> choices 收窄为 <code>simulator|cc</code>（robot）与 <code>simulator|mcp</code>（hotel）。</li><li>持久化身份逐字不变：数据库文件名、<code>runtime_id</code> 哈希输入、<code>hotel:{service_id}:escort|return</code> 幂等键、已发布脚本指纹全部照旧。现成证据是 <a href="/Users/zhazha/Documents/robot_core/agent/tests/test_configuration.py#L38">test_configuration.py:38-46</a> 已经把 4 组 <code>runtime_id</code> 硬编码成 digest，拆完必须仍然绿。</li><li>两处<strong>有意</strong>的行为变化，需要你确认：通用 agent 不再自带酒店 Skill；酒店输出信封的 <code>'scenario': 'hotel'</code> 改名为 <code>'agent': 'hotel'</code>。</li><li>分四步，每步容器跑完不退化再进下一步：抽内核 → 切酒店项目 → 删场景概念 → 文档与基线对账。</li></ol><h2>现在为什么读不懂（实测）</h2><p><code>scenario</code> 这个词在 <code>agent/src/robot_agent/**/*.py</code> 出现 <strong>58 次 / 7 个文件</strong>，测试里另有 124 次。其中真正属于"两个 agent 的差异"的内容被摊在共用层：</p><table><thead><tr><th>位置</th><th>混合形态</th></tr></thead><tbody><tr><td><code>scenarios/registry.py</code></td><td>一个 dict 同时装着 robot 和 hotel 的存储策略、后端白名单、入口函数</td></tr><tr><td><code>configuration.py</code>（14 处）</td><td><code>resolve_storage()</code> 里 <code>if backend == 'mcp'</code> 与 <code>if scenario.runtime_identity_tag is not None</code> 两条分支，只服务 hotel</td></tr><tr><td><code>app.py</code>（8 处）</td><td>一个 71 行的 <code>parse_args</code> 同时校验 hotel 才有的 <code>--runtime-socket</code>，并为 mcp 单独覆盖默认技能集</td></tr><tr><td><code>adapters/mcp.py</code></td><td>放在共用层，却硬编码 <code>{'navigation.navigate_to','audio.speak'}</code> 和一句 <code>'Hotel MCP runtime is missing required skills'</code></td></tr><tr><td><code>skillkit/catalog.py:144</code></td><td><code>files("robot_agent").joinpath("skills")</code> —— 通用 agent 因此能 <code>--skill</code> 加载酒店 Skill</td></tr><tr><td><code>domains/hotel/*</code> + <code>skills/*</code></td><td>酒店领域代码与三个酒店 Skill 包住在通用 agent 的包里</td></tr></tbody></table><p><code>agent/tests/</code> 26 个用例文件里 8 个是纯酒店用例（<code>test_hotel_*</code>，共 80 个测试定义），另有 <code>test_scenarios.py</code>（5）整体只为验证"一个包能切两个场景"而存在。</p><h2>目标目录</h2><pre><code>robot_core/
+├── src/robot_agent_runtime/          # 不动（runtime 归你）
+├── mcp_bridge/                       # 不动
+├── agent-core/                       # 新：共享内核包
+│   ├── pyproject.toml                #   dist robot-agent-core
+│   ├── README.md
+│   └── src/robot_agent_core/
+│       ├── graph.py  state.py  models.py  ports.py  errors.py  validation.py
+│       ├── config.py  configuration.py  cli.py
+│       ├── shell.py
+│       └── skillkit/{catalog,host,scripts,selection,versions}.py
+│   └── tests/                        #   图/宿主/配置/shell/契约用例
+├── agent/                            # 改：只剩通用 robot agent
+│   ├── pyproject.toml                #   dependencies += robot-agent-core
+│   ├── README.md
+│   └── src/robot_agent/
+│       ├── app.py                    #   CLI：--backend simulator|cc
+│       ├── application.py            #   原 scenarios/robot.py
+│       └── robot_tools.py
+│   └── tests/{test_app,test_tools,test_scenarios→…}.py
+└── hotel-agent/                      # 新：酒店 agent
+    ├── pyproject.toml                #   dist robot-agent-hotel，入口 hotel-agent
+    ├── README.md                     #   原 agent/HOTEL.md 升级为项目 README
+    └── src/hotel_agent/
+        ├── app.py                    #   CLI：--backend simulator|mcp + --runtime-socket
+        ├── application.py            #   原 scenarios/hotel.py
+        ├── adapters/mcp.py
+        ├── domains/{models,errors,repository,service,task_coordination,tools,simulator,script_bindings}.py
+        └── skills/{frontdesk-reception,guest-handoff,escort-assistance}/
+    └── tests/                        #   8 个 test_hotel_* + 酒店配置用例</code></pre><p><code>domains/hotel/</code> 摊平成 <code>hotel_agent/</code> 的直接模块（项目本身就是酒店域，少一层前缀）；<code>adapters/</code> 只剩 <code>mcp.py</code>，<code>__init__.py</code> 那句"loaded by the selected scenario"随之删除。</p><h2>归属表</h2><table><thead><tr><th>现文件</th><th>去处</th><th>理由</th></tr></thead><tbody><tr><td><code>graph.py</code> <code>state.py</code> <code>models.py</code> <code>ports.py</code> <code>errors.py</code> <code>validation.py</code> <code>shell.py</code> <code>config.py</code> <code>configuration.py</code></td><td><code>robot_agent_core/</code></td><td>与场景无关：图、状态快照、模型端口、shell 循环、存储解析本身</td></tr><tr><td><code>skillkit/</code>（5 文件）</td><td><code>robot_agent_core/skillkit/</code></td><td>Agent-Skill 宿主是通用能力，酒店只是它的一个使用者</td></tr><tr><td><code>app.py</code> 的参数校验助手、<code>_default_data_dir</code>、<code>_write_error</code>、<code>open_cc_connection</code> 之外的骨架</td><td><code>robot_agent_core/cli.py</code></td><td>两个 agent 都要正数校验、数据目录约定、错误脱敏。<code>open_cc_connection</code>（依赖 <code>ubt_robot</code>）留在 <code>agent/</code></td></tr><tr><td><code>robot_tools.py</code></td><td><code>agent/</code></td><td>通用 runtime 工具集，酒店用的是 <code>HotelTools</code> 而不是它</td></tr><tr><td><code>scenarios/registry.py</code></td><td><strong>删除</strong></td><td>见下节</td></tr><tr><td><code>scenarios/robot.py</code></td><td><code>agent/src/robot_agent/application.py</code></td><td>只有一个使用者</td></tr><tr><td><code>scenarios/hotel.py</code></td><td><code>hotel-agent/src/hotel_agent/application.py</code></td><td>同上</td></tr><tr><td><code>adapters/mcp.py</code></td><td><code>hotel-agent/src/hotel_agent/adapters/mcp.py</code></td><td>内容本来就是酒店专属</td></tr><tr><td><code>domains/hotel/**</code></td><td><code>hotel-agent/src/hotel_agent/**</code></td><td>领域代码</td></tr><tr><td><code>skills/**</code>（3 个包）</td><td><code>hotel-agent/src/hotel_agent/skills/**</code></td><td>文档内容就是接待/交接/带房 SOP</td></tr></tbody></table><p>移动的文件里凡是 import <code>robot_agent.graph</code> 这类共用层的，改成 <code>robot_agent_core.*</code>；<code>hotel_agent</code> 内部互相引用改自己的包名。<code>script_bindings.py:48</code> 的 <code>import_module(f'robot_agent.skills.{name}.scripts.{script}')</code> 必须改成 <code>hotel_agent.skills.…</code> —— 指纹是按源码内容算的（<code>SkillScriptRunner</code> 比 <code>resource['fingerprint']</code>，模块路径不在指纹里），所以换包名不会让已发布指纹失效。</p><h2>用 <code>StorageProfile</code> 取代 <code>ScenarioDescriptor</code></h2><p><code>robot_agent_core/configuration.py</code> 里换成只描述存储、不含 <code>run</code> 回调的常量：</p><pre><code>@dataclass(frozen=True)
+class StorageProfile:
+    name: str                     # 仍进 identity hash：'robot' / 'hotel'
+    simulator_database: str
+    runtime_identity_tag: str | None
+    checkpoint_database: str
+    business_database: str | None
+    allowed_backends: frozenset[str]
+    mcp_checkpoint_database: str | None = None
+    mcp_business_database: str | None = None
+
+ROBOT_PROFILE = StorageProfile('robot', 'simulator-tasks.sqlite3', None,
+                               'checkpoints.sqlite3', None, frozenset({'simulator', 'cc'}))</code></pre><p>酒店那份常量放在 <code>hotel_agent</code> 自己的包里。<code>resolve_storage(..., profile=...)</code> 只把参数名和取值来源换掉，哈希输入的<strong>顺序与内容一字不改</strong>：mcp 仍是 <code>json([backend, str(runtime_socket), profile.name])</code>，非 mcp 仍是 <code>json([backend, task_database, api_id?, address?])</code> 再按需追加 tag。</p><p><code>AppConfig</code> 去掉 <code>scenario: str = 'robot'</code>，改为必填 <code>profile: StorageProfile</code> —— 于是通用 agent 的配置快照在类型上就不可能自称是酒店 agent，<code>validate_config()</code> 也不必回查全局表（现在 <code>test_configuration.py:81</code> 专门测这条"不查表"，拆完这条测试变成结构性事实，可以简化为断言 <code>config.profile.name</code>）。<code>scenarios/registry.py</code>、<code>scenario_names()</code>、<code>get_scenario()</code>、<code>--scenario</code> 一起删除；<code>conftest.py</code> 里 <code>scripted_model(config.scenario)</code> 改为各项目的 conftest 注入自己的替身模型。</p><h2>两处有意的语义变化</h2><p><strong>一、通用 agent 不再自带酒店 Skill。</strong> <code>SkillRegistry.bundled()</code> 参数化为 <code>bundled(package: str)</code>，<code>agent/</code> 传 <code>package='robot_agent'</code> 时找不到 <code>skills/</code>，默认走 <code>--skills-dir</code> 或内置空目录报错。想要酒店 SOP 就运行 <code>hotel-agent</code>；想在通用 agent 里加载任意 Skill 文档，<code>--skills-dir</code> 仍然完全可用。这是"减少混合"的直接后果，也是本次拆分的目的之一。</p><p><strong>二、酒店输出信封 <code>'scenario': 'hotel'</code> → <code>'agent': 'hotel'</code>。</strong> 拆完 <code>scenario</code> 这个概念在代码里不存在了，留着键名会让读 JSON 的人去找一个已经不存在的参数。改 1 处写入（<code>application.py</code> 的 <code>_result</code>）加对应断言，没有其他消费者。</p><h2>必须逐字保留</h2><ul><li>7 个数据库文件名字符串（含 <code>hotel-mcp-{endpoint}-checkpoints.sqlite3</code> 模板）与 <code>data_dir</code> 约定、<code>ROBOT_AGENT_DATA_DIR</code> / <code>XDG_STATE_HOME</code>。</li><li><code>runtime_id</code> 的哈希输入顺序与编码（已有 digest 测试守住；酒店额外补一条 mcp digest pin）。</li><li><code>hotel:{service_id}:escort</code> / <code>:return</code> 幂等键（<code>task_coordination.py</code> 与 <code>service.py:_navigation_request</code>）。</li><li><s>三个酒店 Skill 包内 <code>scripts/*.py</code> 的源码内容 —— 一个字节都不改</s>（落地时不成立，见下方偏差记录）。</li><li><code>robot_runtime_mcp.client.open_mcp_runtime(socket, allowed_skills=...)</code> 调用形态。</li><li>各 <code>--backend</code> 默认技能集的实际值（simulator 四项 / cc 一项 / mcp 两项），只是不再靠分支判断选择。</li></ul><h2>成本与风险</h2><table><thead><tr><th>项</th><th>量</th><th>处置</th></tr></thead><tbody><tr><td>import 重写</td><td>共用层 1440 行（含 <code>skillkit/</code> 688）+ 酒店层 1132 行与 3 个 Skill 包搬家</td><td>纯机械；用 <code>compileall</code> + 三套完整用例兜住</td></tr><tr><td>容器安装</td><td>由 1 个 editable 变 3 个</td><td>需 <code>pip install -e ./agent-core -e ./agent -e ./hotel-agent --no-deps --no-build-isolation</code>；宿主 pip 403，只能进容器做</td></tr><tr><td>用例重分配</td><td>264 个（现 30 文件 / 246 个模块级定义）</td><td>按表拆到 3 个 <code>tests/</code>，先写"归属清单"再搬，搬完三套总数对账到 264，一条不许丢</td></tr><tr><td><code>.verify/sweep.py</code></td><td>FILES 只扫 <code>agent/tests</code></td><td>本仓库主力已改容器，sweep 基线数字作废；不投入维护</td></tr><tr><td>两处语义变化</td><td>见上节</td><td>需要你点头；不同条就只做布局拆分</td></tr><tr><td>README 三处</td><td><code>agent/README.md</code>、<code>HOTEL.md</code>、根 <code>README.md</code> 模块树</td><td>第 4 步统一改，公开行为变了必须同步</td></tr></tbody></table><p>最大风险不是搬家，是<strong>第 3 步删场景概念时顺手改到哈希输入</strong>。对策：把 digest pin 测试在动手前先补全（robot / hotel-simulator / hotel-mcp 三条各钉一个固定值），任何走样立刻红。</p><h2>明确不做</h2><p>不动 <code>src/robot_agent_runtime/**</code> 与 <code>mcp_bridge/**</code>（你的硬约束）。不给通用 agent 加 mcp 后端，不给酒店 agent 加 cc 后端。不做插件式 agent 注册表、不做"多场景可插拔"框架 —— 那等于把 <code>--scenario</code> 换个写法留下。不改幂等键、不改文件名、不改 Skill 文档内容。不删 <code>SimulatedHotel</code> / <code>HotelSimulator</code>（此前你选了"先不删除"）。不引入新依赖。</p><h2>实施步骤（每步容器验证后才进下一步）</h2><ol><li><strong>抽共享内核</strong>：建 <code>agent-core/</code>，把归属表前两行的文件移过去，<code>agent/</code> 依赖它并改成 <code>robot_agent_core.*</code> 导入；<code>--scenario</code> 暂时原样保留。验收：<code>agent</code> 264 passed，runtime 497 passed。</li><li><strong>切出酒店项目</strong>：建 <code>hotel-agent/</code>，移 <code>domains/hotel</code>、<code>skills</code>、<code>adapters/mcp.py</code>、<code>scenarios/hotel.py</code>（→ <code>application.py</code>）与 8 个 <code>test_hotel_*</code>；补酒店自己的 <code>app.py</code>（含 <code>--runtime-socket</code>）。验收：<code>agent</code> + <code>hotel-agent</code> 两套总数 = 264，runtime 497。</li><li><strong>删场景概念</strong>：<code>ScenarioDescriptor</code> → <code>StorageProfile</code>，去掉 <code>AppConfig.scenario</code> 与 <code>--scenario</code>，删 <code>scenarios/registry.py</code>，<code>scenarios/robot.py</code> → <code>application.py</code>，<code>SkillRegistry.bundled(package)</code>，信封键改名。验收：digest pin 三条全绿，两套总数仍 264。</li><li><strong>文档与对账</strong>：三处 README 模块树与运行说明、<code>HOTEL.md</code> 并入 <code>hotel-agent/README.md</code>、根 README 目录树与启动命令；容器 <code>pip list</code> 记录三个 editable 安装。验收：三套全绿 + 一次 <code>hotel-agent</code> 与一次 <code>robot-agent --backend simulator</code> 实跑冒烟。</li></ol>
+
+<h2>实际落地偏差（2026-11-10 实施后回填）</h2>
+<ol>
+<li><strong>三份酒店发布脚本的源码指纹变了。</strong> 它们的 import 必须从 <code>robot_agent.domains.hotel.errors</code> / <code>robot_agent.skillkit.*</code> 改成 <code>hotel_agent.errors</code> / <code>robot_agent_core.*</code>，所以“一个字节都不改”做不到。指纹按源码内容计算，<code>script_bindings.py</code> 是用 <code>SkillRegistry.bundled('hotel_agent')</code> 的<strong>同一份发布内容</strong>去比对活跃资源的指纹，两侧一起移动，绑定仍然成立；代价是升级前保存的 pending 脚本决策返回 <code>AGENT_CONFIGURATION_INVALID</code>，不执行旧指令、不自动刷新指纹。</li>
+<li><strong><code>domains/hotel/</code> 摊平时 <code>adapters.py</code> 与 <code>backend.py</code> 合并成了 <code>backend.py</code></strong>（<code>HotelBackend</code> 端口、<code>VerifiedStay</code>、<code>SimulatedHotel</code> 同处一个模块），<code>adapters/</code> 只留 <code>mcp.py</code>。</li>
+<li><strong><code>agent/pyproject.toml</code> 去掉了 <code>mcp</code> extra 和 <code>skills/*</code> package-data</strong>：通用 agent 不携带 Skill 内容，也不消费 MCP 桥接；MCP extra 只在 <code>hotel-agent</code> 声明。<code>agent-core/tests/test_contracts.py</code> 里的 TaskRuntime 契约用例用 <code>importorskip('robot_runtime_mcp')</code>，不依赖该 extra。</li>
+<li><strong>用例总数从 264 涨到 291</strong>（agent-core 73 + agent 101 + hotel-agent 117）：共享层与配置层的用例在两个应用里各留一份（后端白名单、身份摘要、拒绝另一 agent 的快照），酒店额外补了 mcp digest pin 与 profile 归属检查。没有任何一条原有覆盖被删除。</li>
+</ol>
+<footer>设计文档源文件：<code>docs/plans/2026-11-10-two-agent-split-design.md</code> · 11 个章节 · 2026-11-10</footer>
+</main></body></html>
