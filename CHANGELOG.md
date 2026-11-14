@@ -1,5 +1,7 @@
 # 变更记录
 
+> **项目创建**：2026-10-24
+
 本文件记录对使用者的行为影响。内部重构、测试补充不在此重复。
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
