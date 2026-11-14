@@ -1,11 +1,14 @@
 import asyncio
 import json
+import secrets
 from contextlib import aclosing
 from typing import Any
 
+import uvicorn
 from mcp import types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from robot_agent_capabilities import RobotCapabilities
@@ -228,5 +231,79 @@ async def serve(socket_path: str, *, allowed_skills: set[str] | None = None) -> 
         bridge = RuntimeMcpServer(runtime, allowed_skills=allowed_skills)
         async with stdio_server() as (reader, writer):
             await bridge.server.run(reader, writer, bridge.server.create_initialization_options())
+    finally:
+        await runtime.close()
+
+
+_MCP_PATH = "/mcp"
+
+
+async def _send_json(send: Any, status: int, payload: dict[str, Any]) -> None:
+    body = json.dumps(payload).encode()
+    await send({
+        "type": "http.response.start", "status": status,
+        "headers": [(b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode())],
+    })
+    await send({"type": "http.response.body", "body": body})
+
+
+class _BearerGuard:
+    """ASGI middleware: bearer-token gate in front of the MCP session manager.
+
+    Every request must present ``Authorization: Bearer <token>``; comparison is
+    constant-time. The token never reaches MCP message handling on rejection.
+    """
+
+    def __init__(self, app: Any, token: str) -> None:
+        self._app = app
+        self._expected = f"Bearer {token}".encode()
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        if scope.get("path") != _MCP_PATH:
+            await _send_json(send, 404, {"error": {"code": "NOT_FOUND", "message": "Unknown path"}})
+            return
+        headers = {key.decode("latin-1").lower(): value.decode("latin-1")
+                   for key, value in scope.get("headers", ())}
+        supplied = headers.get("authorization", "").encode()
+        if not secrets.compare_digest(supplied, self._expected):
+            await _send_json(send, 401, {"error": {
+                "code": "UNAUTHORIZED", "message": "Missing or invalid bearer token"}})
+            return
+        await self._app(scope, receive, send)
+
+
+async def serve_http(
+    socket_path: str, *,
+    allowed_skills: set[str] | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    token: str = "",
+) -> None:
+    """Serve the same MCP tool surface over streamable HTTP for remote clients.
+
+    The bridge still connects to the runtime over its local Unix socket; only
+    the client-facing transport changes. An empty token is refused so a
+    misconfigured deployment fails fast instead of exposing physical actions.
+    """
+    if not token or not token.strip():
+        raise ValueError("serve_http requires a nonempty bearer token")
+    runtime = RemoteRuntime(socket_path)
+    try:
+        async with asyncio.timeout(10):
+            await runtime.start()
+        bridge = RuntimeMcpServer(runtime, allowed_skills=allowed_skills)
+        manager = StreamableHTTPSessionManager(
+            bridge.server, json_response=True, event_store=None)
+        config = uvicorn.Config(
+            _BearerGuard(manager.handle_request, token), host=host, port=port,
+            lifespan="off", log_level="warning",
+        )
+        server = uvicorn.Server(config)
+        async with manager.run():
+            await server.serve()
     finally:
         await runtime.close()
