@@ -1,1058 +1,152 @@
 # Robot Agent Runtime & Capabilities
 
-面向 Codex、Claude Code、其他外部 Agent 与自研业务 Agent 的机器人能力基础设施。
-架构为 Runtime + 统一机器人能力层 + MCP/Python SDK：runtime 管任务生命周期、资源与事件、取消和恢复，
-独立能力层提供统一工具目录、参数 schema、稳定动作身份及结果观察，Agent 自己负责决策循环。
+面向 Codex、Claude Code、WorkBuddy 等 MCP 客户端与自研 Python Agent 的机器人能力基础设施。
+内核管任务生命周期、资源与事件、取消与恢复；独立能力层提供统一工具目录、参数 schema、
+稳定动作身份和结果观察；**Agent 只负责决策**。
 
-运行时内核不依赖任何机器人厂商 SDK、ROS 2 或云端服务：硬件接入通过 `ports.py` 中的
-Protocol 以适配器形式注入。
+<p align="center">
+  <a href="assets/architecture.svg"><img src="assets/architecture.svg" alt="Robot Agent Runtime 分层架构" width="100%"></a>
+</p>
 
-外部 Agent 从 [统一接入说明](docs/agent-integration.md) 开始；Python 应用可直接使用
-[capabilities/](capabilities/README.md)，无需安装 LangGraph 或运行仓库自带 Agent。
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.11%2B-2b5c8a?style=flat-square" alt="Python 3.11+">
+  <img src="https://img.shields.io/badge/status-experimental-b4761f?style=flat-square" alt="Status: experimental">
+  <img src="https://img.shields.io/badge/license-proprietary-6b7686?style=flat-square" alt="License: proprietary">
+</p>
 
-完整流程与能力边界见 [任务执行、结果获取、持久化与重启状态核对](docs/task-execution-and-recovery.md)，
-包含 CC API 语音示例、SQLite 与 InMemory 的区别，以及 Reconciler 当前能处理的范围。
+<p align="center">
+  <a href="#快速开始"><strong>快速开始</strong></a> ·
+  <a href="#四种接入方式">接入方式</a> ·
+  <a href="#五个概念">核心概念</a> ·
+  <a href="#设计取舍">设计取舍</a> ·
+  <a href="#文档">文档</a> ·
+  <a href="#边界与成熟度">边界与成熟度</a>
+</p>
 
-## 安装
+> 一句话边界：**runtime 决定「这台机器现在允许做什么」，Agent 决定「要做什么」。**
+
+## 它解决什么问题
+
+写一个能动机器人的 Agent，真正难的不是调接口，而是这三件事每次都要重写：
+
+1. **任务不是一个调用。** 提交、等待、超时、取消、重试、重启后核对——每个 Agent 都会写一遍，
+   每个都写得略有不同。
+2. **硬件差异会漏进业务代码。** 换一台机器，`if vendor == ...` 就长到业务逻辑里。
+3. **安全判定散落各处。** 急停、电量、资源互斥、停止是否确认，一旦分散到每个 Agent，
+   就没人能回答「现在到底谁允许它动」。
+
+这个仓库把这三件事收进内核，业务只保留「想做什么」。
+
+## 快速开始
 
 ```bash
-pip install -e '.[test]'
+pip install -e '.[test]'      # Python 3.11+
+python examples/embedded_demo.py
 ```
 
-需要 Python 3.11+。
-
-外部 Agent/统一能力 SDK 在已准备依赖的容器中从仓库根目录安装：
-
-```bash
-/opt/robot_agent_venv/bin/python -m pip install -e . -e ./capabilities -e ./mcp_bridge
-```
-
-第三方模型与 MCP 依赖不进入 runtime 发布包。
-
-## 两种使用形态
-
-同一个 `RuntimeCore` 支撑两种接入方式，公开方法签名一致。
-
-`RobotRuntime` 和 `RuntimeServer` 都把内核托管在专用 daemon 线程的 asyncio 循环上。
-应用、SDK 监听、技能和厂商接口的循环不与内核共用。状态机、资源锁和事件总线仍只在
-内核循环操作，线程交接由边界模块负责；本方案不使用子进程。
-
-### 嵌入式（同进程）
+嵌入式最小用法：
 
 ```python
+import asyncio
+
 from robot_agent_runtime.adapters.simulator import Simulator
 from robot_agent_runtime.models import SkillCall, TaskRequest
 from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 from robot_agent_runtime.sdk import RobotRuntime
 
-simulator = Simulator()
-runtime = RobotRuntime(InMemoryTaskRepository(), simulator.skills)
-await runtime.start()
-try:
-    final = await runtime.submit_and_wait(
-        TaskRequest(
+
+async def main() -> None:
+    runtime = RobotRuntime(InMemoryTaskRepository(), Simulator(delay_s=0.01).skills)
+    await runtime.start()
+    try:
+        final = await runtime.submit_and_wait(TaskRequest(
             task_type="announcement",
             steps=[
                 SkillCall(skill="navigation.navigate_to", params={"target": "meeting_room"}),
                 SkillCall(skill="audio.speak", params={"message": "The meeting starts at 3 PM."}),
             ],
-        )
-    )
-    print(final.state, final.result, final.error)
-finally:
-    await runtime.close()
-```
-
-### 远程（跨进程，Unix Domain Socket）
-
-启动守护进程：
-
-```bash
-robot-agent-runtime serve --socket /tmp/runtime.sock --database /tmp/tasks.db
-```
-
-客户端：
-
-```python
-from robot_agent_runtime.sdk import RemoteRuntime
-
-runtime = RemoteRuntime("/tmp/runtime.sock")
-await runtime.start()
-try:
-    final = await runtime.submit_and_wait(request)
-finally:
-    await runtime.close()
-```
-
-可运行的完整示例见 `examples/embedded_demo.py`、`examples/remote_demo.py` 和
-`examples/precondition_demo.py`。CC 语音的最小调用、回调监听和线程实验分别见
-[示例索引](examples/README.md)。
-
-## Agent 验证项目
-
-Agent 层由共享内核和三个独立消费者应用组成，靠入口区分；它们不是外部 Agent 使用机器人的前提。
-独立 [capabilities/](capabilities/README.md)（dist `robot-agent-capabilities`）由 MCP 与 Python 客户端共用，
-仅依赖 runtime，不依赖 Agent、LangGraph 或 MCP。
-
-- [agent-core/](agent-core/README.md)（dist `robot-agent-core`，import `robot_agent_core`）：共享内核，
-  提供 LangGraph 决策循环、工具端口、Agent Skill 宿主、shell 与存储身份解析，不含任何业务领域。
-- [agent/](agent/README.md)（dist `robot-agent-app`，入口 `robot-agent`）：通用机器人 agent，
-  后端 `simulator|cc`，通过嵌入式 SDK 或厂商平台验证机器人工具；本身不携带 Skill 内容，
-  要用 Skill 必须给 `--skills-dir`。
-- [hotel-agent/](hotel-agent/README.md)（dist `robot-agent-hotel`，入口 `hotel-agent`）：酒店接待与带房 agent，
-  后端 `simulator|mcp`，MCP 后端通过独立的 [MCP 桥接项目](mcp_bridge/README.md) 连接既有 UDS runtime，
-  调用链为 HotelTools → HotelWorkflow → MCP → RemoteRuntime；自带接待、交接、护送三个 Agent Skill 包。
-- [guide-agent/](guide-agent/README.md)（dist `robot-agent-guide`，入口 `guide-agent`）：导览 Agent，
-  接收唤醒/最终话语事件，从 `venue-guide` Skill 配置地点与介绍，确认后导航并自动播报介绍；后端 `simulator|mcp`。
-
-各项目的框架依赖都只声明在各自 `pyproject.toml`，不加入 runtime 发布包。
-通用 Agent 的 RobotTools 只适配统一能力目录和结果；TaskRuntime 与 Observation 契约归能力包所有。
-存储策略不再查全局注册表：每个项目自带一份 `StorageProfile` 模块常量（`ROBOT_PROFILE` /
-`HOTEL_PROFILE` / `GUIDE_PROFILE`），由 `configuration.resolve_storage` 在装配时解析，`AppConfig.scenario` 字段与
-`scenarios/` 包一起删除。`skillkit/host.py` 集中实现 Skills 协议，图只编排模型与动作批次；
-`cli.py` 提供参数校验、状态目录约定、错误脱敏与退出码，应用入口各自实现。
-已实现决策、执行与观察闭环，模型接口只有一种（兼容 OpenAI 的工具调用，必须提供凭据），
-支持模拟器与 CC 语音、交互输入、任务查询和取消、SQLite 图检查点与幂等恢复。
-容器独立环境的运行命令与验证边界见各子项目说明。
-酒店项目用 `/skills` 查看、`/skill NAME` 按需选择技能包，`--skill NAME` 可限制可见目录；
-包内 references 和注册 Python scripts 保留，不按业务阶段强制加载。
-它使用模拟入住凭据、可信客人确认、单机器人租约、后台导航与扬声器播报，
-完整操作见 [hotel-agent/README.md](hotel-agent/README.md)。
-
-## 公开 API
-
-统一能力 API 为 `robot_agent_capabilities.RobotCapabilities.create(runtime, ...)`、`tools` 和
-`invoke(name, params, *, operation_id=None, wait=False)`。动作必须提供非空稳定 operation_id；
-默认后台提交，显式 wait=True 才有界等待。Observation 的 task_id/state/result 依据 runtime，
-error 同时区分运行时结果与本地等待、操作身份冲突；无法确认最新状态时 state 为 null。
-MCP 原五项任务工具保留，并按同一白名单提供 robot_speak、robot_navigate_to 等实际能力及
-robot_task_status/robot_cancel_task；技能调用信封为 `{operation_id, params, wait=false}`。
-默认键为 `robot:{operation_id}`，旧 RobotTools 的 `agent:` 键保持不变；不要跨命名空间重发旧动作。
-完整 Python 示例和 Codex/Claude Code stdio 配置见 [统一接入说明](docs/agent-integration.md)。
-
-Agent 应用入口为各自独立包提供的 `robot-agent` / `hotel-agent` / `guide-agent`（也可 `python -m robot_agent`、
-`python -m hotel_agent`、`python -m guide_agent`），通过下方公开 SDK 调用 runtime，不增加内核 API。
-导览支持 `--input text|events`、`--skills-dir PATH` 和 `--backend mcp --runtime-socket PATH`；
-唤醒/ASR 适配器通过 `guide_agent.ports.InteractionSource` 输入稳定 ID 的事件，只有最终话语进入模型。
-地点资料来自 `venue-guide/references/destinations.yaml` 与 `introductions.md`；地图目标为空可问答及模拟导航，MCP 不提交移动。
-`--scenario` 参数已删除：通用验证用 `robot-agent`，酒店接待/带房模拟验证用 `hotel-agent`。
-`hotel-agent` 可指定 `--backend mcp --runtime-socket PATH`，由应用启动 stdio 桥接进程；
-`robot-agent` 只有 `simulator` 与 `cc` 两个后端。`--skills-dir` 可指定 Agent Skill 目录。
-`robot-runtime-mcp --socket PATH` 供本机 MCP 客户端连接；除上述具体能力外，保留 list_skills、submit_task、get_task_status、cancel_task 和有界 read_task_events。
-MCP 桥接及客户端位于独立包 `robot_runtime_mcp`；酒店通过应用层 `TaskRuntime` 端口消费它，内核无 MCP 依赖。
-酒店装配入口是 `hotel_agent.application`，业务模块使用 `hotel_agent.*` 路径：
-`HotelWorkflow`、`ServicePhase`、`SimulatedHotel` 分别从 `hotel_agent.service`、`hotel_agent.models`、
-`hotel_agent.backend` 导入；机器人装配入口是 `robot_agent.application`。
-公共类型、单轮图调用与 CLI 骨架分别使用 `robot_agent_core.config`、`robot_agent_core.shell`、
-`robot_agent_core.cli`；三个应用都不被内核反向依赖。
-影响存储/身份的配置变化通过 `robot_agent_core.configuration.rebuild_config` 重建；
-启动一致性校验会拒绝旧解析结果，也会拒绝携带另一个 agent profile 的快照，
-数据库文件名和既有 runtime_id 保持不变。
-通用宿主提供 load_skill / read_skill_resource / run_skill_script，脚本需应用注册；机器人自定义目录不自动批准脚本。
-共享 `/skills`、`/skill NAME` 命令不调用模型或业务，显式选择不会代替客人确认或启动机器人。
-酒店自定义目录中的脚本是可选能力：只有可见且与发布指纹一致的入口才绑定，缺失或变化不阻断文档加载与查询/取消；调用未批准脚本仍被拒绝。
-
-`RobotRuntime` 与 `RemoteRuntime` 均提供：
-
-服务端从 `robot_agent_runtime.transport.server` 导入 `RuntimeServer`；低层内核从
-`robot_agent_runtime.kernel.core` 导入 `RuntimeCore`。使用下方模块结构中的新路径导入。
-
-| 方法 | 说明 |
-| --- | --- |
-| `start()` | 嵌入式按对象的线程绑定启动并完成重启恢复；远程模式确认服务可用 |
-| `submit_task(request)` | 提交任务，返回快照；校验失败直接返回 `FAILED` 任务 |
-| `submit_and_wait(request, *, timeout_s=None)` | 提交并等待终态，返回最终快照；等待超时或调用方取消不取消业务任务 |
-| `get_task_status(task_id)` | 读取持久化的任务状态 |
-| `cancel_task(task_id)` | 请求取消并在有限停止确认期后返回终态；无法确认时进入待对账状态 |
-| `list_skills()` | 列出已注册技能定义 |
-| `subscribe_task_events(task_id, after_sequence=0)` | 分页回放历史后接续实时事件；订阅容量独立于查询和取消 |
-| `add_task_listener(on_event=..., on_done=..., on_error=..., execution="caller", group=None)` | 监听本 SDK 后续提交的任务，返回 `TaskListener`；可选择调用方、分组或独立执行回调 |
-| `close()` | 嵌入式停止内核并限时清理监听；远程模式清理本客户端监听和连接 |
-
-只需要最终结果时，两种 SDK 都可以直接调用：
-
-```python
-final = await runtime.submit_and_wait(request, timeout_s=None)
-print(final.state, final.result, final.error)
-```
-
-无需注册监听或创建 Future。方法内部复用提交、历史回放订阅和最终查询，任务即使在
-订阅前完成也能取得结果；准入失败或幂等重提已返回终态时直接返回。所有终态都返回
-`Task`，包括 `FAILED`、`CANCELED`、`UNKNOWN`、`RECONCILIATION_REQUIRED`，不代表成功。
-提交、订阅、查询失败仍抛异常，事件流提前结束不冒充完成。
-
-`timeout_s` 必须为有限正数或 `None`，从提交返回后开始计算，覆盖订阅与最终查询；
-`None` 表示无限等待。到期抛出 `errors.TaskWaitTimeout`，错误码 `TASK_WAIT_TIMEOUT`，
-`error.info.details["task_id"]` 可用于后续查询或显式取消。等待超时、调用方取消只结束
-本次等待并关闭订阅，不自动取消机器人动作。业务任务总期限仍由 `TaskRequest.timeout_s`
-控制，主动取消仍使用 `cancel_task(task_id)`。已有注册监听独立交付；需要收齐回调时，
-在关闭 SDK 前继续 `await listener.wait()`。
-
-嵌入式另提供 `RobotRuntime.from_platform(repository, platform, *, allowed_permissions=None,
-options=None)`，消费 `RobotPlatform` 并一次装配技能、状态源和对账器；显式线程绑定原样
-交给宿主，权限与选项传给同一个运行时构造入口。平台启动和关闭继续由应用负责。
-
-`RobotRuntime(..., options=RuntimeOptions(...))` 与
-`RuntimeServer(repository, skills, socket_path, options=RuntimeOptions(...))` 可以配置隔离边界。
-厂商接入包通过 `ports.RobotPlatform` 汇总既有端口，应用负责选择工厂和生命周期：
-
-| 平台接口 | 行为 |
-|---|---|
-| `skills` | 稳定的只读 `Mapping[str, Skill \| ThreadBinding[Skill]]`，保留每个技能的线程选择 |
-| `robot_state` / `reconciler` | 各自的原始端口或 `ThreadBinding[端口类型]`；没有对应能力时返回 `None` |
-| `start()` / `close()` | 启动驱动和技能、确认停止并释放订阅；重复等待共享真实结果 |
-
-服务端直接接收端口，不再接收已创建的 `RuntimeCore`：
-
-```python
-from robot_agent_runtime.transport.server import RuntimeServer
-
-server = RuntimeServer(
-    repository, skills, socket_path,
-    reconciler=reconciler,
-    allowed_permissions={"navigation", "audio"},
-    robot_state=robot_state,
-)
-```
-
-隔离配置示例：
-
-```python
-from robot_agent_runtime.sdk import RuntimeOptions
-
-options = RuntimeOptions(
-    port_timeout_s=5.0,
-    cancel_grace_s=0.2,
-    max_extension_threads=32,
-    max_pending_calls=256,
-    max_control_calls=16,
-    max_subscriptions=256,
-    max_snapshot_bytes=1_048_576,
-    max_snapshot_depth=64,
-    event_page_size=128,
-    max_event_buffer=1000,
-    max_listener_threads=16,
-    max_pending_listener_callbacks=64,
-    listener_queue_timeout_s=5.0,
-)
-```
-
-端口操作默认期限 5 秒。`TaskRequest.timeout_s` 从接受请求开始计算总期限，覆盖准入校验、
-排队、资源等待与执行；每步受技能声明或单步覆盖和剩余总预算共同限制。
-停止确认与持久化各自有界，不计入执行预算。技能收到取消信号后有 0.2 秒协作退出，
-声明支持取消时才进一步请求协程取消，并再等待最多 0.2 秒。
-需要更长硬件停止确认时间的部署须相应增加 `cancel_grace_s`。
-普通调用、订阅与控制操作分别限额，查询、取消和关闭不被空闲订阅挤出；外部线程
-数量（含声明校验线程）有上限，卡住的线程不会补建。容量耗尽报告
-`EXTENSION_CAPACITY_EXCEEDED`。监听线程另有独立预算，超限报告
-`LISTENER_CAPACITY_EXCEEDED`。`RemoteRuntime(socket_path, options=...)` 使用本地监听的
-停止确认期限、监听线程与回调排队限额，不配置服务端限额。
-
-单个跨边界快照默认最多 1 MiB、嵌套深度 64，结果与错误在工作线程规范化后交接，
-超限报告 `SNAPSHOT_TOO_LARGE`。事件历史默认每页 128 条；内存和 SQLite 仓储提供
-可选 `PagedEventRepository.list_events_page()`，旧仓储在工作线程内裁页兼容。
-实时队列与关闭后事件缓冲默认各限 1000 条，溢出显式报告 `EVENT_STREAM_OVERFLOW`，
-附带最后交付的序号，调用方可据此恢复回放。
-
-技能、仓储、状态源和对账器各有稳定的外部线程归属，运行期间不要在应用中直接调用或修改
-这些对象中的 asyncio 状态。技能取消信号、进度、参数和结果由代理交接；事件仍先回放后
-接实时。输入和结果须能表示为 JSON 数据。低层 `RuntimeCore` 单独使用时是受信任的
-asyncio 引擎，不自动提供线程隔离；面向业务的入口应使用 SDK 或 `RuntimeServer`。
-
-`KernelHost` 在专用内核循环中准备外部代理，随后创建唯一的 `RuntimeCore`。内核从构造时
-就使用最终端口、事件容量和准入校验器，不接收线程绑定，也不在运行期间替换依赖。
-`AdmissionValidator` 只负责准入规则：默认本地实现在当前循环校验，托管实现将相同规则
-交给有界校验线程；任务状态始终由内核写入。
-
-关闭由宿主协调：先 `RuntimeCore.stop()` 完成停止确认和终态持久化并结束事件生产，
-再排空已打开订阅的事件，之后 `RuntimeCore.close()` 关闭仓储，最后关闭外部循环和内核
-循环。`stop()` 与 `close()` 各自共享真实完成结果，重复调用和等待方取消不重复清理。
-`KernelHost.begin_close()` 发起同一次关闭并立即返回，`close()` 等待结果；SDK 先发起
-业务停止，再限时清理监听。停止或排空失败仍继续资源释放并汇总异常。
-
-### 外部对象的线程归属
-
-注册已有对象时可以用 `ThreadBinding` 选择线程，不传绑定保持原有的对象独占行为：
-
-| 注册方式 | 在一个运行时内的线程归属 |
-| --- | --- |
-| `ThreadBinding.shared(obj)` | 所有选择 shared 的对象共用一个外部线程 |
-| `ThreadBinding.group(obj, "navigation")` | 同名组共用一个外部线程，不同组彼此独立 |
-| `ThreadBinding.dedicated(obj)` 或直接传 `obj` | 该对象独占一个外部线程 |
-
-```python
-from robot_agent_runtime.sdk import RobotRuntime, ThreadBinding
-
-runtime = RobotRuntime(
-    repository,  # 仓储保持默认独占
-    {
-        "navigation.navigate_to": ThreadBinding.group(navigate_skill, "navigation"),
-        "navigation.position": ThreadBinding.group(position_skill, "navigation"),
-        "audio.speak": ThreadBinding.shared(speak_skill),
-        "vendor.blocking": ThreadBinding.dedicated(blocking_skill),
-    },
-    robot_state=navigation_state,  # 状态源保持默认独占，及时交付前置条件变化
-)
-```
-
-上面的变量代表应用预先创建的对象。`blocking_skill` 是示例变量名，表示可能调用同步阻塞
-接口的技能对象，例如等待返回的厂商 SDK 方法、同步网络请求或 `time.sleep()`；
-`"vendor.blocking"` 是示例注册名。两者都由应用自行定义，框架没有内置 blocking 技能。
-`ThreadBinding.dedicated(blocking_skill)` 为它选择独占线程，避免同步阻塞拖住共享线程
-中的其他对象。线程策略由应用显式选择，运行时不会自动检测技能是否阻塞。
-真正的异步 I/O 或 `await asyncio.sleep()` 会让出事件循环，适合使用共享或指定组线程；
-仅把包含同步阻塞调用的函数声明成 `async def`，仍会阻塞它所在的线程。
-
-技能、仓储、状态源和对账器都支持绑定。`RuntimeServer` 直接在端口构造参数中
-接收相同绑定，远程客户端不能改变服务端线程归属。共享和指定组均为运行时内部线程，
-不使用应用循环；默认 shared 线程与名为 `"shared"` 的指定组分开，不同运行时也不共享。
-同一对象按身份去重，重复注册必须使用相同模式和组名；普通对象等同 dedicated，
-与 shared/group 混用会在启动外部线程前以 `INVALID_REQUEST` 拒绝。
-绑定目标必须是实际对象，`ThreadBinding.shared(None)` 等空目标会在构造时以
-`INVALID_REQUEST` 拒绝；可选端口直接传 `None` 仍表示不启用该端口。
-
-线程名标明配置归属：默认共享为 `robot-extension-shared`，指定组为
-`robot-extension-group-组名`，独占为 `robot-extension-dedicated-序号`。
-这些名称可在线程调试器中核对；不同运行时可能出现相同名称，仍是不同线程。
-
-`max_extension_threads` 按实际分配的外部线程加一个校验线程计数，内核和 SDK 回调线程
-另计。共享线程上的所有对象共用 `max_pending_calls` 和控制调用额度，超限立即报错。
-同一线程内逐个读取技能声明，不会因技能数量多而在启动时挤满调用额度。
-
-共享只统一线程与事件循环，不保证调用串行；协程在 `await` 时可以交错，资源互斥仍由
-运行时资源锁负责。同步阻塞影响同组全部对象。**需要及时触发任务打断的状态源，不得与
-可能同步阻塞的技能共用事件循环**，否则 `watch()` 无法交付标签变化，运行中的任务不能
-及时响应前置条件丢失。状态源建议保持默认独占；适配器若自行交回其他循环，实际状态读取
-和推送所在的循环也必须避免同步阻塞。线程配置不会检测或自动禁止这些业务层组合。
-仓储建议保持默认独占，避免技能阻塞拖住任务持久化。某技能停止未确认只隔离该技能
-实例和资源，不关闭同组其他对象的线程。
-组内其他调用若也因阻塞而到期，仍分别遵守原有超时和故障关闭规则。
-
-绑定只控制运行时后续调用，`MySkill(...)` 构造仍在调用方线程；运行时不提供线程内工厂构造或自动迁移
-已绑定的 asyncio 对象。CC API 仍会将厂商操作交回适配器 `start()` 所在循环。
-低层 `RuntimeCore` 只接收普通端口对象并在当前循环执行；线程绑定交给 SDK/Server。
-
-端口截止后按失败关闭：状态读取失败仍以 `INTERNAL_ERROR` 拒绝提交；对账超时不猜测
-终态；仓储操作超时后报告 `EXTENSION_TIMEOUT`。若调用已开始，则禁止继续使用该仓储，
-避免不确定提交之后继续写入；仅排队且已确认撤销、从未开始的调用不会禁用仓储，也不会
-在队列恢复后补执行。仓储不可用时，任务最终状态可能无法落盘，应在恢复仓储后对账。
-
-接入 CC API 时，应用先调用 `platform.start()` 启动驱动和技能，再启动运行时；
-退出时先关闭运行时，再关闭平台，最后停止应用拥有的 SDK 连接。
-
-### 统一注册任务监听
-
-`RobotRuntime` 与 `RemoteRuntime` 使用同样的接口。在提交任务之前注册一次，回调通过
-`event.task_id` / `task.id` 区分任务；不扫描旧任务，也不接收其他 SDK 实例提交的任务。
-
-```python
-from robot_agent_runtime.models import Event, Task
-
-def on_event(event: Event) -> None:
-    print("执行过程", event.task_id, event.event_type, event.data)
-
-def on_done(task: Task) -> None:
-    print("最终结果", task.id, task.state, task.result, task.error)
-
-def on_error(task_id: str, error: Exception) -> None:
-    print("监听异常", task_id, error)
-
-listener = runtime.add_task_listener(
-    on_event=on_event, on_done=on_done, on_error=on_error,
-)
-await runtime.start()
-try:
-    first = await runtime.submit_task(request_a)
-    second = await runtime.submit_task(request_b)
-    # 此处可以继续做其他异步工作。
-    await listener.wait()
-finally:
-    await runtime.close()
-```
-
-回调支持普通函数和 `async def` 函数（包括 `async __call__`），至少提供一个。
-每个监听器对同一任务按事件顺序调用，终态事件的 `on_event` 完成后，查询最终快照并
-调用一次 `on_done`。不同任务各自监听；回调收到独立的深拷贝快照。
-
-一次注册的 `on_event`、`on_done`、`on_error` 使用同一执行模式：
-
-| `execution` | 回调执行位置 | 同步阻塞的影响 |
-|---|---|---|
-| `"caller"`（默认） | 异步回调在提交任务的业务循环，同步回调在 SDK 共享线程池 | 异步回调里的同步阻塞会卡住业务循环；同步回调占用共享线程槽位 |
-| `"group"` | 同一 SDK 内，同名组共用一个专用线程和事件循环 | 同组监听相互影响，其他组和调用方循环可继续 |
-| `"dedicated"` | 每次监听注册独占一个专用线程和事件循环 | 阻塞限制在本次注册，不直接卡住其他监听循环 |
-
-```python
-# 保持现有行为，适合要直接访问业务循环中异步对象的回调。
-runtime.add_task_listener(on_event=update_ui, execution="caller")
-
-# 同组共用一个循环，适合愿意共享阻塞影响的监听。
-runtime.add_task_listener(on_event=record_event, execution="group", group="reporting")
-runtime.add_task_listener(on_done=record_result, execution="group", group="reporting")
-
-# 可能执行同步网络等待的回调独占一个循环。
-runtime.add_task_listener(on_event=slow_callback, execution="dedicated")
-```
-
-只有 `group` 模式接受 `group` 参数，组名必须是非空白字符串；组名按原字符串匹配，
-作用域仅限当前 SDK 实例。不同 SDK 的同名组不共享线程，监听线程也不与技能或仓储线程共用。
-组内不同任务仍可协作并发，分组不保证跨任务串行。独立模式也以注册为单位，
-同一注册的多个任务共享其循环。
-
-`caller` 模式的普通函数返回 awaitable 时，回到提交方循环等待它。
-`group` / `dedicated` 模式的普通函数、异步函数，以及普通函数返回的 awaitable，
-都在所选循环中执行，不占用默认同步回调线程池。订阅和状态查询仍在提交方循环，
-仅用户回调跨线程交接。
-
-选择分组或独立模式后，异步客户端、连接及 asyncio Event/Queue/Future 必须在其所属循环
-创建和使用，不能直接操作业务循环里的对象。通知业务循环用 `loop.call_soon_threadsafe()`；
-调用依赖业务循环的异步接口用 `asyncio.run_coroutine_threadsafe()` 桥接，尤其是
-`RemoteRuntime` 的请求接口。监听句柄的 `wait()` / `close()` 支持跨循环调用，
-从隔离回调调用 SDK `close()` 时自动交接回提交方循环。
-
-默认模式的异步回调即使阻塞调用方循环，也不在内核循环执行；该调用方自己的请求和 `close()` 仍可能
-无法继续。可以从其他正常运行的调用方查询内核，不能把调用方循环停住等同于内核停住。
-
-默认模式的同步回调不能直接操作 asyncio Future、Event 或 Queue，也不能直接调用 SDK 的异步方法；
-需要这些操作时使用 `async def` 回调，或通过 `loop.call_soon_threadsafe()` 通知事件循环。
-同一任务按事件顺序执行；不同任务或不同注册的同步回调可能并发，调用方共享的数据须自行同步。
-
-默认模式下，每个 SDK 实例共享 4 个工作线程，最多排队 64 个同步回调，排队期限 5 秒。队列满时报告
-`LISTENER_CALLBACK_QUEUE_FULL`，排队过期报告 `LISTENER_CALLBACK_TIMEOUT`，结束对应任务
-的监听，不影响业务任务。同步 `on_error` 同样受容量与期限约束，无法执行时交给事件循环
-异常处理器；异步 `on_error` 不占线程槽位。这些默认同步线程池限额不提供公开配置。
-
-分组与独立模式默认最多保留 16 个监听线程位置，同名组计一次，每个独立注册计一次。
-线程在首次回调时启动；注册时预留位置。关闭最后一个组成员或独立注册后释放线程，
-但永久阻塞或抵抗取消的线程继续占用预算，直到真实退出，不补建替代线程。
-每个循环默认最多接纳 64 个回调（在途与排队合计），排队期限 5 秒；满额和过期分别报告
-`LISTENER_CALLBACK_QUEUE_FULL`、`LISTENER_CALLBACK_TIMEOUT`，结束对应任务的监听。
-`on_error` 同样在所选循环执行并受限，无法执行时交给提交方循环异常处理器。
-限额由 `RuntimeOptions.max_listener_threads`、`max_pending_listener_callbacks`、
-`listener_queue_timeout_s` 配置，与默认同步线程池及外部端口线程预算分开。
-
-嵌入式 `close()` 先启动内核关闭；两种 SDK 均限时注销监听、取消尚未被线程领取的工作，
-不等待已经领取的同步回调。分组和独立模式也撤销未开始回调、请求取消在途回调，
-限时等待线程退出；无法停止的回调保留线程，丢弃迟到结果，不再交付后续事件。
-回调内可以关闭自身监听或 SDK，当前回调返回后自行退出其已关闭的专用循环。
-异步监听即使吞掉取消，也只能占用 `cancel_grace_s` 的清理等待；副作用可能继续，
-运行时会停止后续交付并遗弃迟到结果。
-已领取的回调视为在途：其外部副作用可能继续，运行时丢弃完成结果和异常，进程退出不会
-等待这些守护线程。永久阻塞的线程一直占用槽位，不会被超时终止或补建；所有槽位阻塞后，
-后续同步回调只能排队过期或因队列满而失败。需要观察最终回调须先 `wait()` 再 `close()`，
-但 `wait()` 本身不会为正在运行的回调设置执行期限。
-
-任务成功、失败、取消都交给 `on_done`；订阅、查询、回调异常交给
-`on_error(task_id, exception)`，随后结束该任务的监听，不改变业务任务状态。
-没有错误回调或错误回调自身失败时，由 asyncio 事件循环异常处理器报告。回调自行抛出
-`CancelledError` 按 `LISTENER_CALLBACK_FAILED` 上报；真正关闭监听时的取消仍正常传播。
-事件流提前结束不会冒充任务完成。慢回调可能触发现有的事件队列溢出，不会自动重试；
-需要重放时仍可用 `subscribe_task_events` 及 `after_sequence`。
-
-| 监听句柄操作 | 行为 |
-| --- | --- |
-| `await listener.wait()` | 等待调用时已经登记的任务监听完成；以后仍可提交新任务并再次等待 |
-| `await listener.close()` | 注销并取消排队回调，遗弃在途同步回调结果；不取消业务任务，可以重复调用 |
-
-取消 `wait()` 的调用者不会取消后台监听。同一个注册对同一任务 ID 只监听一次，
-所以重复提交幂等请求不会重复通知；去重 ID 保留到注销。多次注册得到独立的监听句柄。
-SDK `close()` 会停止监听，不保证交付尚未完成的回调，要收齐结果应先 `wait()`。
-监听流关闭或失败后 `wait()` 也会返回，因此业务成功要以 `on_done` 的任务状态为准。
-回调内部不能 `wait()` 自己的监听句柄，也不要吞掉取消信号。
-
-## 任务状态机
-
-统一能力层不新增状态，不写状态机。后台受理不等于完成；requires_attention 在非 succeeded 状态为 true，
-只是调用方观察提示。等待超时或 MCP/SDK 调用结束不证明物理停止，停止与重启核对仍由 runtime 负责。
-
-Agent 的图节点、会话检查点和本轮暂停只属于应用状态，不增加 `TaskState`；
-任务完成、取消和待对账仍以下述 runtime 状态为准。
-酒店的接待、等待同意、交接、护送、客人到达确认及服务完成也属于独立业务状态，由 `hotel_agent.service` 管理。
-播报只交付一次扬声器任务结果，既不是业务阶段，也不占用机器人租约。
-导航成功不等于客人到达；机器人已停止但未确认回到会合点时仍保留业务占用，不增加内核状态。
-未批准脚本调用只返回 Agent 工具失败观察，不创建机器人任务或增加 `TaskState`。
-共享 shell 和场景描述符只属于应用层；酒店错误归位保持错误码，脚本指纹变化仍拒绝恢复旧 pending，不改变任务状态机。
-SkillHost 保留执行批次开始前的加载集合与决策时的脚本指纹，不写 runtime 任务状态；宿主参数格式错误仍返回 INVALID_REQUEST。
-通用期限参数校验失败返回应用配置错误；导入酒店错误或业务数据类型仅加载对应契约。
-MCP 提交保留调用方的非空幂等键，真实事件保留原序号；等待超时、请求取消和连接断开不表示机器人已停止。
-酒店 MCP 后端关闭时先让 workflow 请求停止并保存实际结果，再关闭桥接连接；独立 runtime 服务继续运行。
-导览的等待确认、导航、介绍和完成属于 `guide_agent.service` 的业务状态；导航成功后才自动提交一次配置介绍。
-导览停止先撤销旧对话的动作权限，再请求 runtime 停止；未知提交/停止保留占用并待核对，重启不重放动作。
-重复唤醒不重置导览；ASR 中间结果不进入模型，最终输入事件持久化去重；麦克风与 ASR 引擎由外部适配器提供。
-
-目录按职责归类，任务状态、持久化与停止确认语义保持一致。
-`stop()` / `close()` 是运行时生命周期阶段，不增加业务任务状态；停止未确认仍落待对账。
-
-```
-CREATED → VALIDATING → QUEUED → RUNNING → SUCCEEDED
-                           │        │  ↕
-                           │        │  WAITING（等待资源互斥锁）
-                           │        ├→ FAILED
-                           │        └→ CANCELING → CANCELED
-                           └→ FAILED（校验未通过）
-
-重启恢复：UNKNOWN / RECONCILIATION_REQUIRED
-执行或取消无法确认停止：RUNNING / CANCELING → RECONCILIATION_REQUIRED
-```
-
-终态为 `SUCCEEDED`、`FAILED`、`CANCELED`、`UNKNOWN`、`RECONCILIATION_REQUIRED`。
-
-注册式监听只观察这些状态，不增加新的状态或写入状态。`on_done` 包含所有终态，
-表示本次任务已结束，不等于成功；`on_error` 及回调队列满、排队超时也不改变机器人任务状态。
-`submit_and_wait` 只等待现有终态，不增加任务状态；`TASK_WAIT_TIMEOUT` 是调用方等待错误，
-不把业务任务改为超时或取消，区别于任务总期限的 `TASK_TIMEOUT`。
-监听的调用方/分组/独立执行方式只决定回调归属，不增加状态或改变业务任务的执行位置。
-`from_platform` 从厂商平台装配原有端口并保留线程分组，不增加任务状态；驱动断连、响应不可信或停止未确认，仍通过
-技能错误进入现有失败、停止确认和待对账流程。
-线程选择不增加任务状态；共享组被阻塞时仍按原有期限、停止确认和资源隔离规则处理。
-尚未派发的技能在排队期间单步期限到期为 `FAILED / SKILL_TIMEOUT`，总期限到期为
-`FAILED / TASK_TIMEOUT`，撤销后不会补执行或隔离该技能实例。已开始且无法确认停止的
-调用仍进入待对账并隔离资源；软件状态不证明机器人已经停止。
-
-CC API 的 `audio.speak` 在启动受理后保持 `RUNNING`，收到匹配 `workId` 的
-`cc.api.work.finished` 才成功。首版按约定不解析 finished 的结束原因，外部停止/失败
-如果也发出该事件，同样被视为成功。运行时主动取消仍等待停止确认后进入 `CANCELED`；
-停止未确认进入 `RECONCILIATION_REQUIRED / EXECUTION_UNRESPONSIVE`。
-不支持取消的真实调用不会被强制取消；支持取消的调用也须正常成功返回或显式抛
-`TaskCancelled` 确认停止，仅 `CancelledError` 不足以证明物理动作已停止。只有执行已结束的
-超时技能才报告 `FAILED / SKILL_TIMEOUT`。总期限到期且未派发或确认已停止时报告
-`FAILED / TASK_TIMEOUT`；停止不明仍进入待对账。
-
-无法确认停止时，该技能实例与它声明的资源在当前运行时内被隔离，等待者和新任务都不能
-因为软件任务已结束而复用资源，报告 `RESOURCE_QUARANTINED`。迟到结果不会把任务改回
-成功，也不会在终态后追加进度。隔离不会因线程后来返回而自动解除；重新创建运行时或
-适配器前必须先确认旧动作已停止，重启不等于硬件停止确认。
-
-技能**正常返回失败**时，是否释放资源由 `SkillResult.action` 决定：
-
-| `action` | 处理 |
-| --- | --- |
-| `None` | 适配器尚未接入该声明，沿用原有行为，不据此推断静止 |
-| `executed="none"` | 一步未执行，释放资源并按 `FAILED` 结束 |
-| `executed="some"` + `stopped=True` | 执行过且已确认静止，释放资源并按 `FAILED` 结束 |
-| `executed="some"` + `stopped` 非 `True`，或 `executed="unknown"` | 隔离资源，任务落 `RECONCILIATION_REQUIRED / EXECUTION_UNSETTLED` |
-| `operator_required=True` | 无论执行多少都隔离，等待人工恢复 |
-
-`ActionOutcome` 只陈述执行事实，不解释硬件语义；`stopped=True` 只能由适配器在观察到
-执行器静止后给出。新增该字段的适配器不需要改动内核判断。
-
-## 重启恢复语义
-
-运行时**不会**因为数据库里是 `RUNNING` 就重放任务。`start()` 时对每个非终态任务：
-
-1. 若注入了 `Reconciler` 且它返回权威终态（`SUCCEEDED` / `FAILED` / `CANCELED` / `UNKNOWN`），采信该状态；
-2. 否则（无 reconciler、reconciler 抛异常、返回不确定结果）任务落入
-   `RECONCILIATION_REQUIRED`，等待人工或上层介入。
-
-这条规则用于避免重复执行非幂等的物理动作。
-
-## 模块结构
-
-仓库包含统一能力包 `capabilities/`、共享 Agent 内核 `agent-core/`、三个 Agent 应用 `agent/`、`hotel-agent/` 与 `guide-agent/`、
-`mcp_bridge/` 接入包与 `src/robot_agent_runtime/` 运行时包，分别打包。
-依赖方向是协议/应用 → capabilities → runtime；runtime 不反向依赖上层。接入边界见各子项目说明。
-
-```text
-capabilities/src/robot_agent_capabilities/
-├── client.py        RobotCapabilities、稳定操作、后台提交与有限等待
-├── catalog.py       工具目录、白名单、命名和参数 schema
-├── observations.py  共享 Observation 与事实转换
-├── ports.py         TaskRuntime 客户端 Protocol
-├── errors.py        能力层结构化错误
-├── __init__.py      SDK 入口
-└── py.typed         类型标记
-```
-
-```text
-agent-core/src/robot_agent_core/
-├── graph.py         LangGraph 决策、执行、观察与路由
-├── state.py         图状态与稳定动作标识
-├── models.py        决策模型 Protocol 与 ChatOpenAI 适配
-├── ports.py         图工具 ToolSet，复用能力包 TaskRuntime/Observation
-├── errors.py        应用结构化错误
-├── validation.py    与装配无关的通用期限校验
-├── shell.py         输入、单轮图调用、结果基础信封、错误状态与公共循环
-├── config.py        标准库依赖的不可变配置快照（携带 profile）
-├── configuration.py StorageProfile、存储/身份解析、重建与启动一致性校验
-├── cli.py           参数校验、状态目录约定、模型生命周期、错误脱敏与退出码
-└── skillkit/        Agent Skills 宿主，按模块导入不做统一装配
-    ├── catalog.py   Skills 目录、校验、受控文档加载与 bundled(package)
-    ├── host.py      宿主 schema/指导/handler、脚本指纹与批次状态
-    ├── scripts.py   注册脚本执行、指纹与期限校验
-    ├── selection.py 用户查看目录与显式技能选择
-    └── versions.py  图执行与显式选择共用的正文/版本校验
-```
-
-```text
-agent/src/robot_agent/          # 通用机器人 agent，入口 robot-agent
-├── app.py                      CLI、凭据前提、CC 原生连接所有权与启动装配
-├── profiles.py                 ROBOT_PROFILE：后端白名单与固定库文件名
-├── application.py              机器人装配、SDK/平台生命周期与交互错误策略
-├── robot_tools.py              统一能力的图工具格式与旧操作身份适配
-└── __main__.py                 模块入口
-```
-
-```text
-hotel-agent/src/hotel_agent/    # 酒店 agent，入口 hotel-agent
-├── app.py                      CLI、凭据前提、profile 归属校验与启动装配
-├── profiles.py                 HOTEL_PROFILE：后端白名单与七个库文件名
-├── application.py              酒店装配、可信确认、客人会话与关闭顺序
-├── models.py                   酒店服务阶段与业务记录
-├── errors.py                   酒店业务错误，保持 HOTEL_WORKFLOW_REJECTED
-├── repository.py               业务持久化、版本与机器人租约
-├── service.py                  接待门禁、阶段规则、回位、播报和恢复
-├── task_coordination.py        带期限的提交、查询、取消与观察原语
-├── tools.py                    模型可用酒店工具与业务事实
-├── simulator.py                从大厅初始化的酒店导航与播报模拟器
-├── backend.py                  HotelBackend 端口、已核验入住凭据与 SimulatedHotel
-├── script_bindings.py          按活跃资源指纹选择可批准的发布脚本
-├── adapters/
-│   └── mcp.py                  MCP 连接装配、必需技能检查与连接生命周期
-├── skills/                     三个独立酒店 Skill，含资料和酒店专属脚本
-└── __main__.py                 模块入口
-```
-
-```text
-guide-agent/src/guide_agent/
-├── app.py           CLI、配置与模型生命周期
-├── profiles.py      独立的导览存储与后端策略
-├── application.py   对话队列、停止优先处理与共享图装配
-├── ports.py         唤醒/最终话语输入事件端口
-├── interaction.py   文本与 NDJSON 有界输入
-├── catalog.py       Skill 地点目录、事实快照与地图目标校验
-├── tools.py         查找、介绍、带路建议、查询与取消工具
-├── service.py       确认、导航、自动介绍、停止与恢复
-├── models.py        导览业务快照
-├── repository.py    SQLite 事件去重、动作意图与机器人租约
-├── runtime.py       模拟器和 MCP 连接装配
-├── errors.py        导览结构化错误
-├── skills/venue-guide/ 导览方法与可配置资料
-└── __main__.py      模块入口
-```
-
-```text
-mcp_bridge/src/robot_runtime_mcp/
-├── server.py        MCP 工具、真实事件批次与 UDS 客户端装配
-├── tool_schemas.py  统一能力协议信封、嵌套 schema 引用转换
-├── client.py        MCP 任务客户端、事件回放与 stdio 生命周期
-├── errors.py        结构化远端错误与传输结果不确定错误
-└── __main__.py      robot-runtime-mcp stdio 入口
-```
-
-实现按职责归类；根目录只保留公共契约、配置与命令行入口。
-
-```text
-src/robot_agent_runtime/
-├── models.py              任务、事件、技能数据模型
-├── errors.py              结构化错误
-├── ports.py               外部能力与 RobotPlatform 装配契约
-├── schemas.py             JSON Schema 边界复述，供被简化 schema 的客户端使用
-├── options.py             运行时容量、期限和快照配置
-├── thread_binding.py      外部对象线程归属配置
-├── __main__.py            命令行组装入口
-├── kernel/                内核任务执行与状态
-│   ├── core.py            生命周期与公开任务 API
-│   ├── task_state.py      唯一状态写入点
-│   ├── executor.py        步骤编排、超时与停止确认
-│   ├── resources.py       资源互斥与隔离
-│   ├── events.py          历史回放与实时事件
-│   ├── policy.py          准入规则与本地 AdmissionValidator
-│   ├── registry.py        技能查找
-│   └── recovery.py        重启状态核对
-├── hosting/               内核托管与外部调用边界
-│   ├── kernel_host.py     内核装配、线程与分阶段关闭、请求和事件交接
-│   ├── thread_runtime.py  固定循环线程与真实完成结果
-│   ├── isolation.py       外部端口代理与线程分配
-│   ├── boundary.py        有界快照与外部结果净化
-│   └── execution_context.py  控制容量上下文
-├── repositories/          仓储实现
-│   ├── memory.py          InMemoryTaskRepository
-│   └── sqlite.py          SQLiteTaskRepository
-├── transport/             UDS 服务与协议
-│   ├── server.py          RuntimeServer
-│   └── wire.py            NDJSON 成帧与编解码
-├── sdk/                   应用调用接口
-│   ├── embedded.py        RobotRuntime 与保留线程绑定的 from_platform 装配
-│   ├── remote.py          RemoteRuntime
-│   ├── listeners.py       TaskListener
-│   ├── task_waiting.py    两种 SDK 共用的提交与终态等待、独立等待期限
-│   ├── callback_executor.py  默认同步回调执行器
-│   └── listener_execution.py  监听分组/独立循环、容量与回调桥接
-└── adapters/              机器人能力实现
-    ├── cc_api/            CC 厂商接入包
-    │   ├── __init__.py    导出类和工厂，不创建连接
-    │   ├── contracts.py   CcApiClient / CcApiResponse 厂商 SDK 协议
-    │   ├── platform.py    CcApiPlatform 与 create_cc_api_platform
-    │   ├── driver.py      请求响应、订阅分发和 SDK 回调桥接
-    │   └── speech.py      语音参数、完成与停止确认
-    └── simulator.py       模拟技能、状态源与对账器
-```
-
-| 原模块（已移除旧入口） | 当前实现路径 |
-| --- | --- |
-| `core`、`executor`、`task_state`、`resources`、`events`、`policy`、`registry`、`recovery` | `kernel.<同名模块>` |
-| `kernel_host`、`thread_runtime`、`isolation`、`boundary`、`execution_context` | `hosting.<同名模块>` |
-| `repository` / `sqlite_repository` | `repositories.memory` / `repositories.sqlite` |
-| `server` / `wire` | `transport.server` / `transport.wire` |
-
-表中的路径均以 `robot_agent_runtime.` 开头。旧根目录模块已删除，所有导入和补丁路径
-均使用当前实现路径。`sdk` 的公开导入保持一致。
-托管层负责代理与内核装配；内核只依赖普通端口及 `AdmissionValidator`，不依赖 `hosting`。
-
-## 技能定义
-
-每个技能声明自己的契约，由运行时统一执行校验、加锁、超时与取消：
-
-```python
-SkillDefinition(
-    name="navigation.navigate_to",
-    version="1.0.0",
-    description="让机器人移动到 target 指定的地点；成功表示已到达，不表示路径最优。",
-    input_schema={
-        "type": "object",
-        "required": ["target"],
-        "properties": {"target": {
-            "type": "string",
-            "minLength": 1,
-            "description": "业务定义的地点标识（站点名或房间号），不是坐标。",
-        }},
-    },
-    resources={"base"},          # 同名资源上的技能串行执行
-    permissions={"robot.navigation"},
-    preconditions={"estop.clear", "battery.sufficient"},
-    timeout_s=30,
-    supports_cancel=True,
-)
-```
-
-`description` 与参数级 `description` 是给模型看的语义，不参与校验。工具 schema 组装时，
-`robot_agent_runtime.schemas.describe_bounds()` 会把 `minimum` / `minLength` / `maxItems`
-等边界复述进对应节点的 description：schema 仍是唯一执行点，复述只是防止客户端简化
-schema 后模型看不到边界。`description` 为空时 `RobotTools` 回退到内置兼容表。
-
-实现 `ports.Skill` Protocol 即可接入：`definition` 属性 + `async execute(context, params)`。
-
-## 厂商接入包
-
-任务内核通过 `Skill`、`RobotStateProvider`、`Reconciler` 执行机器人操作。SDK 的
-`RobotRuntime.from_platform(...)` 消费 `RobotPlatform`，从中取得这三个端口并构造运行时。
-厂商包提供实现该契约的平台、工厂、驱动和技能。新增厂商可放在
-`adapters/vendor_x/` 或独立 Python 包中；应用选择相应工厂并传入配置，运行时和其他
-厂商模块不需要添加分支。原生 SDK 依赖留在对应部署环境，普通导入不加载原生库。
-
-```python
-from robot_agent_runtime.adapters.cc_api import create_cc_api_platform
-from robot_agent_runtime.ports import RobotPlatform
-
-# api 由应用创建并连接；不同厂商的工厂可以接受自己的 SDK 或配置。
-platform: RobotPlatform = create_cc_api_platform(api, skill_thread_group="audio")
-try:
-    await platform.start()
-    runtime = RobotRuntime.from_platform(repository, platform, allowed_permissions={"audio"})
-    try:
-        await runtime.start()
-        task = await runtime.submit_task(request)
-        # 业务代码查询状态或监听任务事件。
+            idempotency_key="announcement-1",
+        ))
+        print(final.state)        # TaskState.SUCCEEDED
     finally:
         await runtime.close()
-finally:
-    await platform.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-工厂在调用方装配对象，不改变运行时的线程绑定机制。平台启动、关闭与驱动操作应在
-同一应用循环进行；厂商 SDK 的回调通过驱动桥接。平台生命周期由应用负责，
-`RobotRuntime` / `RuntimeServer` 不自动启动或关闭它。资源停止无法确认时，先保留
-运行时的待对账与隔离结果，再释放通信资源，不能用释放连接表示物理动作已经停止。
+更多可运行示例见 [examples/README.md](examples/README.md)（嵌入式、远程、前置条件、CC 语音）。
 
-平台可在 `skills` 中混合提供裸技能与 `ThreadBinding.shared/group/dedicated`，状态源和
-对账器也可声明绑定。`from_platform` 将这些值原样传给宿主，不解包或重新选择线程。
-裸对象保持独占，同组对象共用一个线程且共享同步阻塞的影响；不同组和独占线程各自运行。
-容量按实际线程加声明校验线程计算。绑定只决定运行时的调用位置，平台启停仍操作原始对象。
-需及时交付前置条件的状态源应保持独占，避免与可能阻塞的技能共用循环。
+## 四种接入方式
 
-`RobotPlatform` 不规定厂商必须有 request、callback 或 workId；HTTP、原生同步 SDK、
-ROS 2 都可在自己的驱动和技能里转换。`adapters.cc_api.contracts` 中的 `CcApiClient` /
-`CcApiResponse` 描述 CC SDK 边界，通用 `ports.py` 只保留厂商无关的运行时契约。
-未实现状态源或对账器时明确返回 `None`，不推测设备可用或动作已经完成。
+| 方式 | 适用 | 入口 |
+| --- | --- | --- |
+| 嵌入式 SDK | 同进程，最短路径 | `RobotRuntime`，见 [SDK 参考](docs/sdk-reference.md) |
+| 远程 SDK | 跨进程，UDS + NDJSON | `robot-agent-runtime serve --socket ...` |
+| MCP stdio | 客户端拉起的子进程（Codex / Claude Code / WorkBuddy） | `python -m robot_runtime_mcp` |
+| MCP HTTP | 跨机接入，或客户端无法管理子进程 | `--mode http --token-env ...`，端点 `/mcp` |
 
-## CC API 语音播报
+四种方式暴露同一份工具目录与准入语义；HTTP 模式额外要求 Bearer 令牌，默认只监听 `127.0.0.1`。
+接入步骤见 [统一接入说明](docs/agent-integration.md)。
 
-`create_cc_api_platform` 接受已连接、专用的 `ubt_robot.Api` 实例，装配驱动和
-`audio.speak` 技能。首版无状态源和对账器。平台管理请求、订阅和技能，应用继续管理
-SDK 的 initialize/start/stop，不自动重连。
+## 五个概念
 
-工厂参数 `skill_thread_group` 默认为 `None`，保持技能独占；显式传入非空组名时，
-平台返回 `ThreadBinding.group(skill, name)`。语音 demo 显式使用 `"audio"`，保留示例原有
-分组。技能本身仍把厂商通信交回驱动所属的应用循环，此分组配置不迁移 SDK 连接。
+| 概念 | 含义 | 谁负责 |
+| --- | --- | --- |
+| **技能（Skill）** | 一个可执行能力：输入 schema、占用资源、权限、前置条件、能否取消 | 适配器实现，内核执行 |
+| **任务（Task）** | 一到多步技能的顺序执行，11 态状态机，落库可恢复 | 内核 |
+| **前置条件** | `estop.clear`、`battery.sufficient` 这类机器条件，提交时与每步执行前各判一次 | 内核 |
+| **资源** | 物理互斥单位（`base`、`speaker`）——同一资源上的任务串行 | 内核 |
+| **ActionOutcome** | 失败之后「到底动没动」：`executed` 三态 + `stopped` 三态 + `operator_required` | 适配器报告，内核据此决定能否释放资源 |
 
-直接构造 `CcApiSpeechSkill(api)` 时会创建独占驱动：
+`ActionOutcome` 是这套设计里最关键的一条：**失败不等于没动**。无法确认静止时，内核在释放
+资源锁之前隔离该资源，任务进入 `reconciliation_required`，后续提交被拒——而不是让下一个
+任务去撞一台还没停稳的机器。
 
-```python
-from robot_agent_runtime.adapters.cc_api import CcApiSpeechSkill
+## 设计取舍
 
-speech = CcApiSpeechSkill(api)
-await speech.start()
-runtime = RobotRuntime(
-    InMemoryTaskRepository(), {"audio.speak": speech}, allowed_permissions={"audio"},
-)
-```
+- **唯一信任边界。** 准入、资源、停止确认只在 `RuntimeCore` 里判。上层（MCP 桥、SDK、
+  业务 Agent）可以预检、可以解释，但不能替代判定，也不该复制一份。
+- **内核零厂商依赖。** 不依赖厂商 SDK、ROS 2 或云端服务；硬件经 `ports.py` 的 Protocol
+  注入。换机器不改内核，新增厂商不改内核。
+- **失败给事实，不给建议。** 内核返回「执行了多少、是否静止、是否需要人」，不返回
+  「建议重试 / 建议改道」。业务含义由业务层解释。
+- **能力与业务分离。** 本仓库不授予酒店或导览的业务确认权，也不做跨业务的机器人调度。
 
-提交参数为 `{"message": "你好，我是机器人"}`。技能声明 `speaker` 资源互斥、`audio`
-权限、空前置条件、30 秒默认超时和支持取消。底层发送 `cc.api.work.start`，技能码
-`A000001`，语速与音量均为 50；每次播报具有独立 `traceId`。
+## 文档
 
-启动回调提供 `workId`，适配器按它匹配 finished，允许 finished 早于启动回调到达。
-取消、超时和关闭时只停止当前 work，停止请求受理不等于停止完成，还需要 finished。
-停止清理最多等待 5 秒；断连、缺失 workId 或停止未确认后，该实例拒绝继续播报。
-运行时只等待配置的停止确认期，可能先于适配器的 5 秒清理期限进入待对账状态；此时
-speaker 资源保持隔离。应用需要先确认旧播报已经结束，再建立新连接和适配器。
-首版不提供重启对账，也不自动重试播报。
-
-CC API 适配器保留 `start()` 时所属的应用循环，跨线程执行会交回该循环；厂商请求与
-回调不会在内核循环执行。应用循环阻塞也可能拖住适配器的停止确认，此时按上述规则隔离。
-
-运行示例使用底层异步回调接口，将回调转回 asyncio；不调用 `cc_api/` 中包含阻塞等待的
-`RobotClient`。SDK 的连接启动和停止放在事件循环之外。
-`CcApiDriver` 独占该连接的 finished 和 disconnect 回调。多个技能共用同一个驱动时，
-通过 `subscribe_finished` / `subscribe_failure` 订阅；返回的函数仅注销本次订阅。
-`CcApiSpeechSkill(driver)` 不拥有共享驱动，关闭技能只删除自己的订阅，驱动由平台或
-应用最后关闭。直接操作同一 Api 对象覆盖这些回调仍不受支持。
-
-驱动把回调响应净化为快照后交接，不把厂商响应对象带到运行时。普通请求与控制请求
-分别受 `RuntimeOptions.max_pending_calls` / `max_control_calls` 限制，停止请求使用
-保留的控制容量；响应等待受 `port_timeout_s` 限制。SDK 回调缓冲受 `max_event_buffer`
-限制，满额报告 `EVENT_STREAM_OVERFLOW` 并关闭该驱动的后续准入。响应超时、断连和
-无效响应也会失败关闭，已发送动作可能仍在执行，需要停止确认或对账。
-已下发请求的等待被取消时同样拒绝后续准入，防止丢弃启动响应后重复发送物理动作。
-请求被厂商明确拒绝时保留 `vendor_code`，允许应用之后另行提交，不自动重试。
-
-语音示例按用途分为三个独立入口，原入口的参数和行为保持不变：
-
-| 入口 | 用途 |
+| 文档 | 内容 |
 | --- | --- |
-| [cc_api_speech_minimal_demo.py](examples/cc_api_speech_minimal_demo.py) | 首次接入：`submit_and_wait()` 直接取得终态，不注册任务监听 |
-| [cc_api_speech_callback_demo.py](examples/cc_api_speech_callback_demo.py) | 回调监听：提交前注册一个监听，等待通知完成后查询结果；监听异常向调用方抛出 |
-| [cc_api_speech_demo.py](examples/cc_api_speech_demo.py) | 原有双监听 caller/dedicated 与阻塞实验，保留所有旧命令行参数；监听异常只打印 |
+| [架构与模块结构](docs/architecture.md) | 分层、线程归属、模块路径、当前范围 |
+| [SDK 与公开 API](docs/sdk-reference.md) | 公开方法、监听执行模式、关闭顺序 |
+| [生命周期、前置条件与恢复](docs/lifecycle.md) | 状态机、重启核对、降级行为 |
+| [技能定义与厂商接入](docs/adapters.md) | `SkillDefinition`、`RobotPlatform`、CC 语音 |
+| [统一接入说明](docs/agent-integration.md) | 外部 Agent 接入的最短路径 |
+| [任务执行与恢复详解](docs/task-execution-and-recovery.md) | 端到端流程、持久化差异、Reconciler 范围 |
+| [测试与验证边界](docs/testing.md) | 覆盖了什么，没覆盖什么 |
+| [变更记录](CHANGELOG.md) | 行为变化与兼容性 |
 
-三份均提供 `speak(api, message) -> Task`，原入口还保留线程实验的关键字参数。
-完整阅读顺序见 [示例索引](examples/README.md)。在装好 `ubt_robot` 的 Linux ARM64
-环境中，首次调用可以执行（`CC_API_TOKEN` 通过部署环境传入）：
+子项目：[capabilities/](capabilities/README.md) · [mcp_bridge/](mcp_bridge/README.md) ·
+[agent-core/](agent-core/README.md) · [agent/](agent/README.md) ·
+[hotel-agent/](hotel-agent/README.md) · [guide-agent/](guide-agent/README.md)
 
-```bash
-python3 examples/cc_api_speech_minimal_demo.py \
-  --api-id YOUR_API_ID --address ROBOT_IP:48159 --message '你好，我是机器人'
-```
+## 边界与成熟度
 
-查看回调时执行 `examples/cc_api_speech_callback_demo.py`，使用相同连接参数。它打印
-`[EVENT]`、`[DONE]` 和 `[LISTENER ERROR]`，采用默认调用方执行，不包含线程切换或阻塞。
-业务失败仍通过最终 Task 表达，监听失败在 `listener.wait()` 后抛出。
+**已实现**：运行时内核、技能框架、Python SDK（嵌入式 + 远程）、UDS 守护进程、SQLite 持久化、
+模拟适配器、厂商接入契约、CC 语音技能、注册式任务监听、有界停止确认与失控资源隔离、
+任务总期限、事件分页与有界关闭。
 
-原 `cc_api_speech_demo.py` 专门保留线程实验：注册两条任务监听，两条的 `execution`
-可以分别指定。`--listener-block` 让监听1 在
-第一条事件里同步 `time.sleep(N)`，`[REPORT]` 给出监听2 相邻事件的最大间隔：
+**未实现**：调度器（`priority` 已持久化但不参与排序，无并发上限与抢占）、结构化日志、
+自动重规划、回调进程隔离、云端管理平面。
 
-| 监听1（阻塞） | 监听2（测量） | 监听2 的 `longest_gap` | 原因 |
-| --- | --- | --- | --- |
-| `caller` | `caller` | ≈ N | 两条异步回调共用一个提交方循环 |
-| `caller` | `dedicated` | ≈ N | 回调虽在独立线程，事件仍经提交方循环投递 |
-| `dedicated` | `caller` | 毫秒级 | 阻塞留在监听1 自己的线程 |
-| `dedicated` | `dedicated` | 毫秒级 | 两条各占一个回调线程 |
+**尚未在真实硬件上验证**：真实模型凭据下的规划质量与动作效果（协议层用本地 HTTP 测试服务验证）；
+酒店/导览的导航目标需部署方填入地图数据；未见连接真实麦克风/ASR 或随行检测。
 
-```bash
-# 默认组合：监听2 被一起卡住约 2 秒。
-python3 examples/cc_api_speech_demo.py --api-id YOUR_API_ID --address ROBOT_IP:48159 \
-  --message '你好' --listener-block 2
+**不是功能安全**：线程边界保护内核不被阻塞的 Python 回调拖住，不提供硬实时保证；
+真正的急停必须是硬件回路，这里的 `estop.clear` 只做准入判定，不是安全仪表功能。
 
-# 只把监听2 挪到独立线程：仍然会被卡住，因为上游投递还在提交方循环。
-python3 examples/cc_api_speech_demo.py --api-id YOUR_API_ID --address ROBOT_IP:48159 \
-  --message '你好' --listener-block 2 --listener2-execution dedicated
+## 许可
 
-# 把阻塞的监听1 挪到独立线程：监听2 不再受影响。
-python3 examples/cc_api_speech_demo.py --api-id YOUR_API_ID --address ROBOT_IP:48159 \
-  --message '你好' --listener-block 2 --listener1-execution dedicated
-```
-
-每次回调打印 `[秒] 监听名 事件名 thread=线程名#id`；`dedicated` 的线程名是
-`rar-listener-dedicated`，两条监听各一个线程 id。示例在报告和关闭前等待两个监听
-交付完成，`listener2_events` 统计第二个监听实际收到的事件数。
-
-在项目根目录的 Python 调用方中，可以直接取得最终 `Task` 快照（`api` 须已连接）：
-
-```python
-from examples.cc_api_speech_minimal_demo import speak
-from robot_agent_runtime.models import TaskState
-
-final = await speak(api, "你好，我是机器人")
-print(final.id, final.state)
-if final.state == TaskState.SUCCEEDED:
-    output = final.result["steps"][0]["output"]
-    print(output["message"], output["spoken"], output["work_id"])
-elif final.error is not None:
-    print(final.error.code, final.error.message, final.error.details)
-```
-
-`speak()` 等待任务终态并清理运行时和适配器后返回；任务执行或参数校验失败也会返回
-`Task`，通过 `state` 和 `error` 判断原因，连接初始化与清理异常仍向调用方抛出。
-SDK 连接继续由调用方管理。最小示例通过 `submit_and_wait()` 取得最终快照，无需监听或
-结果 Future；回调示例使用 `submit_task()`、`listener.wait()` 和最终查询。
-原线程实验的两条监听打印事件、终态和监听异常，第二条作为共享循环阻塞实验的对照，
-该实验的监听异常不替代业务任务结果。三个命令行入口都保留最终结果输出，任务失败时以异常退出。
-返回值为运行时整理后的结果，不包含 CC API 的完整原始响应。
-
-运行在机器人本机时可省略 `--address`。SDK 不属于内核依赖，宿主常规导入不需要它。
-容器中的自动测试使用假回调 API，不连接机器人；真实发声和机器人结束事件仍需现场验证。
-
-## 机器人状态前置条件
-
-急停、低电、底盘锁定这类**机器人自身的状态**不是任务状态，不占 `TaskState` 的取值。技能
-用 `preconditions` 声明自己需要哪些条件成立，`RobotStateProvider` 报告当前**不成立**的条件
-标签集合，运行时只做集合求交：
-
-```python
-blocked = skill.definition.preconditions & await provider.unsatisfied()
-```
-
-标签对运行时是不透明的。`battery.sufficient` 具体是电压阈值还是 SOC 百分比由适配器决定，
-所以内核里没有任何机器人领域模型。**急停因此不是特例**——它只是一个几乎所有运动技能都会
-声明的标签。
-
-判定发生在三个时刻，对所有条件一视同仁：
-
-| 时刻 | 位置 | 不满足时 |
-| --- | --- | --- |
-| 提交准入 | `PolicyEnforcer`，整单取一次快照 | 整单 `FAILED` + `PRECONDITION_FAILED` |
-| 每步启动前 | `WorkflowExecutor`，取到资源锁之后、`SKILL_STARTED` 之前 | `FAILED` + `PRECONDITION_FAILED`，该步未执行 |
-| 执行中条件变化 | `RuntimeCore` 消费代理转交的 `provider.watch()` 推送 | 先置 `cancel_event`，再记原因；确认停止则 `CANCELED`，无法确认则待对账 |
-
-只有**声明了**已损坏标签的技能会被打断：急停期间一个正在播放的语音任务不受影响，因为
-`audio.speak` 没有声明 `estop.clear`。
-
-未注入 `RobotStateProvider` 时整条检查跳过。读取状态失败按**失败关闭**处理——读不到机器人
-不等于机器人可用，提交会以 `INTERNAL_ERROR` 失败。`watch()` 可以返回一个立即耗尽的迭代器，
-此时降级为仅检查点模式：仍然不会启动机器人做不到的事，但已经在跑的任务不再被打断。
-
-> 这套机制是**软件层面**的准入与打断，不是功能安全。真正的急停必须是硬件回路；这里做的
-> 是在硬件已经断电之后让软件状态与事件记录追上现实。
-
-### 两个模拟实现
-
-`adapters/simulator.py` 提供两个 `RobotStateProvider`，区别是标签从哪来：
-
-| 类 | 标签来源 | 用途 |
-| --- | --- | --- |
-| `SimulatedRobotState` | 调用方直接给，`set_unsatisfied({...})` | 测试替身，精确控制时序 |
-| `SimulatedRobot` | 从模拟读数**推导**，`set_estop()` / `set_voltage()` / `drain()` | 贴近真实适配器的参考实现 |
-
-`SimulatedRobot` 多做两件真实适配器必须做、测试替身不需要做的事：
-
-- **滞环**：电压掉到 `low_voltage` 以下才破，回到 `recovery_voltage` 以上才恢复。没有这个带宽，
-  一块停在阈值上的电池会反复抖动，每次推送都打断刚起来的任务。
-- **无变化不推送**：重新推导出同一个集合就不发，否则一个 10 Hz 的传感器会每秒唤醒运行时 10 次
-  去重算同一个答案。
-
-电池阈值要留够开回充电桩的余量——被打断的导航会把机器人**停在原地**，阈值定得太低这套机制
-救不了场，只是换个姿势搁浅。同理 `power.charge` 这类技能**绝不能**声明 `battery.sufficient`，
-否则电量低时连充电都会被拒。
-
-`examples/precondition_demo.py` 把三个时刻跑成一个可执行脚本：满电准入 → 行进中电量跌破阈值
-被打断 → 同一块电量下导航被拒而语音播报照常完成。
-
-## 内部分工
-
-三个模块的边界是“谁可以写状态”：
-
-- `TaskStateStore` 持有六个以 task id 为键的字典（任务、锁、序号、取消事件、进度任务、
-  执行任务），并提供唯一的 `transition()`。它在持有该任务锁的前提下把快照与事件交给仓储
-  一次原子写入，再把权威结果回填到活的 `Task` 对象，最后才发布到事件总线。
-- `WorkflowExecutor` 自身无状态，只负责顺序：申请资源 → 带超时启动技能 → 把结果、超时、
-  取消、意外异常映射成恰好一次终态转换。
-- `RuntimeCore` 负责生命周期（启动恢复、关闭）与公开 API，并在提交时完成校验。
-- `KernelHost` 拥有内核线程，外部端口代理拥有自己的循环；真实调用结束与“取消请求已发送”
-  分开记录。跨线程超时不会被当作物理动作已经停止的证据。
-
-所有带 guard 的转换都走同一把任务锁，因此“取消请求”与“执行推进”是公平竞速，不存在已
-取消的任务又被推进成功的窗口。
-
-## 测试
-
-```bash
-docker start robot_core_ubuntu24
-docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m pytest -q'
-```
-
-本机验证使用保留的 `robot_core_ubuntu24` 容器，基于 `ubt-api-ubuntu24-ros2:latest`，
-项目挂载到 `/workspace/robot_core`。测试依赖及附带的 `ubt_robot 2.0.16` 已安装；
-验证后保留容器，下次直接复用。测试、语法检查和示例验证均在容器中执行。
-
-测试按关注点组织：`test_models` 契约、`test_core` 执行路径、`test_faults` 故障注入、
-`test_recovery` 重启恢复、`test_preconditions` 机器人状态前置条件、`test_sqlite_repository`
-持久化、`test_embedded_sdk` / `test_remote_sdk` 两种接入形态、`test_contracts` 供后续适配器
-复用的契约测试、`test_cc_api` 语音事件匹配与取消/断连边界、`test_task_listeners`
-统一回调注册、任务隔离与监听生命周期、`test_submit_and_wait` 两种 SDK 的终态等待、
-历史回放、幂等与并发、等待超时和取消隔离、`test_callback_executor` 守护线程退出、容量、
-排队期限与取消竞态；`test_listener_execution` 覆盖监听执行位置、组内阻塞、独立隔离、
-线程预算、排队撤销、远程接入与自关闭；`test_event_paging` 覆盖分页回放、实时去重和批次让出；`test_thread_runtime` / `test_isolation` / `test_kernel_host` /
-`test_execution_boundaries` / `test_runtime_isolation` 覆盖线程归属、阻塞外部代码、有限取消、
-仓储故障关闭、快照和资源隔离；`test_thread_bindings` 覆盖共享/分组/独占、配置冲突、
-实际线程容量、SDK/Server 接入及组内阻塞和取消边界。
-`test_thread_binding_boundaries` 覆盖状态源独占与组内阻塞的对照、空目标拒绝、排队调用
-超时撤销后可复用，以及线程名的配置归属。
-`test_package_layout` 覆盖新模块导入、旧入口移除、当前路径补丁及独立进程导入顺序。
-`test_runtime_ownership` 覆盖内核依赖方向、构造线程、分阶段停止、异常释放与校验隔离；
-`test_contracts` 包含本地和托管准入校验器的可复用契约，也用 CC 和非回调假厂商验证
-`RobotPlatform` 的共同装配契约。`test_cc_platform` 覆盖共享驱动、响应关联和快照、
-断连和过载、控制容量、平台启停及取消等待者后的真实清理，以及 CC 分组和 demo 策略。
-`test_cc_api_demos` 验证最小与回调示例的结果、事件交付、监听异常、启动失败清理，
-以及命令行的连接配置、错误退出和 SDK 连接释放。
-平台契约和嵌入式用例还验证混合绑定、实际线程容量、组内阻塞范围、状态源和对账器绑定。
-
-## 当前范围
-
-已提供独立统一能力 SDK 与原生 MCP 能力工具，外部 Agent 可直接调用，不经自研决策图。
-能力包不启动模型或机器人；权限、前置条件、资源互斥、停止确认及重启不重放仍以 runtime 为准。
-基础能力接入不授予酒店/导览业务确认权，也不新增跨业务的机器人共同调度机制。
-
-Agent 层由共享内核 `agent-core/` 与三个独立应用 `agent/`、`hotel-agent/`、`guide-agent/` 组成：
-LangGraph 工具闭环、模型接口适配、装配层存储/身份解析与被动配置快照、独立 SkillHost、
-固定加载边界的工具批次与 CLI 骨架都在内核；通用项目只剩 RobotTools 与 CC 装配，
-酒店项目只剩 HotelTools、业务确认、租约与三个 Skill 包；导览项目使用独立 GuideTools 与可配置的 venue-guide Skill。
-导览支持唤醒/最终话语输入、地点问答、可信带路确认、后台导航、到达自动介绍和停止；
-内置地点仅为演示，真实 MCP 导航需要部署方填入地图目标，尚未连接真实麦克风/ASR 或跟随检测。
-`--scenario` 与场景描述符注册表已删除，三个应用各自携带 `StorageProfile` 常量并在启动时
-核对快照归属，因此配置快照不能跨 agent 复用；后端白名单收窄为 robot `simulator|cc`、
-hotel/guide `simulator|mcp`，通用 agent 不再自带酒店 Skill，要用 Skill 必须给 `--skills-dir`。
-酒店可经 stdio MCP 桥接访问既有 runtime，保留原 HotelTools、业务确认和租约；
-独立接入包提供技能发现、稳定幂等提交、查询/取消和真实事件批次。本轮只支持本机 stdio，不提供 HTTP 服务。
-发布代码没有离线演示决策实现，命令行测试用的脚本替身分别留在 `agent/tests/scripted_models.py`
-与 `hotel-agent/tests/scripted_models.py`。
-已加载 Skill 正文与版本只由内核一份共享校验检查；通用模型、工具与脚本执行器的期限校验
-独立于任何应用常量，酒店业务实现按需导入。
-三份酒店脚本因包名与错误归位改写而指纹变化，旧 pending 脚本拒绝自动恢复；
-数据路径、任务身份和 JSON 错误码保持原样。
-Agent Skills 通用宿主保留三个独立业务包，用户可选择按需加载、读资料并执行注册脚本；
-酒店同名自定义技能可以只有文档；未批准脚本被跳过，控制命令及其他已批准能力继续可用。
-不合并整包，也不由酒店阶段硬编码切换正文。酒店应用保留模拟接待到护送闭环、独立客人确认与单机器人占用、
-后台导航与独立回位结果；未知停止和待人工归位保留占用。真实 PMS、导航硬件、随行感知与电梯尚未接入。
-真实模型协议使用本地 HTTP 测试服务验证，尚未使用真实模型凭据或硬件验证规划质量与动作效果。
-
-源码按 `kernel`、`hosting`、`repositories`、`transport`、`sdk`、`adapters` 职责归类，
-根目录只保留公共契约和配置，旧模块入口已删除。
-外部代理装配与整体关闭次序由托管层负责，内核支持保留仓储的停止阶段。
-
-已实现：运行时内核、技能层框架、Python SDK（嵌入式 + 远程）、UDS 守护进程、SQLite
-持久化、模拟适配器、厂商接入包契约、SDK 通用平台装配入口与 CC 平台工厂、共享 CC 驱动和语音技能、
-SDK 统一注册式任务监听（仅本客户端后续提交）、
-两种 SDK 的 `submit_and_wait` 终态等待与独立等待期限、
-同步回调的有界守护线程隔离与排队期限、监听回调调用方/分组/独立执行配置、
-同进程内核专用线程和外部端口共享/分组/独占配置、平台端口线程绑定透传、有限停止确认与失控资源隔离、
-任务总期限、控制容量预留、快照限额、事件分页及有界关闭缓冲。
-
-CC 语音示例按最小终态等待、单监听回调、双监听线程实验分开，入口与阅读顺序见
-[示例索引](examples/README.md)；原线程实验入口及参数保持不变。
-
-线程边界保护外部 Python 阻塞或不配合取消时的内核响应，不提供硬实时保证。原生扩展
-长期持有 GIL、进程退出或系统资源耗尽仍会影响整个进程；不能强制终止已经运行的线程。
-
-尚未实现：复杂 Agent 规划、多 Agent 协作与失败动作自动重规划、调度器（`priority` 字段已持久化但不参与
-排序，无并发上限与抢占）、有限重试、结构化日志、其他真实机器人能力适配（导航、
-ROS 2 等）、CC API 结束原因解析与重启对账、回调进程隔离与强制终止、云端管理平面。
+许可证尚未选定。在选定前，代码默认保留所有权利（All rights reserved），
+不构成任何形式的使用授权。商业使用前请联系仓库所有者。

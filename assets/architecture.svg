@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 620" width="960" height="620" role="img" aria-label="Robot Agent Runtime 分层架构">
+  <title>Robot Agent Runtime 分层架构</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8a94a6"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="960" height="620" fill="#ffffff"/>
+
+  <!-- 1. 外部客户端 -->
+  <g stroke="#d7dee8" stroke-width="1.2" fill="#f7f9fc">
+    <rect x="40" y="36" width="880" height="64" rx="10"/>
+  </g>
+  <g stroke="#d7dee8" stroke-width="1" fill="#ffffff">
+    <rect x="56" y="68" width="196" height="26" rx="6"/>
+    <rect x="262" y="68" width="196" height="26" rx="6"/>
+    <rect x="468" y="68" width="196" height="26" rx="6"/>
+    <rect x="674" y="68" width="230" height="26" rx="6"/>
+  </g>
+  <g font-family="-apple-system, 'PingFang SC', 'Segoe UI', sans-serif" fill="#1f2733" font-size="11.5" text-anchor="middle">
+    <text x="154" y="85">Codex</text>
+    <text x="360" y="85">Claude Code</text>
+    <text x="566" y="85">WorkBuddy 等 MCP 客户端</text>
+    <text x="789" y="85">自研 Python Agent / 策略脚本</text>
+  </g>
+
+  <!-- 2. 接入层 -->
+  <g stroke="#c3d4e8" stroke-width="1.2" fill="#eef4fb">
+    <rect x="40" y="126" width="420" height="76" rx="10"/>
+    <rect x="500" y="126" width="420" height="76" rx="10"/>
+  </g>
+
+  <!-- 3. 能力层 -->
+  <g stroke="#d7dee8" stroke-width="1.2" fill="#f7f9fc">
+    <rect x="40" y="232" width="880" height="76" rx="10"/>
+  </g>
+
+  <!-- 4. 内核 -->
+  <g stroke="#c99a4e" stroke-width="1.6" stroke-dasharray="6 4" fill="#fdfaf3">
+    <rect x="40" y="340" width="880" height="106" rx="10"/>
+  </g>
+  <g stroke="#d7dee8" stroke-width="1" fill="#ffffff">
+    <rect x="58" y="376" width="132" height="26" rx="6"/>
+    <rect x="198" y="376" width="132" height="26" rx="6"/>
+    <rect x="338" y="376" width="112" height="26" rx="6"/>
+    <rect x="458" y="376" width="112" height="26" rx="6"/>
+    <rect x="578" y="376" width="132" height="26" rx="6"/>
+    <rect x="718" y="376" width="186" height="26" rx="6"/>
+  </g>
+  <g font-family="-apple-system, 'PingFang SC', 'Segoe UI', sans-serif" fill="#33404f" font-size="11.5" text-anchor="middle">
+    <text x="124" y="393">任务状态机（11 态）</text>
+    <text x="264" y="393">准入与每步复查</text>
+    <text x="394" y="393">资源互斥</text>
+    <text x="514" y="393">事件与订阅</text>
+    <text x="644" y="393">隔离与核对恢复</text>
+    <text x="811" y="393">幂等重放 · SQLite / 内存</text>
+  </g>
+
+  <!-- 5. 适配器与机器人 -->
+  <g stroke="#d7dee8" stroke-width="1.2" fill="#f7f9fc">
+    <rect x="40" y="482" width="560" height="70" rx="10"/>
+  </g>
+  <g stroke="#c3d4e8" stroke-width="1.2" fill="#eef4fb">
+    <rect x="640" y="482" width="280" height="70" rx="10"/>
+  </g>
+
+  <!-- 标题与说明文字 -->
+  <g font-family="-apple-system, 'PingFang SC', 'Segoe UI', sans-serif" fill="#1f2733" font-size="13.5" font-weight="600">
+    <text x="56" y="60">外部 Agent 客户端</text>
+    <text x="58" y="150">MCP 桥（独立进程）</text>
+    <text x="518" y="150">Python SDK（robot-agent-capabilities）</text>
+    <text x="58" y="256">统一能力层 capabilities</text>
+    <text x="58" y="364">运行时内核 RuntimeCore —— 唯一信任边界</text>
+    <text x="58" y="506">适配器（经 ports.py 的 Protocol 注入）</text>
+    <text x="658" y="506">机器人硬件</text>
+  </g>
+
+  <g font-family="-apple-system, 'PingFang SC', 'Segoe UI', sans-serif" fill="#5b6776" font-size="11.5">
+    <text x="58" y="171">stdio：由客户端拉起</text>
+    <text x="58" y="189">http：Streamable HTTP · /mcp · Bearer</text>
+    <text x="518" y="171">嵌入式：同进程调用 RuntimeCore</text>
+    <text x="518" y="189">远程：UDS + NDJSON 请求/事件流</text>
+    <text x="58" y="277">工具目录 · 参数 schema 与边界复述 · 稳定动作身份（operation_id / idempotency_key）· 结果观察</text>
+    <text x="58" y="295">不启动模型，不直接操作机器人；准入、资源与停止确认一律以 runtime 为准</text>
+    <text x="58" y="430">急停与电量等前置条件在此判定；线程边界只隔离阻塞，不提供硬实时保证</text>
+    <text x="58" y="528">simulator　|　cc_api（语音、连接、停止确认）　|　vendor_x（新增厂商，内核零改动）</text>
+    <text x="658" y="528">Walker C1 EDU / 其他平台</text>
+  </g>
+
+  <g font-family="-apple-system, 'PingFang SC', 'Segoe UI', sans-serif" fill="#6b7686" font-size="11.5">
+    <text x="40" y="586">依赖方向单向：客户端 → 能力层 → 内核；适配器经 Protocol 注入内核，内核不反向依赖任何厂商 SDK、ROS 2 或云端服务。</text>
+  </g>
+
+  <!-- 连接线 -->
+  <g stroke="#8a94a6" stroke-width="1.3" fill="none">
+    <path d="M250,100 L250,126" marker-end="url(#arrow)"/>
+    <path d="M710,100 L710,126" marker-end="url(#arrow)"/>
+    <path d="M250,202 L250,232" marker-end="url(#arrow)"/>
+    <path d="M710,202 L710,232" marker-end="url(#arrow)"/>
+    <path d="M250,308 L250,340" marker-end="url(#arrow)"/>
+    <path d="M710,308 L710,340" marker-end="url(#arrow)"/>
+    <path d="M320,446 L320,482" marker-end="url(#arrow)"/>
+    <path d="M600,517 L640,517" marker-end="url(#arrow)"/>
+  </g>
+</svg>

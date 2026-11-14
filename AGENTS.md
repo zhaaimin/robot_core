@@ -2,8 +2,10 @@
 
 写给在本仓库里干活的编码 agent。
 
-项目是什么、公开 API、状态机、前置条件机制的**设计理由**都在 `README.md`，设计与实施计划在
-`docs/plans/`。本文件不重复这些，只写**怎么跑起来**、**什么不能改坏**、**代码长什么样**。
+项目是什么、公开 API、状态机、前置条件机制的**设计理由**都在 `README.md` 及其链接的
+`docs/` 专题文档里（`architecture.md`、`sdk-reference.md`、`lifecycle.md`、`adapters.md`、
+`testing.md`），设计与实施计划在 `docs/plans/`。本文件不重复这些，只写**怎么跑起来**、
+**什么不能改坏**、**代码长什么样**。
 
 ## 定位
 
@@ -161,8 +163,9 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
   实时队列与关闭缓冲有界，溢出保留交付水位并显式报错。任务总期限覆盖准入、排队、
   等资源和执行；停止确认/持久化独立有界，重复取消不得绕过停止确认或误释放资源。
 - **不加依赖**。宿主装不上，加一个依赖就等于让所有人只能进容器干活。
-- 公开行为变了，**同步改 `README.md`**（API 表、状态机、模块结构树、当前范围四处）；
-  新增模块要出现在模块结构树里。
+- 公开行为变了，**同步改对应文档**：API 表 → `docs/sdk-reference.md`，状态机与前置条件 →
+  `docs/lifecycle.md`，模块结构树与当前范围 → `docs/architecture.md`，行为变化摘要 →
+  `CHANGELOG.md`；新增模块要出现在模块结构树里。
 
 ## 必须守住的不变量
 
