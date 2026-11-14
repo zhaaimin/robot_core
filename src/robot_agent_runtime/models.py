@@ -3,7 +3,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import AfterValidator, BaseModel, Field
 
@@ -103,10 +103,44 @@ class Event(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
 
 
+class ActionOutcome(BaseModel):
+    """What one call established about the hardware, apart from its goal.
+
+    A failed call may have moved an arm; a successful call may still be moving.
+    Only these facts let the kernel decide whether the declared resources may be
+    handed to other work, so ``SkillResult.success`` cannot answer them.
+
+    ``stopped`` is deliberately tri-state: ``True`` only when the adapter
+    confirmed the actuators are at rest, ``False`` when it knows they are not,
+    and ``None`` when it cannot tell. ``operator_required`` keeps a recovery
+    that needs a human out of every automatic path.
+
+    ``SkillResult.action`` being ``None`` means the adapter does not report this
+    yet; the kernel then keeps its previous behaviour instead of assuming rest.
+    """
+
+    executed: Literal["none", "some", "unknown"] = "unknown"
+    stopped: bool | None = None
+    operator_required: bool = False
+
+    @property
+    def at_rest(self) -> bool:
+        """Whether this record establishes that nothing is still moving.
+
+        A recovery that needs a person is never at rest, even when the call
+        itself executed nothing: handing the hardware to the next task would
+        skip the recovery the environment asked for.
+        """
+        return not self.operator_required and (
+            self.executed == "none" or self.stopped is True
+        )
+
+
 class SkillResult(BaseModel):
     success: bool
     output: dict[str, Any] = Field(default_factory=dict)
     error: ErrorInfo | None = None
+    action: ActionOutcome | None = None
 
 
 @dataclass(slots=True)

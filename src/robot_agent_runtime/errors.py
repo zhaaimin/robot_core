@@ -122,5 +122,16 @@ class ExecutionUnresponsive(AgentRuntimeError):
     code = "EXECUTION_UNRESPONSIVE"
 
 
+class ExecutionUnsettled(ExecutionUnresponsive):
+    """A failed call whose own record cannot establish that the hardware is at rest.
+
+    Shares the unresponsive consequence — quarantine and require reconciliation —
+    because a waiter that cannot prove stopping must not release physical
+    ownership. The distinct code keeps the cause visible in events and errors.
+    """
+
+    code = "EXECUTION_UNSETTLED"
+
+
 class ResourceQuarantined(AgentRuntimeError):
     code = "RESOURCE_QUARANTINED"

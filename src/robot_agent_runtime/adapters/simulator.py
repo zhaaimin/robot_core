@@ -1,10 +1,11 @@
 import asyncio
 import threading
 from collections.abc import AsyncIterator, Mapping
-from typing import Any
+from typing import Any, Literal
 
 from robot_agent_runtime.errors import SkillExecutionError, TaskCancelled
 from robot_agent_runtime.models import (
+    ActionOutcome,
     SkillContext,
     SkillDefinition,
     SkillResult,
@@ -20,6 +21,11 @@ BATTERY_SUFFICIENT = "battery.sufficient"
 
 
 class SimulatedSkill:
+    #: What a successful call moves. A read-only or purely local wait is ``none``.
+    #: The simulator finishes every call with the model at rest, so it can always
+    #: confirm stopping — a real adapter must only do that when it observed it.
+    executed: Literal["none", "some"] = "some"
+
     def __init__(
         self,
         definition: SkillDefinition,
@@ -50,7 +56,11 @@ class SimulatedSkill:
             output = await self._perform(context, params)
             if context.progress is not None:
                 context.progress(1.0)
-            return SkillResult(success=True, output=output)
+            return SkillResult(
+                success=True,
+                output=output,
+                action=ActionOutcome(executed=self.executed, stopped=True),
+            )
         except asyncio.CancelledError:
             raise TaskCancelled("Simulation stopped before returning") from None
         finally:
@@ -149,6 +159,8 @@ class SpeakSkill(SimulatedSkill):
 
 
 class GetStateSkill(SimulatedSkill):
+    executed = "none"
+
     def __init__(self, state: dict[str, Any], **kwargs: Any) -> None:
         super().__init__(
             SkillDefinition(
@@ -171,6 +183,8 @@ class GetStateSkill(SimulatedSkill):
 
 
 class DelaySkill(SimulatedSkill):
+    executed = "none"
+
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(
             SkillDefinition(

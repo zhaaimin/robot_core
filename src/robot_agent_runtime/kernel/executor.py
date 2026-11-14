@@ -4,6 +4,7 @@ from typing import Any
 from robot_agent_runtime.errors import (
     AgentRuntimeError,
     ExecutionUnresponsive,
+    ExecutionUnsettled,
     InternalError,
     PreconditionFailed,
     RobotStopError,
@@ -120,6 +121,22 @@ class WorkflowExecutor:
                                 "Physical stop was not confirmed",
                                 details={"skill": call.skill, "resources": sorted(resources)},
                             ) from error
+                        # A failure only releases the hardware when its own record
+                        # says nothing is still moving. Quarantine happens before
+                        # the lock is released so no waiter can take it in between.
+                        outcome = result.action
+                        if not result.success and outcome is not None and not outcome.at_rest:
+                            self._resources.quarantine(resources)
+                            raise ExecutionUnsettled(
+                                "Skill failed without establishing that the hardware is at rest",
+                                details={
+                                    "skill": call.skill,
+                                    "resources": sorted(resources),
+                                    "executed": outcome.executed,
+                                    "stopped": outcome.stopped,
+                                    "operator_required": outcome.operator_required,
+                                },
+                            )
                     await self._state.drain_progress(task.id)
 
                     if cancel_event.is_set():

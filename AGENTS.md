@@ -121,6 +121,9 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
 - **全量类型注解**，PEP 585/604 风格（`dict[str, Any]`、`Task | None`、`frozenset[str]`）。
 - **通用端口用 `typing.Protocol`** 声明在 `ports.py`，厂商 SDK 协议放各自接入包的
   `contracts.py`；适配器靠结构匹配，不继承、不注册。
+- **新增运行时模型要同时进快照白名单**：`hosting/boundary.py` 的 `_MODELS` 决定哪些
+  pydantic 模型能跨线程传递，漏加会让所有 SDK 路径报 `INTERNAL_ERROR: Extension
+  returned an invalid snapshot`（新增 `ActionOutcome` 时踩过）。
 - **错误走 `errors.py`**：每个失败模式一个 `AgentRuntimeError` 子类 + 一个 `code` 字符串常量。
   不要裸 `raise RuntimeError`，也不要在业务代码里硬编码错误码字符串。
 - **docstring 写“为什么”和边界**，放在类/Protocol 级别，解释不变量与降级行为（看
@@ -178,6 +181,10 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
 7. **事件序号单调递增**，`subscribe_task_events` 先回放历史再接实时，这个顺序不能变。
 8. 推送型适配器要做**滞环**和**无变化不推送**（参考 `SimulatedRobot`），否则停在阈值上的
    电池会反复打断刚起来的任务。
+9. **失败不等于没动。** 技能返回 `success=False` 时，能否释放资源只看 `SkillResult.action`：
+   `executed="none"` 或 `stopped=True` 才释放，`executed="unknown"`、`stopped` 非 `True`、
+   `operator_required=True` 一律隔离并落待对账。适配器不得因为“调用返回了失败”就假定执行器
+   静止；`action=None` 表示尚未接入，内核沿用原有异常路径，不做任何静止假设。
 
 ## 测试约定
 

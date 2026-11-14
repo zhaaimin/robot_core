@@ -495,6 +495,19 @@ CC API 的 `audio.speak` 在启动受理后保持 `RUNNING`，收到匹配 `work
 成功，也不会在终态后追加进度。隔离不会因线程后来返回而自动解除；重新创建运行时或
 适配器前必须先确认旧动作已停止，重启不等于硬件停止确认。
 
+技能**正常返回失败**时，是否释放资源由 `SkillResult.action` 决定：
+
+| `action` | 处理 |
+| --- | --- |
+| `None` | 适配器尚未接入该声明，沿用原有行为，不据此推断静止 |
+| `executed="none"` | 一步未执行，释放资源并按 `FAILED` 结束 |
+| `executed="some"` + `stopped=True` | 执行过且已确认静止，释放资源并按 `FAILED` 结束 |
+| `executed="some"` + `stopped` 非 `True`，或 `executed="unknown"` | 隔离资源，任务落 `RECONCILIATION_REQUIRED / EXECUTION_UNSETTLED` |
+| `operator_required=True` | 无论执行多少都隔离，等待人工恢复 |
+
+`ActionOutcome` 只陈述执行事实，不解释硬件语义；`stopped=True` 只能由适配器在观察到
+执行器静止后给出。新增该字段的适配器不需要改动内核判断。
+
 ## 重启恢复语义
 
 运行时**不会**因为数据库里是 `RUNNING` 就重放任务。`start()` 时对每个非终态任务：

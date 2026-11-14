@@ -4,6 +4,7 @@ from typing import Any
 
 from robot_agent_runtime.errors import InternalError, SnapshotTooLarge
 from robot_agent_runtime.models import (
+    ActionOutcome,
     ErrorInfo,
     Event,
     SkillCall,
@@ -15,7 +16,9 @@ from robot_agent_runtime.models import (
 )
 
 
-_MODELS = (ErrorInfo, Event, SkillCall, SkillDefinition, SkillResult, Task, TaskRequest)
+_MODELS = (
+    ActionOutcome, ErrorInfo, Event, SkillCall, SkillDefinition, SkillResult, Task, TaskRequest,
+)
 
 
 class _Snapshot:

@@ -17,7 +17,7 @@ from robot_agent_runtime.errors import (
     RobotStopError,
     TaskCancelled,
 )
-from robot_agent_runtime.models import SkillContext, SkillDefinition, SkillResult
+from robot_agent_runtime.models import ActionOutcome, SkillContext, SkillDefinition, SkillResult
 from robot_agent_runtime.adapters.cc_api.contracts import CcApiClient
 from robot_agent_runtime.adapters.cc_api.driver import CcApiDriver
 
@@ -277,9 +277,13 @@ class CcApiSpeechSkill:
                 await self._stop(speech, launch)
                 raise TaskCancelled("Speech cancelled and finished")
             await speech.finished
-            return SkillResult(success=True, output={
-                "message": params["message"], "spoken": True, "work_id": speech.work_id,
-            })
+            # Success here means the finished notification arrived, which is the
+            # only proof this adapter has that playback is no longer running.
+            return SkillResult(
+                success=True,
+                output={"message": params["message"], "spoken": True, "work_id": speech.work_id},
+                action=ActionOutcome(executed="some", stopped=True),
+            )
         except asyncio.CancelledError:
             # The runtime deadline/shutdown must not leave playback running.
             # A repeated cancellation cannot detach the stop acknowledgement.
