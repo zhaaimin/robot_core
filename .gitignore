@@ -31,3 +31,20 @@ venv/
 
 # Local verification scratch (dependency shims; see memory notes)
 .verify/
+
+# ---------------------------------------------------------------------------
+# 厂商 SDK 参考副本（UBT 闭源，无再分发授权）
+# 运行时依赖走 pip 安装的 ubt_robot，本目录仅供本地查阅，不属于本仓库代码。
+# 文件保留在本地，只是不纳入版本控制。
+# ---------------------------------------------------------------------------
+cc_api/
+
+# 厂商二进制投放件（wheel / 原始音频素材）
+*.whl
+*.pcm
+
+# 凭据与本地配置：设备 token、WiFi 密码等一律不入库
+.env
+.env.*
+!.env.example
+cc_api/examples/config.py
