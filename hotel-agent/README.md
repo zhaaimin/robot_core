@@ -24,7 +24,7 @@
 | `hotel_agent/skills/` | 三个独立的任务指导、参考资料与注册脚本包，供 Agent 按需加载 |
 | `hotel_agent/{tools,service,repository,backend,simulator}.py` | 酒店业务支持：工具、规则、业务状态、存储、系统端口与模拟实现 |
 | `hotel_agent/errors.py` | 酒店业务错误；JSON 错误码保持 `HOTEL_WORKFLOW_REJECTED` |
-| `hotel_agent/adapters/mcp.py`、`robot_agent_core.ports` | MCP 连接装配、必需技能检查与 TaskRuntime 端口 |
+| `hotel_agent/adapters/mcp.py`、`robot_agent_capabilities.ports` | MCP 连接装配、必需技能检查与共享 TaskRuntime 端口（agent-core 复用） |
 | `robot_agent_runtime` | 接收机器人任务，处理执行、资源、取消与恢复 |
 
 `hotel_agent/models.py` 保存业务数据，不是语言模型；`hotel_agent/service.py` 的 `HotelWorkflow`
@@ -43,7 +43,7 @@ MCP 后端保留当前酒店 Agent：模型调用 HotelTools，HotelWorkflow 管
 在容器内从仓库根目录安装可选接入包：
 
 ```bash
-/opt/robot_agent_venv/bin/python -m pip install -e ./mcp_bridge -e './hotel-agent[mcp,test]'
+/opt/robot_agent_venv/bin/python -m pip install -e ./capabilities -e ./mcp_bridge -e './hotel-agent[mcp,test]'
 ```
 
 先在一个终端启动独立 runtime。以下使用现有通用模拟器验证，实际部署使用已经装配好导航和播报技能的 RuntimeServer：

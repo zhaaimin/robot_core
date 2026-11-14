@@ -68,6 +68,8 @@ async def test_official_stdio_discovery_schema_and_runtime_idempotency() -> None
             tools = {tool.name: tool for tool in (await session.list_tools()).tools}
             assert set(tools) == {
                 "list_skills", "submit_task", "get_task_status", "cancel_task", "read_task_events",
+                "robot_speak", "robot_navigate_to", "robot_get_state", "robot_wait_delay",
+                "robot_task_status", "robot_cancel_task",
             }
             assert tools["submit_task"].inputSchema["required"] == ["request"]
             assert "steps" in str(tools["submit_task"].inputSchema)

@@ -41,6 +41,17 @@ async def test_discovers_skill_schema_and_executes_a_real_runtime_task() -> None
         assert (await runtime.get_task_status(observed['task_id'])).metadata['operation_id'] == 'op-1'
 
 
+def test_agent_uses_the_shared_execution_and_observation_contracts() -> None:
+    import robot_agent_core.ports as agent_ports
+    from robot_agent_capabilities.observations import Observation, failed_observation, task_observation
+    from robot_agent_capabilities.ports import TaskRuntime
+
+    assert agent_ports.TaskRuntime is TaskRuntime
+    assert agent_ports.Observation is Observation
+    assert agent_ports.failed_observation is failed_observation
+    assert agent_ports.task_observation is task_observation
+
+
 async def test_skill_description_and_bounds_come_from_the_definition() -> None:
     async with running() as (tools, _, _):
         schemas = {tool['function']['name']: tool['function'] for tool in tools.schemas}

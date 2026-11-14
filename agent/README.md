@@ -5,6 +5,10 @@
 CC 厂商连接和命令行入口 `robot-agent`。酒店接待与带房是另一个独立项目
 [`hotel-agent/`](../hotel-agent/README.md)，两者不再靠参数区分，也不共享业务代码。
 
+RobotTools 只做图工具格式与历史错误码适配，实际机器人能力目录和调用来自独立
+[`robot-agent-capabilities`](../capabilities/README.md)。外部 Agent 可直接通过 MCP 使用同一能力，
+无需经过本应用或安装 LangGraph；配置见 [统一接入说明](../docs/agent-integration.md)。
+
 runtime 的源码与根依赖保持独立；框架依赖只声明在 `agent-core/` 与本项目的
 `pyproject.toml`，不进 runtime 发布包。
 
@@ -18,7 +22,7 @@ runtime 的源码与根依赖保持独立；框架依赖只声明在 `agent-core
   没有真实导航或状态查询技能。
 
 `--backend` 的合法取值由本项目的 `ROBOT_PROFILE` 决定，不存在 `mcp` 后端；
-MCP 桥接只由酒店项目消费。运行时技能可用重复的 `--allow-skill NAME` 缩小白名单。
+MCP 桥接可由外部 Agent、酒店和导览项目消费。运行时技能可用重复的 `--allow-skill NAME` 缩小白名单。
 
 模型接口是唯一运行方式：每次运行都必须提供模型名称和凭据，可以是 `--model`／
 `ROBOT_AGENT_MODEL` 与 `OPENAI_API_KEY`，兼容服务可填写 `OPENAI_BASE_URL`。
@@ -53,11 +57,11 @@ Agent Skill 是可选能力包：`SKILL.md` 描述处理方法，`references/` �
 
 安装与验证均在保留的 `robot_core_ubuntu24` 容器完成，项目挂载到 `/workspace/robot_core`。
 Agent 环境是 `/opt/robot_agent_venv`，与原有 runtime 验证环境隔离；宿主无需安装依赖。
-仓库现在有三个可编辑安装的 Agent 包，从仓库根目录执行：
+本应用依赖共享 Agent 内核和独立能力包，从仓库根目录执行：
 
 ```bash
 python3 -m venv /opt/robot_agent_venv
-/opt/robot_agent_venv/bin/python -m pip install -e . -e ./agent-core -e ./agent -e './agent[test]'
+/opt/robot_agent_venv/bin/python -m pip install -e . -e ./capabilities -e ./agent-core -e './agent[test]'
 /opt/robot_agent_venv/bin/python -m pip install ./cc_api/ubt_robot-2.0.16-py3-none-linux_aarch64.whl
 ```
 
@@ -202,7 +206,7 @@ src/robot_agent/
 ├── app.py           CLI 参数、凭据前提、CC 原生连接所有权与退出装配
 ├── profiles.py      ROBOT_PROFILE：后端白名单与固定库文件名
 ├── application.py   通用机器人装配、SDK/平台生命周期与交互错误策略
-├── robot_tools.py   把白名单 runtime 技能翻译成模型工具
+├── robot_tools.py   统一能力的图工具格式、历史 agent: 身份与错误码适配
 └── __main__.py      python -m robot_agent 入口
 ```
 

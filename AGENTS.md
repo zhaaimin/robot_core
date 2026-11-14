@@ -10,6 +10,11 @@
 `robot-agent-runtime`：机器人本机任务执行运行时（Python 3.11+ / asyncio）。内核**不依赖**任何
 机器人厂商 SDK、ROS 2 或云服务，硬件通过 `ports.py` 的 Protocol 以适配器注入。
 
+仓库对外定位为 Runtime + 统一机器人能力层 + MCP/Python SDK。独立 `capabilities/`
+（robot-agent-capabilities）只依赖 runtime，拥有 TaskRuntime、工具目录、稳定操作与 Observation。
+MCP 和自研 RobotTools 共用它；外部 Agent 不经过 agent-core 的 LangGraph。业务确认/租约仍归各 Workflow。
+默认能力键为 robot:，旧 Agent 的 agent: 键不能迁移重发；不要在统一层复制内核执行策略。
+
 ## 环境：先读这段，不要重新诊断
 
 这台 macOS 宿主有几个固定限制，都已经查清楚了：
@@ -196,6 +201,7 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
   只能被 skip，等于在容器外没有保护。确实需要就放到 `test_sqlite_repository.py` 这类本来
   就要进容器的文件里。
 - 新增测试文件记得加进 `.verify/sweep.py` 的 `FILES`，否则 sweep 根本不会跑它。
+  此项指根 `tests/`；capabilities/agent-core/各 Agent/MCP 的独立测试按各自 pyproject 在容器单独运行，不加入根 sweep。
 - **不要用 `sleep` 等状态。** 用 `wait_for_terminal()` 轮询加 `asyncio.timeout(1)`，或等
   `asyncio.Event`（见 `tests/test_core.py` 顶部的辅助函数）。
 - 新增端口（`ports.py` 的 Protocol）要配一个 `test_contracts.py` 里的契约测试，让后续真实
@@ -203,8 +209,9 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
 
 ## 还没做的事
 
-Agent 集成层（计划生成/重规划）、调度器（`priority` 已持久化但不参与排序，无并发上限与
-抢占）、有限重试、结构化日志、真实平台适配器（ROS 2 / 厂商 SDK）、云端管理平面。
+已具备统一能力 SDK、原生 MCP 工具与基础 Agent 决策闭环。尚未完成复杂计划生成/自动重规划、
+调度器（`priority` 已持久化但不参与排序，无并发上限与抢占）、有限重试、结构化日志、
+其他真实平台能力（导航、ROS 2 等）、云端管理平面。CC 厂商语音适配已存在。
 
 动到这些方向时先看 `docs/plans/2026-10-24-robot-agent-runtime-design.md` 里已确认的实施方向，
 别另起一套。

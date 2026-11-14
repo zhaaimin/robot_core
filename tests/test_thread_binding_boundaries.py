@@ -159,8 +159,10 @@ async def observe_state_while_skill_blocks(grouped: bool) -> None:
     release = threading.Event()
 
     class State(SimulatedRobotState):
+        """Report readiness after the owner loop attached its subscription."""
+
         async def watch(self) -> AsyncIterator[frozenset[str]]:
-            loop.call_soon_threadsafe(registered.set)
+            asyncio.get_running_loop().call_soon(loop.call_soon_threadsafe, registered.set)
             async for labels in super().watch():
                 yield labels
 

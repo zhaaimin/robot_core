@@ -12,7 +12,7 @@
 所有命令在保留的 `robot_core_ubuntu24` 容器、仓库根目录执行：
 
 ```bash
-/opt/robot_agent_venv/bin/python -m pip install -e . -e ./agent-core -e './guide-agent[test]'
+/opt/robot_agent_venv/bin/python -m pip install -e . -e ./capabilities -e ./agent-core -e './guide-agent[test]'
 ```
 
 准备 `OPENAI_API_KEY` 和 `ROBOT_AGENT_MODEL`，兼容服务可用 `OPENAI_BASE_URL`。应用不会自动读取 `.env`。
@@ -75,7 +75,7 @@ MCP 模式对空目标拒绝导航，但仍可问答和介绍。部署前把它�
 ## MCP 接入
 
 ```bash
-/opt/robot_agent_venv/bin/python -m pip install -e ./mcp_bridge -e './guide-agent[mcp,test]'
+/opt/robot_agent_venv/bin/python -m pip install -e ./capabilities -e ./mcp_bridge -e './guide-agent[mcp,test]'
 ```
 
 一个终端运行独立 runtime，以下为模拟器：

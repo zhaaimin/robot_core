@@ -2,11 +2,14 @@
 
 通用 agent 内核（Python 3.11+ / asyncio）：LangGraph 决策循环、工具端口、Agent Skill 宿主、
 命令行 shell 与存储身份解析。它**不含任何业务领域**，也不含机器人厂商 SDK 或 MCP 实现。
+机器人能力由独立 [capabilities/](../capabilities/README.md) 提供；本包消费其 TaskRuntime/Observation 契约。
+外部 MCP Agent 和直接使用能力 SDK 的应用不需要安装本包。
 
 应用项目依赖它并各自拥有工具集、业务域与命令行入口：
 
 - `agent/`（dist `robot-agent-app`，入口 `robot-agent`）：通用机器人 agent。
 - `hotel-agent/`（dist `robot-agent-hotel`，入口 `hotel-agent`）：酒店接待与带房 agent。
+- `guide-agent/`（dist `robot-agent-guide`，入口 `guide-agent`）：导览 agent。
 
 内核不猜测应用：Skill 资源包名由调用方给出，存储策略由应用传入自己的常量，
 命令行只共用参数校验、状态目录约定、错误脱敏与退出码。
@@ -18,7 +21,7 @@ src/robot_agent_core/
 ├── graph.py           decide / execute / observe 节点与路由
 ├── state.py           可序列化图状态与稳定动作标识
 ├── models.py          决策模型 Protocol 与 ChatOpenAI 适配
-├── ports.py           ToolSet、TaskRuntime 端口与 Observation 事实记录
+├── ports.py           图工具 ToolSet，复用统一能力包的执行和观察契约
 ├── errors.py          应用层结构化错误
 ├── validation.py      与装配无关的通用期限校验
 ├── shell.py           输入、单轮图调用、错误状态、结果基础信封与交互循环
@@ -53,7 +56,7 @@ Skill 资源同理：`SkillRegistry.bundled(package)` 由调用方给出包名�
 ## 安装与测试
 
 ```bash
-python -m pip install -e ./agent-core
+python -m pip install -e . -e ./capabilities -e ./agent-core
 /opt/robot_agent_venv/bin/python -m pytest -q agent-core/tests
 ```
 

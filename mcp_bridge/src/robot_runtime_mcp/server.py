@@ -8,6 +8,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from robot_agent_capabilities import RobotCapabilities
 from robot_agent_runtime.errors import (
     AgentRuntimeError, InternalError, InvalidRequest, PermissionDenied,
 )
@@ -15,6 +16,7 @@ from robot_agent_runtime.models import TaskRequest, TaskState
 from robot_agent_runtime.schemas import describe_bounds
 from robot_agent_runtime.sdk.remote import RemoteRuntime, RemoteTransportError
 from robot_runtime_mcp.errors import McpTransportError
+from robot_runtime_mcp.tool_schemas import capability_input_schema
 
 
 class EmptyInput(BaseModel):
@@ -27,6 +29,12 @@ class SubmitInput(EmptyInput):
 
 class TaskInput(EmptyInput):
     task_id: str = Field(min_length=1)
+
+
+class CapabilityInput(EmptyInput):
+    operation_id: str = Field(min_length=1, pattern=r"\S")
+    params: dict[str, Any]
+    wait: bool = False
 
 
 class EventsInput(TaskInput):
@@ -61,12 +69,14 @@ class RuntimeMcpServer:
     def __init__(self, runtime: RemoteRuntime, *, allowed_skills: set[str] | None = None) -> None:
         self._runtime = runtime
         self._allowed = frozenset(allowed_skills) if allowed_skills is not None else None
+        self._capability_client: RobotCapabilities | None = None
+        self._catalog_lock = asyncio.Lock()
         self.server = Server("robot-agent-runtime", version="0.1.0")
         self.server.list_tools()(self.list_tools)
         self.server.call_tool(validate_input=False)(self.call_tool)
 
     async def list_tools(self) -> list[types.Tool]:
-        return [
+        tools = [
             types.Tool(
                 name=name, description=_DESCRIPTIONS[name],
                 inputSchema=self._input_schema(name, model),
@@ -77,6 +87,23 @@ class RuntimeMcpServer:
             )
             for name, model in _INPUTS.items()
         ]
+        capabilities = await self._capabilities()
+        tools.extend(types.Tool(
+            name=tool.name,
+            description=tool.description + (" 默认只受理任务；请检查 task_id/state，必要时查询结果。" if tool.skill else ""),
+            inputSchema=capability_input_schema(tool),
+            annotations=types.ToolAnnotations(readOnlyHint=tool.read_only, openWorldHint=False),
+        ) for tool in capabilities.tools)
+        return tools
+
+    async def _capabilities(self) -> RobotCapabilities:
+        async with self._catalog_lock:
+            if self._capability_client is None:
+                definitions = await self._runtime.list_skills()
+                visible = [definition for definition in definitions
+                           if self._allowed is None or definition.name in self._allowed]
+                self._capability_client = RobotCapabilities(self._runtime, visible)
+            return self._capability_client
 
     @staticmethod
     def _input_schema(name: str, model: type[BaseModel]) -> dict[str, Any]:
@@ -94,7 +121,7 @@ class RuntimeMcpServer:
         try:
             model = _INPUTS.get(name)
             if model is None:
-                raise InvalidRequest("Unknown MCP tool", {"tool": name})
+                return await self._call_capability(name, arguments)
             try:
                 value = model.model_validate(arguments)
             except ValidationError as error:
@@ -112,6 +139,24 @@ class RuntimeMcpServer:
         except Exception:
             failure = InternalError("MCP bridge could not complete the runtime request")
             return self._result({"error": failure.to_dict()}, is_error=True)
+
+    async def _call_capability(self, name: str, arguments: dict[str, Any]) -> types.CallToolResult:
+        capabilities = await self._capabilities()
+        tool = next((tool for tool in capabilities.tools if tool.name == name), None)
+        if tool is None:
+            raise InvalidRequest("Unknown MCP tool", {"tool": name})
+        try:
+            if tool.skill is not None:
+                value = CapabilityInput.model_validate(arguments)
+                observed = await capabilities.invoke(name, value.params, operation_id=value.operation_id, wait=value.wait)
+            else:
+                control = TaskInput.model_validate(arguments)
+                observed = await capabilities.invoke(name, {"task_id": control.task_id})
+        except ValidationError as error:
+            raise InvalidRequest("Invalid MCP tool arguments", {"tool": name,
+                "errors": error.errors(include_url=False, include_context=False, include_input=False)}) from error
+        is_error = observed['error'] is not None if tool.skill is not None else observed['task_id'] is None
+        return self._result(dict(observed), is_error=is_error)
 
     async def _dispatch(self, name: str, value: BaseModel) -> dict[str, Any]:
         if name == "list_skills":

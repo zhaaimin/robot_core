@@ -1,14 +1,17 @@
 # robot-agent-mcp
 
-把已有 `robot-agent-runtime` 的 Unix socket 暴露为 MCP stdio 服务。独立发布包
+把已有 `robot-agent-runtime` 的 Unix socket 和统一机器人能力暴露为 MCP stdio 服务。独立发布包
 `robot-agent-mcp`，Python 3.11+，使用官方 `mcp>=1.30,<2`。内核不依赖 MCP、Agent
 或 LangGraph；此包也不导入酒店 Agent。
+
+原五项任务工具保留，另从独立 `robot-agent-capabilities` 目录生成具体能力工具，供外部 Agent 使用。
+自研 Python Agent 可直接用同一能力 SDK；Codex/Claude Code 配置见 [统一接入说明](../docs/agent-integration.md)。
 
 在仓库根目录安装：
 
 ```bash
 python -m pip install -e .
-python -m pip install -e './mcp_bridge[test]'
+python -m pip install -e ./capabilities -e './mcp_bridge[test]'
 ```
 
 先在一个终端启动独立 runtime（以下使用模拟器）：
@@ -30,6 +33,35 @@ python -m robot_runtime_mcp --socket "$PWD/.data/robot.sock" \
 不传 `--allow-skill` 时暴露全部技能。白名单同时过滤技能发现和每个提交步骤；它不改变
 runtime 的权限、前置条件和资源准入规则。桥接连接现有 RuntimeServer，退出时只关闭自己
 的 RemoteRuntime 连接，runtime 和已经受理的物理任务继续运行。
+MCP 白名单是可见性过滤，不是必需能力声明；缺失的白名单项不会阻断工具发现。
+业务应用继续自己检查必需技能，统一 Python SDK 显式请求未知 allowed_skills 则返回配置错误。
+
+## 具体机器人能力
+
+`tools/list` 还会返回白名单内的 robot_speak、robot_navigate_to、robot_get_state 等实际能力，
+以及 robot_task_status / robot_cancel_task。名称、说明、参数边界和结果转换与 Python SDK 共用。
+未声明的硬件能力不会因为工具名字而出现；CC 平台目前仍只有语音。
+
+```json
+{"operation_id": "visit-42-greeting-v1", "params": {"message": "欢迎光临"}, "wait": false}
+```
+
+这是 robot_speak 的入参。技能自己的参数放在 params 内，operation_id/wait 属于协议信封，
+不会覆盖技能同名参数；嵌套本地 schema 引用及原 JSON Schema 方言随包装保留。
+默认后台受理，返回 Observation 的 tool/task_id/state/result/error/requires_attention。
+wait=true 才有界等待；预算耗尽返回已有 task_id、state=null 和 TASK_WAIT_TIMEOUT。
+若期限异常提前到达，至多在剩余等待预算内补查一次实际状态，补查不延长预算。
+查询和显式停止分别用 `robot_task_status({task_id})`、`robot_cancel_task({task_id})`。
+
+动作的稳定 operation_id 默认变成 `robot:{operation_id}`，与统一 Python SDK 相同。
+同一 ID 不同参数报告 INVALID_REQUEST 并保留原任务，不重新执行；不要把未知结果换新 ID 重发。
+技能调用返回错误时 isError=true；控制工具取得权威 Task 快照时 isError=false，
+任务自身的错误及取消/待核对状态仍原样返回，控制调用失败才为 true。
+isError=false 不等于业务完成；requires_attention 在非 succeeded 状态都为 true。
+
+## 任务协议
+
+已有 McpRuntime 客户端的原请求/响应信封、事件游标和生命周期保持不变。
 
 | MCP tool | 参数 | 结构化成功结果 |
 | --- | --- | --- |

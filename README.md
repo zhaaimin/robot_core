@@ -1,9 +1,14 @@
-# Robot Agent Runtime
+# Robot Agent Runtime & Capabilities
 
-机器人本机任务执行运行时。管理 AI 任务的生命周期、技能调度、状态与事件、取消语义和重启恢复。
+面向 Codex、Claude Code、其他外部 Agent 与自研业务 Agent 的机器人能力基础设施。
+架构为 Runtime + 统一机器人能力层 + MCP/Python SDK：runtime 管任务生命周期、资源与事件、取消和恢复，
+独立能力层提供统一工具目录、参数 schema、稳定动作身份及结果观察，Agent 自己负责决策循环。
 
 运行时内核不依赖任何机器人厂商 SDK、ROS 2 或云端服务：硬件接入通过 `ports.py` 中的
 Protocol 以适配器形式注入。
+
+外部 Agent 从 [统一接入说明](docs/agent-integration.md) 开始；Python 应用可直接使用
+[capabilities/](capabilities/README.md)，无需安装 LangGraph 或运行仓库自带 Agent。
 
 完整流程与能力边界见 [任务执行、结果获取、持久化与重启状态核对](docs/task-execution-and-recovery.md)，
 包含 CC API 语音示例、SQLite 与 InMemory 的区别，以及 Reconciler 当前能处理的范围。
@@ -15,6 +20,14 @@ pip install -e '.[test]'
 ```
 
 需要 Python 3.11+。
+
+外部 Agent/统一能力 SDK 在已准备依赖的容器中从仓库根目录安装：
+
+```bash
+/opt/robot_agent_venv/bin/python -m pip install -e . -e ./capabilities -e ./mcp_bridge
+```
+
+第三方模型与 MCP 依赖不进入 runtime 发布包。
 
 ## 两种使用形态
 
@@ -77,7 +90,9 @@ finally:
 
 ## Agent 验证项目
 
-Agent 层由共享内核和三个独立应用组成，靠入口区分：
+Agent 层由共享内核和三个独立消费者应用组成，靠入口区分；它们不是外部 Agent 使用机器人的前提。
+独立 [capabilities/](capabilities/README.md)（dist `robot-agent-capabilities`）由 MCP 与 Python 客户端共用，
+仅依赖 runtime，不依赖 Agent、LangGraph 或 MCP。
 
 - [agent-core/](agent-core/README.md)（dist `robot-agent-core`，import `robot_agent_core`）：共享内核，
   提供 LangGraph 决策循环、工具端口、Agent Skill 宿主、shell 与存储身份解析，不含任何业务领域。
@@ -90,8 +105,9 @@ Agent 层由共享内核和三个独立应用组成，靠入口区分：
 - [guide-agent/](guide-agent/README.md)（dist `robot-agent-guide`，入口 `guide-agent`）：导览 Agent，
   接收唤醒/最终话语事件，从 `venue-guide` Skill 配置地点与介绍，确认后导航并自动播报介绍；后端 `simulator|mcp`。
 
-各项目的框架依赖都只声明在各自 `pyproject.toml`，不加入 runtime 发布包；`src/robot_agent_runtime` 与 `mcp_bridge`
-一行未改。存储策略不再查全局注册表：每个项目自带一份 `StorageProfile` 模块常量（`ROBOT_PROFILE` /
+各项目的框架依赖都只声明在各自 `pyproject.toml`，不加入 runtime 发布包。
+通用 Agent 的 RobotTools 只适配统一能力目录和结果；TaskRuntime 与 Observation 契约归能力包所有。
+存储策略不再查全局注册表：每个项目自带一份 `StorageProfile` 模块常量（`ROBOT_PROFILE` /
 `HOTEL_PROFILE` / `GUIDE_PROFILE`），由 `configuration.resolve_storage` 在装配时解析，`AppConfig.scenario` 字段与
 `scenarios/` 包一起删除。`skillkit/host.py` 集中实现 Skills 协议，图只编排模型与动作批次；
 `cli.py` 提供参数校验、状态目录约定、错误脱敏与退出码，应用入口各自实现。
@@ -105,6 +121,15 @@ Agent 层由共享内核和三个独立应用组成，靠入口区分：
 
 ## 公开 API
 
+统一能力 API 为 `robot_agent_capabilities.RobotCapabilities.create(runtime, ...)`、`tools` 和
+`invoke(name, params, *, operation_id=None, wait=False)`。动作必须提供非空稳定 operation_id；
+默认后台提交，显式 wait=True 才有界等待。Observation 的 task_id/state/result 依据 runtime，
+error 同时区分运行时结果与本地等待、操作身份冲突；无法确认最新状态时 state 为 null。
+MCP 原五项任务工具保留，并按同一白名单提供 robot_speak、robot_navigate_to 等实际能力及
+robot_task_status/robot_cancel_task；技能调用信封为 `{operation_id, params, wait=false}`。
+默认键为 `robot:{operation_id}`，旧 RobotTools 的 `agent:` 键保持不变；不要跨命名空间重发旧动作。
+完整 Python 示例和 Codex/Claude Code stdio 配置见 [统一接入说明](docs/agent-integration.md)。
+
 Agent 应用入口为各自独立包提供的 `robot-agent` / `hotel-agent` / `guide-agent`（也可 `python -m robot_agent`、
 `python -m hotel_agent`、`python -m guide_agent`），通过下方公开 SDK 调用 runtime，不增加内核 API。
 导览支持 `--input text|events`、`--skills-dir PATH` 和 `--backend mcp --runtime-socket PATH`；
@@ -113,7 +138,7 @@ Agent 应用入口为各自独立包提供的 `robot-agent` / `hotel-agent` / `g
 `--scenario` 参数已删除：通用验证用 `robot-agent`，酒店接待/带房模拟验证用 `hotel-agent`。
 `hotel-agent` 可指定 `--backend mcp --runtime-socket PATH`，由应用启动 stdio 桥接进程；
 `robot-agent` 只有 `simulator` 与 `cc` 两个后端。`--skills-dir` 可指定 Agent Skill 目录。
-`robot-runtime-mcp --socket PATH` 也可供其他本机 MCP 客户端连接；工具为 list_skills、submit_task、get_task_status、cancel_task 和有界 read_task_events。
+`robot-runtime-mcp --socket PATH` 供本机 MCP 客户端连接；除上述具体能力外，保留 list_skills、submit_task、get_task_status、cancel_task 和有界 read_task_events。
 MCP 桥接及客户端位于独立包 `robot_runtime_mcp`；酒店通过应用层 `TaskRuntime` 端口消费它，内核无 MCP 依赖。
 酒店装配入口是 `hotel_agent.application`，业务模块使用 `hotel_agent.*` 路径：
 `HotelWorkflow`、`ServicePhase`、`SimulatedHotel` 分别从 `hotel_agent.service`、`hotel_agent.models`、
@@ -437,6 +462,9 @@ SDK `close()` 会停止监听，不保证交付尚未完成的回调，要收齐
 
 ## 任务状态机
 
+统一能力层不新增状态，不写状态机。后台受理不等于完成；requires_attention 在非 succeeded 状态为 true，
+只是调用方观察提示。等待超时或 MCP/SDK 调用结束不证明物理停止，停止与重启核对仍由 runtime 负责。
+
 Agent 的图节点、会话检查点和本轮暂停只属于应用状态，不增加 `TaskState`；
 任务完成、取消和待对账仍以下述 runtime 状态为准。
 酒店的接待、等待同意、交接、护送、客人到达确认及服务完成也属于独立业务状态，由 `hotel_agent.service` 管理。
@@ -520,16 +548,27 @@ CC API 的 `audio.speak` 在启动受理后保持 `RUNNING`，收到匹配 `work
 
 ## 模块结构
 
-仓库包含共享内核 `agent-core/`、三个 Agent 应用 `agent/`、`hotel-agent/` 与 `guide-agent/`、
+仓库包含统一能力包 `capabilities/`、共享 Agent 内核 `agent-core/`、三个 Agent 应用 `agent/`、`hotel-agent/` 与 `guide-agent/`、
 `mcp_bridge/` 接入包与 `src/robot_agent_runtime/` 运行时包，分别打包。
-先列 Agent 模块，其后为 runtime 模块；接入边界见各子项目说明。
+依赖方向是协议/应用 → capabilities → runtime；runtime 不反向依赖上层。接入边界见各子项目说明。
+
+```text
+capabilities/src/robot_agent_capabilities/
+├── client.py        RobotCapabilities、稳定操作、后台提交与有限等待
+├── catalog.py       工具目录、白名单、命名和参数 schema
+├── observations.py  共享 Observation 与事实转换
+├── ports.py         TaskRuntime 客户端 Protocol
+├── errors.py        能力层结构化错误
+├── __init__.py      SDK 入口
+└── py.typed         类型标记
+```
 
 ```text
 agent-core/src/robot_agent_core/
 ├── graph.py         LangGraph 决策、执行、观察与路由
 ├── state.py         图状态与稳定动作标识
 ├── models.py        决策模型 Protocol 与 ChatOpenAI 适配
-├── ports.py         ToolSet、TaskRuntime 端口与 Observation 事实记录
+├── ports.py         图工具 ToolSet，复用能力包 TaskRuntime/Observation
 ├── errors.py        应用结构化错误
 ├── validation.py    与装配无关的通用期限校验
 ├── shell.py         输入、单轮图调用、结果基础信封、错误状态与公共循环
@@ -549,7 +588,7 @@ agent/src/robot_agent/          # 通用机器人 agent，入口 robot-agent
 ├── app.py                      CLI、凭据前提、CC 原生连接所有权与启动装配
 ├── profiles.py                 ROBOT_PROFILE：后端白名单与固定库文件名
 ├── application.py              机器人装配、SDK/平台生命周期与交互错误策略
-├── robot_tools.py              把白名单 runtime 技能翻译成模型工具
+├── robot_tools.py              统一能力的图工具格式与旧操作身份适配
 └── __main__.py                 模块入口
 ```
 
@@ -594,6 +633,7 @@ guide-agent/src/guide_agent/
 ```text
 mcp_bridge/src/robot_runtime_mcp/
 ├── server.py        MCP 工具、真实事件批次与 UDS 客户端装配
+├── tool_schemas.py  统一能力协议信封、嵌套 schema 引用转换
 ├── client.py        MCP 任务客户端、事件回放与 stdio 生命周期
 ├── errors.py        结构化远端错误与传输结果不确定错误
 └── __main__.py      robot-runtime-mcp stdio 入口
@@ -967,6 +1007,10 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
 平台契约和嵌入式用例还验证混合绑定、实际线程容量、组内阻塞范围、状态源和对账器绑定。
 
 ## 当前范围
+
+已提供独立统一能力 SDK 与原生 MCP 能力工具，外部 Agent 可直接调用，不经自研决策图。
+能力包不启动模型或机器人；权限、前置条件、资源互斥、停止确认及重启不重放仍以 runtime 为准。
+基础能力接入不授予酒店/导览业务确认权，也不新增跨业务的机器人共同调度机制。
 
 Agent 层由共享内核 `agent-core/` 与三个独立应用 `agent/`、`hotel-agent/`、`guide-agent/` 组成：
 LangGraph 工具闭环、模型接口适配、装配层存储/身份解析与被动配置快照、独立 SkillHost、

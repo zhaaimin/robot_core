@@ -1,5 +1,9 @@
 # 示例阅读顺序
 
+不接语言模型时，可先运行 [capabilities_demo.py](capabilities_demo.py)：安装 `capabilities/` 后，
+用统一工具目录和稳定操作 ID 调用真实模拟 runtime。命令为
+`/opt/robot_agent_venv/bin/python examples/capabilities_demo.py`，无需 Agent 或 MCP 框架。
+
 CC API 语音分成三个独立入口，按当前要做的事选择即可：
 
 | 入口 | 展示内容 | 任务结果从哪里来 |

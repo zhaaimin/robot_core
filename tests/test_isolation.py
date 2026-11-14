@@ -330,8 +330,10 @@ async def test_simulator_push_crosses_thread_owner_loop_safely() -> None:
     watching = asyncio.Event()
 
     class State(SimulatedRobotState):
+        """Report readiness after the owner loop attached its subscription."""
+
         async def watch(self) -> AsyncIterator[frozenset[str]]:
-            loop.call_soon_threadsafe(watching.set)
+            asyncio.get_running_loop().call_soon(loop.call_soon_threadsafe, watching.set)
             async for value in super().watch():
                 yield value
 
