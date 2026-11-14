@@ -59,6 +59,7 @@ class TaskRequest(BaseModel):
 class SkillDefinition(BaseModel):
     name: str
     version: str
+    description: str = ""
     input_schema: dict[str, Any]
     resources: set[str] = Field(default_factory=set)
     permissions: set[str] = Field(default_factory=set)

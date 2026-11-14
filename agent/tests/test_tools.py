@@ -41,6 +41,29 @@ async def test_discovers_skill_schema_and_executes_a_real_runtime_task() -> None
         assert (await runtime.get_task_status(observed['task_id'])).metadata['operation_id'] == 'op-1'
 
 
+async def test_skill_description_and_bounds_come_from_the_definition() -> None:
+    async with running() as (tools, _, _):
+        schemas = {tool['function']['name']: tool['function'] for tool in tools.schemas}
+
+        speak = schemas['robot_speak']
+        assert speak['description'].startswith('让机器人播报')
+        message = speak['parameters']['properties']['message']
+        assert message['minLength'] == 1
+        assert message['description'].endswith('[minLength=1]')
+
+
+async def test_a_skill_without_description_uses_the_compatibility_table() -> None:
+    from robot_agent.robot_tools import RobotTools
+    from robot_agent_runtime.models import SkillDefinition
+
+    async with running() as (_, _, runtime):
+        tools = RobotTools(runtime, [SkillDefinition(
+            name='audio.speak', version='1.0.0', input_schema={'type': 'object'},
+        )], wait_timeout_s=1, task_timeout_s=60)
+
+        assert tools.schemas[0]['function']['description'] == '让机器人播报 message，成功表示播报技能已完成。'
+
+
 async def test_operation_replay_reuses_the_original_task() -> None:
     async with running() as (tools, simulator, _):
         first = await tools.invoke('robot_speak', {'message': 'hello'}, operation_id='stable')

@@ -89,9 +89,14 @@ class NavigateSkill(SimulatedSkill):
             SkillDefinition(
                 name="navigation.navigate_to",
                 version="1.0.0",
+                description="让机器人移动到 target 指定的地点；成功表示已到达，不表示路径最优。",
                 input_schema={
                     "type": "object",
-                    "properties": {"target": {"type": "string", "minLength": 1}},
+                    "properties": {"target": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "业务定义的地点标识（站点名或房间号），由适配器解释；不是坐标。",
+                    }},
                     "required": ["target"],
                     "additionalProperties": False,
                 },
@@ -117,9 +122,14 @@ class SpeakSkill(SimulatedSkill):
             SkillDefinition(
                 name="audio.speak",
                 version="1.0.0",
+                description="让机器人播报一段文本；成功表示播报已完成。",
                 input_schema={
                     "type": "object",
-                    "properties": {"message": {"type": "string", "minLength": 1}},
+                    "properties": {"message": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "待播报的完整文本，按原样朗读，不做摘要。",
+                    }},
                     "required": ["message"],
                     "additionalProperties": False,
                 },
@@ -144,6 +154,7 @@ class GetStateSkill(SimulatedSkill):
             SkillDefinition(
                 name="robot.get_state",
                 version="1.0.0",
+                description="读取机器人状态快照；只读，不占用资源也不改变状态。",
                 input_schema={
                     "type": "object",
                     "properties": {},
@@ -165,9 +176,14 @@ class DelaySkill(SimulatedSkill):
             SkillDefinition(
                 name="wait.delay",
                 version="1.0.0",
+                description="等待指定秒数；不产生物理动作，受任务 timeout_s 约束。",
                 input_schema={
                     "type": "object",
-                    "properties": {"delay_s": {"type": "number", "minimum": 0}},
+                    "properties": {"delay_s": {
+                        "type": "number",
+                        "minimum": 0,
+                        "description": "等待秒数，可为小数；超过任务 timeout_s 会被取消。",
+                    }},
                     "required": ["delay_s"],
                     "additionalProperties": False,
                 },

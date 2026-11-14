@@ -62,9 +62,14 @@ class CcApiSpeechSkill:
         self.definition = SkillDefinition(
             name="audio.speak",
             version="1.0.0",
+            description="通过 CC 语音服务播报一段文本；成功表示收到 finished 确认，不是发出即成功。",
             input_schema={
                 "type": "object",
-                "properties": {"message": {"type": "string", "minLength": 1}},
+                "properties": {"message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "待播报的完整文本，按原样朗读，不做摘要。",
+                }},
                 "required": ["message"],
                 "additionalProperties": False,
             },

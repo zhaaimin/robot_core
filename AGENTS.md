@@ -173,7 +173,8 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
    同理电池阈值要留够回充电桩的余量。
 6. **新技能必须显式声明** `input_schema` / `resources` / `permissions` / `preconditions` /
    `timeout_s` / `supports_cancel`——校验、加锁、超时、取消都由运行时按声明统一执行，技能
-   实现里不要自己做。
+   实现里不要自己做。`description` 与参数级 `description` 是模型可见语义，也应写明；工具
+   schema 由 `schemas.describe_bounds()` 把边界复述进 description，schema 本身仍是执行点。
 7. **事件序号单调递增**，`subscribe_task_events` 先回放历史再接实时，这个顺序不能变。
 8. 推送型适配器要做**滞环**和**无变化不推送**（参考 `SimulatedRobot`），否则停在阈值上的
    电池会反复打断刚起来的任务。

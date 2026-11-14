@@ -14,6 +14,7 @@ from robot_agent_core.ports import Observation, failed_observation, task_observa
 from robot_agent_core.validation import positive_timeout
 from robot_agent_runtime.errors import AgentRuntimeError, InvalidRequest, TaskWaitTimeout
 from robot_agent_runtime.models import SkillCall, SkillDefinition, TaskRequest
+from robot_agent_runtime.schemas import describe_bounds
 from robot_agent_runtime.sdk import RemoteRuntime, RemoteTransportError, RobotRuntime
 
 
@@ -45,16 +46,17 @@ class RobotTools:
         self._skills: dict[str, SkillDefinition] = {}
         self._schemas: list[dict[str, Any]] = []
         for definition in definitions:
-            name, description = _NAMES.get(definition.name, (
+            name, fallback = _NAMES.get(definition.name, (
                 "robot_" + re.sub(r"[^A-Za-z0-9_-]", "_", definition.name),
                 f"执行机器人技能 {definition.name}，返回 task_id、state、result 和 error。",
             ))
+            description = definition.description or fallback
             if name in self._skills or name in {_STATUS, _CANCEL} or len(name) > 64:
                 raise AgentConfigurationError("Skill tool names collide or exceed 64 characters")
             self._skills[name] = definition
             self._schemas.append({"type": "function", "function": {
                 "name": name, "description": description,
-                "parameters": copy.deepcopy(definition.input_schema),
+                "parameters": describe_bounds(definition.input_schema),
             }})
         for name, description in (
             (_STATUS, "按 task_id 查询原任务；执行中不等于完成。"),

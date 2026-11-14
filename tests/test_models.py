@@ -119,9 +119,11 @@ def test_skill_definition_defaults_and_json_serialization() -> None:
     assert definition.preconditions == set()
     assert definition.timeout_s == 30
     assert definition.supports_cancel is False
+    assert definition.description == ""
     assert json.loads(definition.model_dump_json()) == {
         "name": "move",
         "version": "1.0.0",
+        "description": "",
         "input_schema": {},
         "resources": [],
         "permissions": [],

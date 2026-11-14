@@ -593,6 +593,7 @@ src/robot_agent_runtime/
 ├── models.py              任务、事件、技能数据模型
 ├── errors.py              结构化错误
 ├── ports.py               外部能力与 RobotPlatform 装配契约
+├── schemas.py             JSON Schema 边界复述，供被简化 schema 的客户端使用
 ├── options.py             运行时容量、期限和快照配置
 ├── thread_binding.py      外部对象线程归属配置
 ├── __main__.py            命令行组装入口
@@ -653,10 +654,15 @@ src/robot_agent_runtime/
 SkillDefinition(
     name="navigation.navigate_to",
     version="1.0.0",
+    description="让机器人移动到 target 指定的地点；成功表示已到达，不表示路径最优。",
     input_schema={
         "type": "object",
         "required": ["target"],
-        "properties": {"target": {"type": "string"}},
+        "properties": {"target": {
+            "type": "string",
+            "minLength": 1,
+            "description": "业务定义的地点标识（站点名或房间号），不是坐标。",
+        }},
     },
     resources={"base"},          # 同名资源上的技能串行执行
     permissions={"robot.navigation"},
@@ -665,6 +671,11 @@ SkillDefinition(
     supports_cancel=True,
 )
 ```
+
+`description` 与参数级 `description` 是给模型看的语义，不参与校验。工具 schema 组装时，
+`robot_agent_runtime.schemas.describe_bounds()` 会把 `minimum` / `minLength` / `maxItems`
+等边界复述进对应节点的 description：schema 仍是唯一执行点，复述只是防止客户端简化
+schema 后模型看不到边界。`description` 为空时 `RobotTools` 回退到内置兼容表。
 
 实现 `ports.Skill` Protocol 即可接入：`definition` 属性 + `async execute(context, params)`。
 

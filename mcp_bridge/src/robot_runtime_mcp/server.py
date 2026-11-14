@@ -12,6 +12,7 @@ from robot_agent_runtime.errors import (
     AgentRuntimeError, InternalError, InvalidRequest, PermissionDenied,
 )
 from robot_agent_runtime.models import TaskRequest, TaskState
+from robot_agent_runtime.schemas import describe_bounds
 from robot_agent_runtime.sdk.remote import RemoteRuntime, RemoteTransportError
 from robot_runtime_mcp.errors import McpTransportError
 
@@ -87,7 +88,7 @@ class RuntimeMcpServer:
                 "type": "string", "minLength": 1, "pattern": r"\S",
                 "description": "Stable caller-owned key; the bridge never generates or retries it.",
             }
-        return schema
+        return describe_bounds(schema)
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> types.CallToolResult:
         try:
