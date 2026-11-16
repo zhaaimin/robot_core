@@ -12,23 +12,36 @@ import asyncio
 import json
 import os
 from collections.abc import Sequence
+from contextlib import aclosing
 
 from robot_agent_capabilities import RobotCapabilities
 from robot_agent_capabilities.observations import Observation
 from robot_agent_runtime.adapters.cc_api import create_cc_api_platform
 from robot_agent_runtime.adapters.cc_api.contracts import CcApiClient
-from robot_agent_runtime.errors import RobotConnectionError
+from robot_agent_runtime.errors import RobotConnectionError, TaskEventStreamEnded
+from robot_agent_runtime.models import TaskState
 from robot_agent_runtime.repositories.memory import InMemoryTaskRepository
 from robot_agent_runtime.sdk import RobotRuntime
 
 
-async def speak(api: CcApiClient, message: str, operation_id: str) -> Observation:
-    """Invoke robot_speak through the capability layer; caller keeps the connection.
+def _print_event(event) -> None:
+    """One line per runtime event, as it is delivered."""
+    data = {key: value for key, value in event.data.items() if key != "state"}
+    state = event.data.get("state", "")
+    suffix = f" state={state}" if state else ""
+    print(f"[EVENT] seq={event.sequence:>3} {event.event_type}{suffix}"
+          + (f" {json.dumps(data, ensure_ascii=False)}" if data else ""))
 
-    wait_timeout_s must cover the real speech duration, not just task
-    submission: ``invoke(wait=True)`` waits for a terminal task snapshot and
-    reports ``requires_attention`` instead of failing when the wait is cut
-    short. The default of 5 seconds is too tight for live TTS.
+
+async def speak(api: CcApiClient, message: str, operation_id: str) -> Observation:
+    """Invoke robot_speak through the capability layer and stream every event.
+
+    Submission goes through ``invoke(wait=False)``; the task's event stream is
+    then consumed directly so each runtime event is printed as it is delivered.
+    The final observation still comes from the capability layer
+    (``robot_task_status``), so the ``[RESULT]`` shape is unchanged. Streaming
+    has no local deadline: timing out or cancelling the wait must not stop the
+    robot, matching the listener contract.
     """
     platform = create_cc_api_platform(api, skill_thread_group="audio")
     runtime = RobotRuntime.from_platform(
@@ -40,10 +53,28 @@ async def speak(api: CcApiClient, message: str, operation_id: str) -> Observatio
         robot = await RobotCapabilities.create(
             runtime, allowed_skills={"audio.speak"}, wait_timeout_s=30.0,
         )
-        return await robot.invoke(
-            "robot_speak", {"message": message},
-            operation_id=operation_id, wait=True,
+        submitted = await robot.invoke(
+            "robot_speak", {"message": message}, operation_id=operation_id,
         )
+        if submitted["error"]:
+            return submitted
+        task_id = submitted["task_id"]
+        if submitted["state"] in {state.value for state in TaskState if state.is_terminal}:
+            return submitted
+
+        try:
+            async with aclosing(runtime.subscribe_task_events(task_id)) as events:
+                async for event in events:
+                    _print_event(event)
+                    try:
+                        terminal = TaskState(event.data.get("state")).is_terminal
+                    except (TypeError, ValueError):
+                        terminal = False
+                    if terminal:
+                        break
+        except TaskEventStreamEnded:
+            print("[EVENT] stream ended before a terminal event")
+        return await robot.invoke("robot_task_status", {"task_id": task_id})
     finally:
         try:
             await runtime.close()
