@@ -95,6 +95,11 @@ docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 -m
 
 此约定取代上面的宿主主力验证方式；宿主离线命令保留作历史环境记录。
 
+2026-11-16 更新：完整验证应跑**五个包**（根 / capabilities / mcp_bridge / agent /
+agent-core），根套件命令只覆盖第一个。新增包要在容器里 `pip install -e` 显式安装——
+`capabilities` 曾漏装，`mcp_bridge` 的测试在收集阶段就全挂（`ModuleNotFoundError:
+robot_agent_capabilities`），报错点在 `mcp_bridge` 看起来像回归，实际是容器依赖缺失。
+
 真实套件要在容器里跑（`/Users/zhazha/Documents/robot_core` 挂到 `/workspace`）。约定：
 **跑完不要 `docker rm -f`，容器留着**。依赖在宿主装不上，每次重建重装纯属浪费；下次
 `docker start` + `docker exec` 复用即可，只有镜像或依赖集变了才重建。
