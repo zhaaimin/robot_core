@@ -15,10 +15,28 @@ import asyncio
 import os
 import signal
 from collections.abc import Sequence
+from pathlib import Path
 
 from robot_agent_runtime.adapters.simulator import Simulator
 from robot_agent_runtime.transport.server import RuntimeServer
 from robot_agent_runtime.repositories.sqlite import SQLiteTaskRepository
+
+
+def _ensure_database_parent(database_path: str) -> None:
+    """Create the SQLite file's parent directory if it is missing.
+
+    aiosqlite opens the path directly; a missing parent fails deep inside the
+    repository start and surfaces as an opaque ``InternalError``. Fail fast
+    here with a clear message instead.
+    """
+    parent = Path(database_path).parent
+    if str(parent) and not parent.exists():
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise SystemExit(
+                f"Cannot create database directory {parent}: {error}"
+            ) from error
 
 
 def _build_serve_parser(subparsers) -> None:
@@ -58,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
 async def serve(socket_path: str, database_path: str, delay_s: float) -> None:
     if delay_s < 0:
         raise ValueError("--delay must be non-negative")
+    _ensure_database_parent(database_path)
     simulator = Simulator(delay_s=delay_s)
     server = RuntimeServer(SQLiteTaskRepository(database_path), simulator.skills, socket_path)
     await _run_server(server, socket_path)
@@ -83,6 +102,8 @@ async def serve_cc(
         raise RobotConnectionError(
             "Install the supplied ubt_robot Linux ARM64 wheel in the deployment environment"
         ) from error
+
+    _ensure_database_parent(database_path)
 
     config = ubt_robot.Config()
     config.api_id = api_id
