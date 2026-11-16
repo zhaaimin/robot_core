@@ -1,4 +1,8 @@
-"""Use the shared robot tools without a language model or an agent framework."""
+"""Use the shared robot tools without a language model or an agent framework.
+
+Real-robot variant: ``cc_api_capabilities_demo.py`` — same tool name and
+observation shape, CC platform instead of the simulator.
+"""
 
 import asyncio
 import json
