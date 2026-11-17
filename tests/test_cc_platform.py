@@ -79,8 +79,8 @@ async def test_cc_platform_factory_exposes_existing_runtime_ports_and_speech() -
 
     api = Api()
     platform: RobotPlatform = create_cc_api_platform(api)
-    assert set(platform.skills) == {"audio.speak"}
-    assert isinstance(platform.skills["audio.speak"], CcApiSpeechSkill)
+    assert set(platform.skills) == {"audio.speak", "robot.status"}
+    assert isinstance(unwrap_thread_binding(platform.skills["audio.speak"]), CcApiSpeechSkill)
     assert platform.robot_state is None and platform.reconciler is None
     with pytest.raises(TypeError):
         platform.skills["other"] = platform.skills["audio.speak"]
@@ -616,3 +616,131 @@ async def test_cc_speech_demo_returns_vendor_failure_in_final_task() -> None:
     finally:
         speaking.cancel()
         await asyncio.gather(speaking, return_exceptions=True)
+
+
+async def test_cc_platform_exposes_robot_status_skill() -> None:
+    from robot_agent_runtime.adapters.cc_api import CcApiRobotInfoSkill, create_cc_api_platform
+
+    api = Api()
+    platform = create_cc_api_platform(api)
+    assert set(platform.skills) == {"audio.speak", "robot.status"}
+    assert isinstance(unwrap_thread_binding(platform.skills["robot.status"]), CcApiRobotInfoSkill)
+    await platform.close()
+
+
+async def test_robot_status_skill_discovers_ids_then_queries_and_returns_payload() -> None:
+    from robot_agent_runtime.adapters.cc_api import CcApiRobotInfoSkill
+
+    api = Api()
+    skill = CcApiRobotInfoSkill(api)
+    await skill.start()
+    try:
+        execution = asyncio.create_task(skill.execute(context(), {}))
+        # First it discovers the vendor's real status items…
+        method, params, respond = await api.next_request()
+        assert method == "cc.api.status.list"
+        respond(Response(result={"list": ["state", "work_mode"]}))
+        # …then queries those discovered IDs.
+        method, params, respond = await api.next_request()
+        assert method == "cc.api.status.get"
+        assert params["list"] == ["state", "work_mode"]
+        respond(Response(result={"state": "idle", "work_mode": "stand"}))
+        result = await asyncio.wait_for(execution, 1)
+        assert result.success is True
+        assert result.output["status"] == {"state": "idle", "work_mode": "stand"}
+        assert result.output["status_ids"] == ["state", "work_mode"]
+        # A read-only query reports no physical execution and is at rest.
+        assert result.action is not None and result.action.executed == "none" and result.action.at_rest
+    finally:
+        await skill.close()
+
+
+async def test_robot_status_skill_accepts_explicit_ids() -> None:
+    from robot_agent_runtime.adapters.cc_api import CcApiRobotInfoSkill
+
+    api = Api()
+    skill = CcApiRobotInfoSkill(api)
+    await skill.start()
+    try:
+        execution = asyncio.create_task(skill.execute(context(), {"status_ids": ["state", "leg_status"]}))
+        _, params, respond = await api.next_request()
+        assert params["list"] == ["state", "leg_status"]
+        respond(Response(result={"state": "walking", "leg_status": "STAND"}))
+        result = await asyncio.wait_for(execution, 1)
+        assert result.success and result.output["status_ids"] == ["state", "leg_status"]
+    finally:
+        await skill.close()
+
+
+async def test_robot_status_skill_rejects_invalid_ids() -> None:
+    from robot_agent_runtime.adapters.cc_api import CcApiRobotInfoSkill
+    from robot_agent_runtime.errors import InvalidRequest
+
+    api = Api()
+    skill = CcApiRobotInfoSkill(api)
+    await skill.start()
+    try:
+        for bad in ("state", 123, ["state", ""], [1, 2]):
+            with pytest.raises(InvalidRequest):
+                await skill.execute(context(), {"status_ids": bad})
+        assert api.requests.empty()
+    finally:
+        await skill.close()
+
+
+async def test_robot_status_skill_propagates_vendor_rejection() -> None:
+    from robot_agent_runtime.adapters.cc_api import CcApiRobotInfoSkill
+    from robot_agent_runtime.errors import RobotRequestError
+
+    api = Api()
+    skill = CcApiRobotInfoSkill(api)
+    await skill.start()
+    try:
+        execution = asyncio.create_task(skill.execute(context(), {}))
+        _, _, respond = await api.next_request()
+        respond(Response(False, error_code=5, error_message="status unavailable"))
+        with pytest.raises(RobotRequestError) as caught:
+            await asyncio.wait_for(execution, 1)
+        assert caught.value.info.details["vendor_code"] == 5
+    finally:
+        await skill.close()
+
+
+async def test_robot_status_skill_unavailable_before_start_and_after_close() -> None:
+    from robot_agent_runtime.adapters.cc_api import CcApiRobotInfoSkill
+    from robot_agent_runtime.errors import RobotConnectionError
+
+    api = Api()
+    skill = CcApiRobotInfoSkill(api)
+    with pytest.raises(RobotConnectionError):
+        await skill.execute(context(), {})
+    await skill.start()
+    await skill.close()
+    with pytest.raises(RobotConnectionError):
+        await skill.execute(context(), {})
+
+
+async def test_platform_end_to_end_robot_status_via_runtime() -> None:
+    from robot_agent_runtime.adapters.cc_api import create_cc_api_platform
+
+    api = Api()
+    platform = create_cc_api_platform(api)
+    await platform.start()
+    runtime = RobotRuntime.from_platform(InMemoryTaskRepository(), platform)
+    try:
+        await runtime.start()
+        task = await runtime.submit_task(TaskRequest(task_type="status", steps=[
+            SkillCall(skill="robot.status", params={"status_ids": ["state"]}),
+        ]))
+        method, params, respond = await api.next_request()
+        assert method == "cc.api.status.get" and params["list"] == ["state"]
+        respond(Response(result={"state": "idle"}))
+        async with asyncio.timeout(1):
+            async for _ in runtime.subscribe_task_events(task.id):
+                pass
+        assert (await runtime.get_task_status(task.id)).state == TaskState.SUCCEEDED
+    finally:
+        try:
+            await runtime.close()
+        finally:
+            await platform.close()

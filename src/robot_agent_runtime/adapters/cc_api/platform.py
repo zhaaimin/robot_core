@@ -5,6 +5,7 @@ from types import MappingProxyType
 from robot_agent_runtime.adapters.cc_api.driver import CcApiDriver
 from robot_agent_runtime.adapters.cc_api.contracts import CcApiClient
 from robot_agent_runtime.adapters.cc_api.speech import CcApiSpeechSkill
+from robot_agent_runtime.adapters.cc_api.robotinfo import CcApiRobotInfoSkill
 from robot_agent_runtime.errors import InvalidRequest, RobotConnectionError
 from robot_agent_runtime.options import RuntimeOptions
 from robot_agent_runtime.ports import Reconciler, RobotPlatform, RobotStateProvider, Skill
@@ -31,12 +32,21 @@ class CcApiPlatform:
     ) -> None:
         self._driver = CcApiDriver(api, options=options)
         self._speech = CcApiSpeechSkill(self._driver, stop_timeout_s=stop_timeout_s)
-        skill: Skill | ThreadBinding[Skill] = (
-            self._speech if skill_thread_group is None
+        self._robotinfo = CcApiRobotInfoSkill(self._driver)
+        # Both skills share one CcApiDriver, whose methods must run on a single
+        # owning loop. They are therefore bound to the same loop in every case:
+        # a named group when one is requested, otherwise a shared loop.
+        speech_skill: Skill | ThreadBinding[Skill] = (
+            ThreadBinding.shared(self._speech) if skill_thread_group is None
             else ThreadBinding.group(self._speech, skill_thread_group)
         )
+        robotinfo_skill: Skill | ThreadBinding[Skill] = (
+            ThreadBinding.shared(self._robotinfo) if skill_thread_group is None
+            else ThreadBinding.group(self._robotinfo, skill_thread_group)
+        )
         self._skills: Mapping[str, Skill | ThreadBinding[Skill]] = MappingProxyType({
-            self._speech.definition.name: skill,
+            self._speech.definition.name: speech_skill,
+            self._robotinfo.definition.name: robotinfo_skill,
         })
         self._loop: asyncio.AbstractEventLoop | None = None
         self._start_task: asyncio.Task[None] | None = None
@@ -73,6 +83,7 @@ class CcApiPlatform:
     async def _start(self) -> None:
         try:
             await self._speech.start()
+            await self._robotinfo.start()
         except Exception as error:
             try:
                 await self._driver.close()
@@ -94,7 +105,7 @@ class CcApiPlatform:
             except Exception:
                 pass
         errors: list[Exception] = []
-        for close in (self._speech.close, self._driver.close):
+        for close in (self._speech.close, self._robotinfo.close, self._driver.close):
             try:
                 await close()
             except Exception as error:
