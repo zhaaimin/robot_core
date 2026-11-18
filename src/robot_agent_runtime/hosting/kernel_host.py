@@ -1,153 +1,28 @@
 import asyncio
 import threading
-from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from contextlib import aclosing
 from typing import Any
 
 from robot_agent_runtime.hosting.boundary import bounded_snapshot
 from robot_agent_runtime.kernel.core import RuntimeCore
 from robot_agent_runtime.errors import (
-    EventStreamOverflow,
     ExtensionCapacityExceeded,
     ExtensionTimeout,
     InvalidRequest,
 )
-from robot_agent_runtime.models import Event, TaskRequest
+from robot_agent_runtime.models import Event, PlatformEvent, TaskRequest
+from robot_agent_runtime.hosting.notification_host import NotificationHost
 from robot_agent_runtime.options import RuntimeOptions
 from robot_agent_runtime.hosting.isolation import (
     IsolatedAdmissionValidator, IsolatedPorts, isolate_ports,
 )
-from robot_agent_runtime.ports import Reconciler, RobotStateProvider, Skill, TaskRepository
+from robot_agent_runtime.ports import PlatformEventRepository, PlatformEventSource, Reconciler, RobotStateProvider, Skill, TaskRepository
+from robot_agent_runtime.repositories.platform_events import InMemoryPlatformEventRepository
 from robot_agent_runtime.thread_binding import ThreadBinding
 from robot_agent_runtime.hosting.thread_runtime import LoopJob, LoopThread
 
-
-_EMPTY = object()
-_END = object()
-
-
-class _EventStream:
-    """Keep generator ownership on the kernel and bound its shutdown backlog.
-
-    Buffered events remain replayable after the kernel stops. Overflow reports
-    the last event actually delivered to this consumer, so replay can recover
-    every omitted event even when shutdown finished before the consumer resumed.
-    """
-
-    def __init__(
-        self, source: Callable[[], AsyncGenerator[Event, None]], task_id: str,
-        after_sequence: int, options: RuntimeOptions,
-    ) -> None:
-        self._source_factory = source
-        self._source: AsyncGenerator[Event, None] | None = None
-        self._task_id = task_id
-        self._options = options
-        self._pull_lock = asyncio.Lock()
-        self._buffer_lock = threading.Lock()
-        self._buffer: deque[Event] = deque()
-        self._error: BaseException | None = None
-        self._overflowed = False
-        self._incomplete = False
-        self._delivered = after_sequence
-        self._offline = False
-        self._ended = False
-
-    def _snapshot(self, event: Event) -> Event:
-        return bounded_snapshot(
-            event, max_bytes=self._options.max_snapshot_bytes,
-            max_depth=self._options.max_snapshot_depth,
-        )
-
-    def delivered(self, event: Event) -> None:
-        with self._buffer_lock:
-            self._delivered = event.sequence
-
-    def abort_close(self) -> None:
-        with self._buffer_lock:
-            if not self._offline:
-                self._incomplete = True
-                self._offline = True
-
-    def offline_next(self) -> Event | object:
-        with self._buffer_lock:
-            if not self._offline:
-                return _EMPTY
-            if self._buffer:
-                return self._buffer.popleft()
-            if self._overflowed:
-                self._overflowed = False
-                raise EventStreamOverflow(
-                    "Shutdown event buffer overflow; resubscribe to replay missed events",
-                    details={
-                        "task_id": self._task_id, "after_sequence": self._delivered,
-                        "queue_size": self._options.max_event_buffer,
-                    },
-                )
-            if self._incomplete:
-                self._incomplete = False
-                raise EventStreamOverflow(
-                    "Event stream shutdown was incomplete; resubscribe to replay missed events",
-                    details={
-                        "task_id": self._task_id, "after_sequence": self._delivered,
-                        "reason": "shutdown_incomplete",
-                    },
-                )
-            if self._error is not None:
-                error, self._error = self._error, None
-                raise error
-            return _END
-
-    async def pull(self) -> Event | object:
-        async with self._pull_lock:
-            buffered = self.offline_next()
-            if buffered is not _EMPTY:
-                return buffered
-            if self._ended:
-                return _END
-            if self._source is None:
-                self._source = self._source_factory()
-            try:
-                return self._snapshot(await anext(self._source))
-            except StopAsyncIteration:
-                self._ended = True
-                return _END
-
-    async def drain(self) -> None:
-        async with self._pull_lock:
-            try:
-                with self._buffer_lock:
-                    offline = self._offline
-                if not self._ended and not offline and self._source is not None:
-                    async for event in self._source:
-                        with self._buffer_lock:
-                            if self._offline:
-                                break
-                            if len(self._buffer) >= self._options.max_event_buffer:
-                                self._overflowed = True
-                                break
-                            self._buffer.append(self._snapshot(event))
-            except Exception as error:
-                with self._buffer_lock:
-                    if not self._offline:
-                        self._error = error
-            finally:
-                if self._source is not None:
-                    await self._source.aclose()
-                with self._buffer_lock:
-                    self._offline = True
-                self._ended = True
-
-    async def close(self) -> None:
-        async with self._pull_lock:
-            if self._source is not None:
-                await self._source.aclose()
-            self._ended = True
-            with self._buffer_lock:
-                self._buffer.clear()
-                self._error = None
-                self._overflowed = False
-                self._incomplete = False
-                self._offline = True
+from robot_agent_runtime.hosting.event_stream import HostedEventStream, _EMPTY, _END
 
 
 class KernelHost:
@@ -168,6 +43,8 @@ class KernelHost:
         robot_state: RobotStateProvider | ThreadBinding[RobotStateProvider] | None = None,
         *,
         options: RuntimeOptions | None = None,
+        event_source: PlatformEventSource | ThreadBinding[PlatformEventSource] | None = None,
+        event_repository: PlatformEventRepository | ThreadBinding[PlatformEventRepository] | None = None,
     ) -> None:
         self._skills = dict(skills)
         if any(type(name) is not str for name in self._skills):
@@ -176,6 +53,10 @@ class KernelHost:
         if self._permissions is not None and any(type(value) is not str for value in self._permissions):
             raise InvalidRequest("Permissions must contain plain strings")
         self._inputs = (repository, reconciler, robot_state)
+        self._event_source = event_source
+        self._event_repository = (event_repository if event_repository is not None else
+                                  InMemoryPlatformEventRepository() if event_source is not None else None)
+        self._notifications: NotificationHost | None = None
         self._core: RuntimeCore | None = None
         self._ports: IsolatedPorts | None = None
         self._prepare_failure: Exception | None = None
@@ -191,7 +72,7 @@ class KernelHost:
         self._lifecycle_lock: asyncio.Lock | None = None
         self._start_job: LoopJob[None] | None = None
         self._close_job: LoopJob[None] | None = None
-        self._streams: set[_EventStream] = set()
+        self._streams: set[HostedEventStream] = set()
         self._started = False
         self._closing = False
         self._closed = False
@@ -226,6 +107,8 @@ class KernelHost:
         async with self._kernel_lifecycle_lock():
             core = await self._prepare_core()
             await core.start()
+            if self._notifications is not None:
+                await self._notifications.start()
             with self._admission_lock:
                 self._started = True
 
@@ -242,9 +125,12 @@ class KernelHost:
             return self._core
         repository, reconciler, robot_state = self._inputs
         try:
-            self._ports = isolate_ports(repository, self._skills, reconciler, robot_state, self._options)
+            self._ports = isolate_ports(repository, self._skills, reconciler, robot_state, self._options,
+                                        event_source=self._event_source, event_repository=self._event_repository)
             await self._ports.prepare()
             self._core = self._create_core(self._ports)
+            if self._ports.event_repository is not None:
+                self._notifications = NotificationHost(self._ports.event_repository, self._ports.event_source, self._options)
         except BaseException as error:
             self._prepare_failure = (error if isinstance(error, Exception) else
                                      InvalidRequest("Host preparation interrupted; workers cannot be replaced"))
@@ -315,6 +201,11 @@ class KernelHost:
                     await self._drain_streams()
                 except Exception as error:
                     errors.append(error)
+                if self._notifications is not None:
+                    try:
+                        await self._notifications.close()
+                    except Exception as error:
+                        errors.append(error)
                 try:
                     await core.close()
                 except Exception as error:
@@ -417,10 +308,22 @@ class KernelHost:
         if type(after_sequence) is not int or after_sequence < 0:
             raise InvalidRequest("after_sequence must be a non-negative integer")
         task_id = self._snapshot(task_id)
-        stream = _EventStream(
-            lambda: self._core.subscribe_task_events(task_id, after_sequence),
-            task_id, after_sequence, self._options,
-        )
+        async with aclosing(self._subscribe_task_stream(
+            lambda: self._core.subscribe_task_events(task_id, after_sequence), task_id, after_sequence,
+        )) as stream:
+            async for value in stream:
+                yield value
+
+    async def subscribe_all_task_events(self, event_types: set[str] | None = None) -> AsyncGenerator[Event, None]:
+        if event_types is not None and (type(event_types) not in (set, frozenset) or any(type(value) is not str or not value.strip() for value in event_types)):
+            raise InvalidRequest("event_types must be a set of nonempty strings")
+        selected = self._snapshot(event_types)
+        async with aclosing(self._subscribe_task_stream(lambda: self._core.subscribe_all_task_events(selected), "*", 0)) as stream:
+            async for value in stream:
+                yield value
+
+    async def _subscribe_task_stream(self, factory: Callable[[], AsyncGenerator[Event, None]], task_id: str, after_sequence: int) -> AsyncGenerator[Event, None]:
+        stream = HostedEventStream(factory, task_id, after_sequence, self._options)
         with self._admission_lock:
             if not self._started or self._closing or self._closed:
                 raise InvalidRequest("Kernel host is not running")
@@ -464,3 +367,17 @@ class KernelHost:
             finally:
                 with self._admission_lock:
                     self._streams.discard(stream)
+
+    async def subscribe_platform_events(
+        self, after_cursor: int = 0, event_types: set[str] | None = None,
+    ) -> AsyncGenerator[PlatformEvent, None]:
+        with self._admission_lock:
+            if not self._started or self._closing or self._notifications is None:
+                raise InvalidRequest("Platform events are not configured or the runtime is not running")
+            notifications = self._notifications
+        stream = notifications.subscribe(after_cursor, event_types)
+        try:
+            async for value in stream:
+                yield value
+        finally:
+            await stream.aclose()

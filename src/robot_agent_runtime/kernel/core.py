@@ -137,7 +137,7 @@ class RuntimeCore:
     async def _watch_robot_state(self, provider: RobotStateProvider) -> None:
         """Interrupt in-flight work whose preconditions stopped holding.
 
-        This is the only push path in the runtime, and it is deliberately not
+        This state-enforcement push path is deliberately not
         specific to any one condition: an emergency stop and a battery falling
         below its reserve arrive as the same set change and are answered the
         same way. A task is cancelled only if the skill it is running declares
@@ -151,6 +151,10 @@ class RuntimeCore:
         """
         async for unsatisfied in provider.watch():
             await self._cancel_blocked_tasks(frozenset(unsatisfied))
+            # A dispatched write may consume cancellation to establish its
+            # commit outcome. Shutdown must not then open another quiet pull.
+            if self._closing:
+                return
 
     async def _cancel_blocked_tasks(self, unsatisfied: frozenset[str]) -> None:
         if not unsatisfied:
@@ -408,6 +412,9 @@ class RuntimeCore:
         self, task_id: str, after_sequence: int = 0
     ) -> AsyncIterator[Event]:
         return self._events.subscribe(task_id, after_sequence)
+
+    def subscribe_all_task_events(self, event_types: set[str] | None = None) -> AsyncIterator[Event]:
+        return self._events.subscribe_all(event_types)
 
     def _require_running(self) -> None:
         if not self._started or self._closing or self._closed:

@@ -3,6 +3,7 @@ from typing import Any, Protocol
 
 from robot_agent_runtime.models import (
     Event,
+    PlatformEvent,
     SkillContext,
     SkillDefinition,
     SkillCall,
@@ -11,6 +12,38 @@ from robot_agent_runtime.models import (
     TaskState,
 )
 from robot_agent_runtime.thread_binding import ThreadBinding
+
+
+class PlatformEventSource(Protocol):
+    """Provide detached platform facts without choosing their delivery transport.
+
+    The application owns vendor connections and source lifecycle. Hosted watch
+    calls belong to the source's selected loop; native callbacks must bridge to
+    it. Exhaustion or failure is observable, never proof that faults cleared.
+    """
+
+    def watch(self) -> AsyncIterator[PlatformEvent]: ...
+
+
+class PlatformEventRepository(Protocol):
+    """Own ordered platform history independently of task transactions.
+
+    Append assigns cursor positions and deduplicates immutable event IDs within
+    retained history. Pages are ordered snapshots; expired or future cursors
+    fail explicitly. A page may be shorter than limit to respect byte budgets;
+    an empty page marks the current end. Bounds are (first retained cursor,
+    last assigned cursor).
+    """
+
+    async def start(self) -> None: ...
+
+    async def close(self) -> None: ...
+
+    async def append_platform_event(self, event: PlatformEvent) -> PlatformEvent: ...
+
+    async def list_platform_events(self, after_cursor: int = 0, limit: int = 128) -> list[PlatformEvent]: ...
+
+    async def platform_event_bounds(self) -> tuple[int, int]: ...
 
 
 class AdmissionValidator(Protocol):

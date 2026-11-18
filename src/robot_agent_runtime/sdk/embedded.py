@@ -5,10 +5,12 @@ from typing import Self
 from robot_agent_runtime.kernel.core import RuntimeCore
 from robot_agent_runtime.errors import InvalidRequest
 from robot_agent_runtime.hosting.kernel_host import KernelHost
-from robot_agent_runtime.models import Event, SkillDefinition, Task, TaskRequest
+from robot_agent_runtime.models import Event, PlatformEvent, SkillDefinition, Task, TaskRequest
 from robot_agent_runtime.options import RuntimeOptions
 from robot_agent_runtime.ports import (
     Reconciler,
+    PlatformEventSource,
+    PlatformEventRepository,
     RobotPlatform,
     RobotStateProvider,
     Skill,
@@ -36,10 +38,12 @@ class RobotRuntime:
         robot_state: RobotStateProvider | ThreadBinding[RobotStateProvider] | None = None,
         *,
         options: RuntimeOptions | None = None,
+        event_source: PlatformEventSource | ThreadBinding[PlatformEventSource] | None = None,
+        event_repository: PlatformEventRepository | ThreadBinding[PlatformEventRepository] | None = None,
     ) -> None:
         self._options = options or RuntimeOptions()
         self._host = KernelHost(repository, skills, reconciler, allowed_permissions, robot_state,
-                                options=self._options)
+                                options=self._options, event_source=event_source, event_repository=event_repository)
         self._listeners = TaskListeners(
             self.subscribe_task_events, self.get_task_status,
             cancel_grace_s=self._options.cancel_grace_s,
@@ -55,12 +59,14 @@ class RobotRuntime:
         *,
         allowed_permissions: set[str] | None = None,
         options: RuntimeOptions | None = None,
+        event_repository: PlatformEventRepository | ThreadBinding[PlatformEventRepository] | None = None,
     ) -> Self:
         """Preserve platform port bindings; the application owns its lifecycle."""
         return cls(
             repository, platform.skills, reconciler=platform.reconciler,
             allowed_permissions=allowed_permissions, robot_state=platform.robot_state,
             options=options,
+            event_source=getattr(platform, "event_source", None), event_repository=event_repository,
         )
 
     @property
@@ -131,5 +137,17 @@ class RobotRuntime:
         self, task_id: str, after_sequence: int = 0
     ) -> AsyncGenerator[Event, None]:
         async with aclosing(self._host.subscribe_task_events(task_id, after_sequence)) as stream:
+            async for event in stream:
+                yield event
+
+    async def subscribe_platform_events(
+        self, *, after_cursor: int = 0, event_types: set[str] | None = None,
+    ) -> AsyncGenerator[PlatformEvent, None]:
+        async with aclosing(self._host.subscribe_platform_events(after_cursor, event_types)) as stream:
+            async for event in stream:
+                yield event
+
+    async def subscribe_all_task_events(self, event_types: set[str] | None = None) -> AsyncGenerator[Event, None]:
+        async with aclosing(self._host.subscribe_all_task_events(event_types)) as stream:
             async for event in stream:
                 yield event

@@ -42,6 +42,14 @@ class EventStreamOverflow(AgentRuntimeError):
     code = "EVENT_STREAM_OVERFLOW"
 
 
+class PlatformEventCursorExpired(AgentRuntimeError):
+    code = "PLATFORM_EVENT_CURSOR_EXPIRED"
+
+
+class PlatformEventSourceUnavailable(AgentRuntimeError):
+    code = "PLATFORM_EVENT_SOURCE_UNAVAILABLE"
+
+
 class SkillTimeout(AgentRuntimeError):
     code = "SKILL_TIMEOUT"
 

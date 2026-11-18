@@ -29,6 +29,35 @@ async def _wait_future(
     return await asyncio.wait_for(protected, timeout_s)
 
 
+async def _wait_thread_exit(thread: threading.Thread, deadline: float) -> None:
+    """Confirm native exit without blocking a caller loop or allocating a waiter.
+
+    The loop-stop acknowledgement is published by the worker itself, before
+    its Python thread can actually return. Public is_alive checks bridge that
+    final gap using only the caller's remaining close budget.
+    """
+    loop = asyncio.get_running_loop()
+    finished = loop.create_future()
+    handle: asyncio.TimerHandle | None = None
+
+    def check() -> None:
+        nonlocal handle
+        if finished.done():
+            return
+        remaining = deadline - loop.time()
+        if not thread.is_alive() or remaining <= 0:
+            finished.set_result(None)
+        else:
+            handle = loop.call_later(min(0.001, remaining), check)
+
+    check()
+    try:
+        await finished
+    finally:
+        if handle is not None:
+            handle.cancel()
+
+
 class LoopJob(Generic[T]):
     """Separate a cancellation request from proof that external work has stopped.
 
@@ -155,6 +184,8 @@ class LoopThread:
             or grace_s < 0
         ):
             raise InvalidRequest("grace_s must be finite and nonnegative")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + grace_s
         with self._lock:
             self._closed = True
             jobs = tuple(self._jobs)
@@ -168,9 +199,12 @@ class LoopThread:
         if preserve is not None:
             return
         try:
-            await _wait_future(self._stopped, grace_s)
+            await _wait_future(self._stopped, max(0.0, deadline - loop.time()))
         except TimeoutError:
-            pass
+            return
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            await _wait_thread_exit(thread, deadline)
 
     def _run(self) -> None:
         loop: asyncio.AbstractEventLoop | None = None

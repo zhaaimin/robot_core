@@ -19,8 +19,67 @@ from robot_agent_runtime.sdk import RemoteRuntime
 from robot_agent_runtime.options import RuntimeOptions
 from robot_agent_runtime.thread_binding import ThreadBinding, unwrap_thread_binding
 from robot_agent_runtime.ports import (
-    AdmissionValidator, PagedEventRepository, RobotPlatform, Skill,
+    AdmissionValidator, PagedEventRepository, PlatformEventRepository, PlatformEventSource, RobotPlatform, Skill,
 )
+
+
+async def check_platform_event_repository_contract(repository: PlatformEventRepository) -> None:
+    """Reusable journal ownership, immutable identity and paging contract."""
+    from robot_agent_runtime.models import PlatformEvent
+
+    first = PlatformEvent(event_id="contract-first", source="vendor-neutral", event_type="device.changed", data={"values": [1]})
+    await repository.start()
+    try:
+        saved = await repository.append_platform_event(first)
+        assert saved.cursor == 1 and first.cursor == 0
+        assert (await repository.append_platform_event(first)).cursor == 1
+        saved.data["values"].append(99)
+        page = await repository.list_platform_events(0, 1)
+        assert len(page) == 1 and page[0].data == {"values": [1]}
+        second = PlatformEvent(event_id="contract-second", source="other-vendor", event_type="vendor.detail")
+        assert (await repository.append_platform_event(second)).cursor == 2
+        assert [event.cursor for event in await repository.list_platform_events(1, 10)] == [2]
+        assert await repository.platform_event_bounds() == (1, 2)
+    finally:
+        await repository.close()
+        await repository.close()
+
+
+async def check_platform_event_source_contract(source: PlatformEventSource, count: int) -> None:
+    """Sources expose facts without task IDs, cursors or transport assumptions."""
+    from contextlib import aclosing
+    from robot_agent_runtime.models import PlatformEvent
+
+    seen: set[str] = set()
+    async with aclosing(source.watch()) as stream:
+        async with asyncio.timeout(1):
+            for _ in range(count):
+                event = await anext(stream)
+                assert type(event) is PlatformEvent and event.cursor == 0
+                assert event.source and event.event_type and event.event_id not in seen
+                json.loads(event.model_dump_json())
+                seen.add(event.event_id)
+
+
+async def test_platform_event_memory_repository_reusable_contract() -> None:
+    from robot_agent_runtime.repositories.platform_events import InMemoryPlatformEventRepository
+
+    await check_platform_event_repository_contract(InMemoryPlatformEventRepository())
+
+
+async def test_non_callback_platform_event_sources_share_the_same_contract() -> None:
+    from robot_agent_runtime.models import PlatformEvent
+
+    class Source:
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        async def watch(self):
+            for number in (1, 2):
+                yield PlatformEvent(source=self._name, event_type="vendor.changed", data={"value": number})
+
+    await check_platform_event_source_contract(Source("other-sdk"), 2)
+    await check_platform_event_source_contract(Source("http-adapter"), 2)
 
 
 async def check_robot_platform_contract(

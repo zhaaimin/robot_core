@@ -1,13 +1,13 @@
 import asyncio
 from collections.abc import AsyncGenerator
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from typing import Any
 from uuid import uuid4
 
 from pydantic import ValidationError
 
 from robot_agent_runtime.errors import AgentRuntimeError, InvalidRequest
-from robot_agent_runtime.models import Event, SkillDefinition, Task, TaskRequest
+from robot_agent_runtime.models import Event, PlatformEvent, SkillDefinition, Task, TaskRequest
 from robot_agent_runtime.options import RuntimeOptions
 from robot_agent_runtime.sdk.listeners import (
     DoneCallback,
@@ -137,17 +137,40 @@ class RemoteRuntime:
     async def subscribe_task_events(
         self, task_id: str, after_sequence: int = 0
     ) -> AsyncGenerator[Event, None]:
+        async with aclosing(self._subscribe_events("subscribe_task_events", {"task_id": task_id, "after_sequence": after_sequence}, Event)) as stream:
+            async for value in stream:
+                yield value
+
+    async def subscribe_platform_events(
+        self, *, after_cursor: int = 0, event_types: set[str] | None = None,
+    ) -> AsyncGenerator[PlatformEvent, None]:
+        self._validate_event_types(event_types)
+        params = {"after_cursor": after_cursor, "event_types": sorted(event_types) if event_types is not None else None}
+        async with aclosing(self._subscribe_events("subscribe_platform_events", params, PlatformEvent)) as stream:
+            async for value in stream:
+                yield value
+
+    async def subscribe_all_task_events(self, event_types: set[str] | None = None) -> AsyncGenerator[Event, None]:
+        self._validate_event_types(event_types)
+        params = {"event_types": sorted(event_types) if event_types is not None else None}
+        async with aclosing(self._subscribe_events("subscribe_all_task_events", params, Event)) as stream:
+            async for value in stream:
+                yield value
+
+    @staticmethod
+    def _validate_event_types(event_types: set[str] | None) -> None:
+        if event_types is not None and (type(event_types) not in (set, frozenset) or any(type(value) is not str or not value.strip() for value in event_types)):
+            raise InvalidRequest("event_types must be a set of nonempty strings")
+
+    async def _subscribe_events(self, method: str, params: dict[str, Any], model: type[Event] | type[PlatformEvent]) -> AsyncGenerator[Event | PlatformEvent, None]:
+        watermark = params.get("after_cursor", 0)
         writer: asyncio.StreamWriter | None = None
         try:
             reader, writer = await self._open_connection()
             request_id = uuid4().hex
             await write_message(
                 writer,
-                {
-                    "id": request_id,
-                    "method": "subscribe_task_events",
-                    "params": {"task_id": task_id, "after_sequence": after_sequence},
-                },
+                {"id": request_id, "method": method, "params": params},
             )
             while True:
                 try:
@@ -168,7 +191,12 @@ class RemoteRuntime:
                     return
                 if message_type != "event" or "event" not in message:
                     raise RemoteTransportError("Invalid event stream message")
-                yield self._validate(Event, message["event"])
+                value = self._validate(model, message["event"])
+                if model is PlatformEvent:
+                    if value.cursor <= watermark:
+                        raise RemoteTransportError("Platform event cursors must increase")
+                    watermark = value.cursor
+                yield value
         except (OSError, ConnectionError) as error:
             if not self._closed:
                 raise RemoteTransportError(f"Event stream transport failed: {error}") from error

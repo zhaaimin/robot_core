@@ -7,6 +7,7 @@ from robot_agent_runtime.models import (
     ActionOutcome,
     ErrorInfo,
     Event,
+    PlatformEvent,
     SkillCall,
     SkillDefinition,
     SkillResult,
@@ -17,7 +18,7 @@ from robot_agent_runtime.models import (
 
 
 _MODELS = (
-    ActionOutcome, ErrorInfo, Event, SkillCall, SkillDefinition, SkillResult, Task, TaskRequest,
+    ActionOutcome, ErrorInfo, Event, PlatformEvent, SkillCall, SkillDefinition, SkillResult, Task, TaskRequest,
 )
 
 

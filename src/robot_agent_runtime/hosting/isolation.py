@@ -21,6 +21,7 @@ from robot_agent_runtime.errors import (
 )
 from robot_agent_runtime.models import (
     Event,
+    PlatformEvent,
     ErrorInfo,
     SkillContext,
     SkillCall,
@@ -31,7 +32,7 @@ from robot_agent_runtime.models import (
 )
 from robot_agent_runtime.hosting.execution_context import CONTROL_OPERATION
 from robot_agent_runtime.options import RuntimeOptions
-from robot_agent_runtime.ports import Reconciler, RobotStateProvider, Skill, TaskRepository
+from robot_agent_runtime.ports import PlatformEventRepository, PlatformEventSource, Reconciler, RobotStateProvider, Skill, TaskRepository
 from robot_agent_runtime.kernel.policy import PolicyEnforcer
 from robot_agent_runtime.kernel.registry import SkillRegistry
 from robot_agent_runtime.hosting.thread_runtime import LoopJob, LoopThread
@@ -224,6 +225,96 @@ class _Repository:
 
     async def find_by_idempotency_key(self, key: str) -> Task | None:
         return await self._port.call("find_by_idempotency_key", key, poison=True)
+
+
+class _PlatformEventRepository:
+    def __init__(self, port: _Port) -> None:
+        self._port = port
+
+    async def start(self) -> None:
+        await self._port.call("start", poison=True, write=True)
+
+    async def close(self) -> None:
+        if not self._port.poisoned:
+            await self._port.call("close", poison=True, write=True)
+
+    async def append_platform_event(self, event: PlatformEvent) -> PlatformEvent:
+        return await self._port.call("append_platform_event", event, poison=True, write=True)
+
+    async def list_platform_events(self, after_cursor: int = 0, limit: int = 128) -> list[PlatformEvent]:
+        async def page(target: PlatformEventRepository, after: int, size: int) -> list[PlatformEvent]:
+            values = await target.list_platform_events(after, size)
+            if type(values) is not list:
+                raise InternalError("Platform event pages require a list")
+            bounded: list[PlatformEvent] = []
+            for value in values[:size]:
+                try:
+                    candidate = _snapshot([*bounded, value], self._port.options)
+                except SnapshotTooLarge:
+                    if not bounded:
+                        raise
+                    break
+                bounded = candidate
+            return bounded
+
+        return await self._port.call("list_platform_events", after_cursor, limit, poison=True, factory=page)
+
+    async def platform_event_bounds(self) -> tuple[int, int]:
+        return await self._port.call("platform_event_bounds", poison=True)
+
+
+class _PlatformEventSource:
+    def __init__(self, port: _Port) -> None:
+        self._port = port
+
+    async def watch(self) -> AsyncIterator[PlatformEvent]:
+        iterator: AsyncIterator[PlatformEvent] | None = None
+        closing = threading.Event()
+        pulling = False
+        cleanup_started = False
+
+        async def close_iterator() -> None:
+            nonlocal cleanup_started
+            if pulling or cleanup_started or iterator is None:
+                return
+            cleanup_started = True
+            if (close := getattr(iterator, "aclose", None)) is not None:
+                await close()
+
+        async def next_value() -> tuple[bool, PlatformEvent | None]:
+            nonlocal iterator, pulling
+            if closing.is_set():
+                return False, None
+            if iterator is None:
+                iterator = self._port.target.watch().__aiter__()
+            pulling = True
+            try:
+                return True, await anext(iterator)
+            except StopAsyncIteration:
+                return False, None
+            finally:
+                pulling = False
+                if closing.is_set():
+                    await close_iterator()
+
+        try:
+            while True:
+                job = self._port.runner.submit(lambda: _invoke(next_value, self._port.options, allow_cancel=True))
+                try:
+                    available, value = _unwrap(await job.wait())
+                except asyncio.CancelledError:
+                    closing.set()
+                    job.cancel()
+                    raise
+                if not available:
+                    return
+                if type(value) is not PlatformEvent:
+                    raise InternalError("Platform source returned an invalid event")
+                yield value
+        finally:
+            closing.set()
+            with suppress(Exception, asyncio.CancelledError):
+                _unwrap(await self._port.runner.call(lambda: _invoke(close_iterator, self._port.options), timeout_s=self._port.options.cancel_grace_s, control=True))
 
 
 class _Reconciler:
@@ -504,9 +595,13 @@ class IsolatedPorts:
         reconciler: Reconciler | ThreadBinding[Reconciler] | None,
         robot_state: RobotStateProvider | ThreadBinding[RobotStateProvider] | None,
         options: RuntimeOptions,
+        *,
+        event_source: PlatformEventSource | ThreadBinding[PlatformEventSource] | None = None,
+        event_repository: PlatformEventRepository | ThreadBinding[PlatformEventRepository] | None = None,
     ) -> None:
         originals = [repository, *skills.values()]
         originals.extend(value for value in (reconciler, robot_state) if value is not None)
+        originals.extend(value for value in (event_source, event_repository) if value is not None)
         unique: dict[int, Any] = {}
         assignments: dict[int, tuple[str, str | int | None]] = {}
         for value in originals:
@@ -551,6 +646,10 @@ class IsolatedPorts:
                            if reconciler is not None else None)
         self.robot_state = (_RobotState(self._ports[id(unwrap_thread_binding(robot_state))])
                            if robot_state is not None else None)
+        self.event_source = (_PlatformEventSource(self._ports[id(unwrap_thread_binding(event_source))])
+                             if event_source is not None else None)
+        self.event_repository = (_PlatformEventRepository(self._ports[id(unwrap_thread_binding(event_repository))])
+                                 if event_repository is not None else None)
 
     async def prepare(self) -> None:
         async def prepare_group(skills: list[_Skill]) -> None:
@@ -603,8 +702,12 @@ def isolate_ports(
     reconciler: Reconciler | ThreadBinding[Reconciler] | None,
     robot_state: RobotStateProvider | ThreadBinding[RobotStateProvider] | None,
     options: RuntimeOptions,
+    *,
+    event_source: PlatformEventSource | ThreadBinding[PlatformEventSource] | None = None,
+    event_repository: PlatformEventRepository | ThreadBinding[PlatformEventRepository] | None = None,
 ) -> IsolatedPorts:
-    return IsolatedPorts(repository, skills, reconciler, robot_state, options)
+    return IsolatedPorts(repository, skills, reconciler, robot_state, options,
+                         event_source=event_source, event_repository=event_repository)
 
 
 class IsolatedAdmissionValidator:

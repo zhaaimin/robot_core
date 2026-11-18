@@ -3,6 +3,7 @@ from collections.abc import Mapping
 from types import MappingProxyType
 
 from robot_agent_runtime.adapters.cc_api.driver import CcApiDriver
+from robot_agent_runtime.adapters.cc_api.events import CcApiEventSource
 from robot_agent_runtime.adapters.cc_api.contracts import CcApiClient
 from robot_agent_runtime.adapters.cc_api.speech import CcApiSpeechSkill
 from robot_agent_runtime.adapters.cc_api.robotinfo import CcApiRobotInfoSkill
@@ -29,8 +30,12 @@ class CcApiPlatform:
         self, api: CcApiClient, *, stop_timeout_s: float = 5.0,
         options: RuntimeOptions | None = None,
         skill_thread_group: str | None = None,
+        enable_events: bool = False,
     ) -> None:
+        if type(enable_events) is not bool:
+            raise InvalidRequest("enable_events must be a boolean")
         self._driver = CcApiDriver(api, options=options)
+        self._event_source = CcApiEventSource(self._driver, options=options) if enable_events else None
         self._speech = CcApiSpeechSkill(self._driver, stop_timeout_s=stop_timeout_s)
         self._robotinfo = CcApiRobotInfoSkill(self._driver)
         # Both skills share one CcApiDriver, whose methods must run on a single
@@ -65,6 +70,10 @@ class CcApiPlatform:
     def reconciler(self) -> Reconciler | None:
         return None
 
+    @property
+    def event_source(self) -> CcApiEventSource | None:
+        return self._event_source
+
     def _owner(self) -> None:
         loop = asyncio.get_running_loop()
         if self._loop is None:
@@ -84,7 +93,11 @@ class CcApiPlatform:
         try:
             await self._speech.start()
             await self._robotinfo.start()
+            if self._event_source is not None:
+                await self._event_source.start()
         except Exception as error:
+            if self._event_source is not None:
+                await self._event_source.close()
             try:
                 await self._driver.close()
             except Exception as cleanup:
@@ -105,7 +118,10 @@ class CcApiPlatform:
             except Exception:
                 pass
         errors: list[Exception] = []
-        for close in (self._speech.close, self._robotinfo.close, self._driver.close):
+        closers = [self._speech.close, self._robotinfo.close, self._driver.close]
+        if self._event_source is not None:
+            closers.insert(0, self._event_source.close)
+        for close in closers:
             try:
                 await close()
             except Exception as error:
@@ -119,6 +135,7 @@ class CcApiPlatform:
 def create_cc_api_platform(
     api: CcApiClient, *, stop_timeout_s: float = 5.0, options: RuntimeOptions | None = None,
     skill_thread_group: str | None = None,
+    enable_events: bool = False,
 ) -> RobotPlatform:
     return CcApiPlatform(api, stop_timeout_s=stop_timeout_s, options=options,
-                         skill_thread_group=skill_thread_group)
+                         skill_thread_group=skill_thread_group, enable_events=enable_events)

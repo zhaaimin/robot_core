@@ -13,7 +13,7 @@ from robot_agent_runtime.errors import AgentRuntimeError, InvalidRequest
 from robot_agent_runtime.hosting.kernel_host import KernelHost
 from robot_agent_runtime.models import TaskRequest
 from robot_agent_runtime.options import RuntimeOptions
-from robot_agent_runtime.ports import Reconciler, RobotStateProvider, Skill, TaskRepository
+from robot_agent_runtime.ports import PlatformEventRepository, PlatformEventSource, Reconciler, RobotStateProvider, Skill, TaskRepository
 from robot_agent_runtime.thread_binding import ThreadBinding
 from robot_agent_runtime.transport.wire import (
     MAX_MESSAGE_BYTES,
@@ -36,10 +36,12 @@ class RuntimeServer:
         allowed_permissions: set[str] | None = None,
         robot_state: RobotStateProvider | ThreadBinding[RobotStateProvider] | None = None,
         options: RuntimeOptions | None = None,
+        event_source: PlatformEventSource | ThreadBinding[PlatformEventSource] | None = None,
+        event_repository: PlatformEventRepository | ThreadBinding[PlatformEventRepository] | None = None,
     ) -> None:
         self._options = options or RuntimeOptions()
         self._host = KernelHost(repository, skills, reconciler, allowed_permissions, robot_state,
-                                options=self._options)
+                                options=self._options, event_source=event_source, event_repository=event_repository)
         self._socket_path = socket_path
         self._server: asyncio.Server | None = None
         self._handlers: set[asyncio.Task[None]] = set()
@@ -201,9 +203,9 @@ class RuntimeServer:
                 raise InvalidRequest("Request method must be a non-empty string")
             if not isinstance(params, dict):
                 raise InvalidRequest("Request params must be an object")
-            streaming = method == "subscribe_task_events"
+            streaming = method in {"subscribe_task_events", "subscribe_platform_events", "subscribe_all_task_events"}
             if streaming:
-                await self._handle_subscription(request_id, params, reader, writer)
+                await self._handle_subscription(request_id, params, reader, writer, method=method)
                 return
             result = await self._dispatch(method, params)
             await write_message(writer, {"id": request_id, "ok": True, "result": result})
@@ -258,16 +260,21 @@ class RuntimeServer:
         params: dict[str, Any],
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
+        *, method: str = "subscribe_task_events",
     ) -> None:
-        task_id = self._task_id(params)
-        after_sequence = params.get("after_sequence", 0)
-        if (
-            not isinstance(after_sequence, int)
-            or isinstance(after_sequence, bool)
-            or after_sequence < 0
-        ):
-            raise InvalidRequest("after_sequence must be a non-negative integer")
-        subscription = self._host.subscribe_task_events(task_id, after_sequence)
+        if method == "subscribe_platform_events":
+            after_cursor = params.get("after_cursor", 0)
+            if type(after_cursor) is not int or after_cursor < 0:
+                raise InvalidRequest("after_cursor must be a nonnegative integer")
+            subscription = self._host.subscribe_platform_events(after_cursor, self._event_types(params))
+        elif method == "subscribe_all_task_events":
+            subscription = self._host.subscribe_all_task_events(self._event_types(params))
+        else:
+            task_id = self._task_id(params)
+            after_sequence = params.get("after_sequence", 0)
+            if type(after_sequence) is not int or after_sequence < 0:
+                raise InvalidRequest("after_sequence must be a non-negative integer")
+            subscription = self._host.subscribe_task_events(task_id, after_sequence)
         iterator = subscription.__aiter__()
         next_event = asyncio.create_task(anext(iterator))
         disconnected = asyncio.create_task(reader.read(1))
@@ -303,3 +310,12 @@ class RuntimeServer:
                     pending.cancel()
             await asyncio.gather(next_event, disconnected, return_exceptions=True)
             await iterator.aclose()
+
+    @staticmethod
+    def _event_types(params: dict[str, Any]) -> set[str] | None:
+        values = params.get("event_types")
+        if values is None:
+            return None
+        if type(values) is not list or any(type(value) is not str or not value.strip() for value in values):
+            raise InvalidRequest("event_types must be a list of nonempty strings")
+        return set(values)

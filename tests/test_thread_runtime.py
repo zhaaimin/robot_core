@@ -77,6 +77,38 @@ async def test_close_does_not_force_cancel_protected_started_work() -> None:
         await owner.close()
 
 
+async def test_close_waits_for_actual_thread_exit_after_loop_stop_acknowledgement() -> None:
+    from robot_agent_runtime.hosting.thread_runtime import LoopThread
+
+    caller = asyncio.get_running_loop()
+    tail_entered = asyncio.Event()
+    release = threading.Event()
+
+    class TailOwner(LoopThread):
+        def _run(self) -> None:
+            try:
+                super()._run()
+            finally:
+                caller.call_soon_threadsafe(tail_entered.set)
+                release.wait(2)
+
+    owner = TailOwner("actual-exit")
+    await owner.start()
+    try:
+        await owner.close(grace_s=0)
+        await asyncio.wait_for(tail_entered.wait(), 1)
+        started = caller.time()
+        await owner.close(grace_s=0.05)
+        assert caller.time() - started >= 0.04
+        assert owner._thread.is_alive()
+        release.set()
+        await owner.close(grace_s=1)
+        assert not owner._thread.is_alive()
+    finally:
+        release.set()
+        await owner.close()
+
+
 def test_thread_isolation_errors_have_structured_codes() -> None:
     for name, code in (
         ("ExtensionCapacityExceeded", "EXTENSION_CAPACITY_EXCEEDED"),

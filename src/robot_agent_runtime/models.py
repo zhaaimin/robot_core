@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Annotated, Any, Literal
+from uuid import uuid4
 
 from pydantic import AfterValidator, BaseModel, Field
 
@@ -101,6 +102,23 @@ class Event(BaseModel):
     event_type: str
     timestamp: UTCDateTime = Field(default_factory=lambda: datetime.now(UTC))
     data: dict[str, Any] = Field(default_factory=dict)
+
+
+class PlatformEvent(BaseModel):
+    """Opaque platform facts, independent of tasks and their sequence counters.
+
+    Sources submit cursor zero; the event journal assigns the authoritative
+    resume position. A retained event ID identifies the same immutable fact.
+    Runtime code never interprets vendor payloads or infers physical safety.
+    """
+
+    event_id: str = Field(default_factory=lambda: uuid4().hex, min_length=1, pattern=r"\S")
+    source: str = Field(min_length=1, pattern=r"\S")
+    event_type: str = Field(min_length=1, pattern=r"\S")
+    timestamp: UTCDateTime = Field(default_factory=lambda: datetime.now(UTC))
+    data: dict[str, Any] = Field(default_factory=dict)
+    task_id: str | None = None
+    cursor: int = Field(default=0, ge=0, strict=True)
 
 
 class ActionOutcome(BaseModel):

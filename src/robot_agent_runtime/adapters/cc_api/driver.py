@@ -19,6 +19,7 @@ from robot_agent_runtime.adapters.cc_api.contracts import CcApiClient, CcApiResp
 
 
 _FINISHED = "cc.api.work.finished"
+_FAULT_UPDATE = "cc.api.fault.current.update"
 T = TypeVar("T")
 
 
@@ -55,6 +56,7 @@ class CcApiDriver:
         self._close_task: asyncio.Task[None] | None = None
         self._pending: dict[asyncio.Future[Any], bool] = {}
         self._finished: dict[object, Callable[[str], None]] = {}
+        self._faults: dict[object, Callable[[Any], None]] = {}
         self._failures: dict[object, Callable[[AgentRuntimeError], None]] = {}
         self._callback_lock = threading.Lock()
         self._accept_callbacks = False
@@ -63,6 +65,8 @@ class CcApiDriver:
         self._registered = False
         self._subscribe_attempted = False
         self._disconnect_registered = False
+        self._fault_registered = False
+        self._fault_enabled = False
 
     def _owner(self) -> asyncio.AbstractEventLoop:
         loop = asyncio.get_running_loop()
@@ -80,11 +84,15 @@ class CcApiDriver:
     ) -> Callable[[], None]:
         return self._subscribe(self._failures, callback)
 
+    def subscribe_fault(self, callback: Callable[[Any], None]) -> Callable[[], None]:
+        return self._subscribe(self._faults, callback)
+
     def _subscribe(self, subscribers: dict[object, T], callback: T) -> Callable[[], None]:
         self._owner()
         if self._closed or self._failure is not None:
             raise RobotConnectionError("CC driver is unavailable")
-        if len(self._finished) + len(self._failures) >= self._options.max_subscriptions:
+        if (len(self._finished) + len(self._failures) + len(self._faults)
+                >= self._options.max_subscriptions):
             raise ExtensionCapacityExceeded("CC driver subscription capacity is exhausted")
         token = object()
         subscribers[token] = callback
@@ -120,6 +128,27 @@ class CcApiDriver:
             except Exception as cleanup:
                 raise ExceptionGroup("CC driver startup and cleanup failed", [failure, cleanup]) from None
             raise failure from None
+
+    async def start_fault_events(self) -> None:
+        """Explicitly activate the optional vendor fault stream once.
+
+        Fault updates describe physical state and never invalidate admission.
+        The SDK has no fault-unsubscribe method; its callback remains owned by
+        this driver until close, while subscribers detach independently.
+        """
+        await self.start()
+        if self._fault_enabled:
+            return
+        try:
+            self._fault_registered = True
+            self._api.add_service(_FAULT_UPDATE, self._on_fault)
+            self._api.notify("cc.api.fault.subscribe")
+        except BaseException as error:
+            failure = RobotConnectionError("Could not subscribe to CC API fault events",
+                                           details={"cause": type(error).__name__})
+            self.invalidate(failure)
+            raise failure from None
+        self._fault_enabled = True
 
     async def request(
         self, method: str, params: dict[str, Any], *, on_dispatch: Callable[[], None] | None = None,
@@ -257,6 +286,23 @@ class CcApiDriver:
     def _on_disconnect(self) -> None:
         self._post(self.invalidate, RobotConnectionError("CC API disconnected"))
 
+    def _on_fault(self, request_id: Any, params: Any) -> None:
+        del request_id
+        try:
+            payload = bounded_snapshot(params, max_bytes=self._options.max_snapshot_bytes,
+                                       max_depth=self._options.max_snapshot_depth)
+        except BaseException:
+            self._post(self.invalidate, RobotResponseError("Invalid or oversized CC fault payload"))
+            return
+        self._post(self._publish_fault, payload)
+
+    def _publish_fault(self, payload: Any) -> None:
+        for token, callback in tuple(self._faults.items()):
+            if token in self._faults:
+                values = bounded_snapshot(payload, max_bytes=self._options.max_snapshot_bytes,
+                                          max_depth=self._options.max_snapshot_depth)
+                self._publish({token: callback}, values)
+
     async def close(self) -> None:
         self._owner()
         if self._close_task is None:
@@ -270,6 +316,8 @@ class CcApiDriver:
         self.invalidate(RobotConnectionError("CC driver closed"))
         errors: list[Exception] = []
         cleanups: list[Callable[[], None]] = []
+        if self._fault_registered:
+            cleanups.append(lambda: self._api.remove_service(_FAULT_UPDATE))
         if self._subscribe_attempted:
             cleanups.append(lambda: self._api.notify("cc.api.work.unsubscribe"))
         if self._registered:
@@ -283,6 +331,7 @@ class CcApiDriver:
                 errors.append(RobotConnectionError("Could not detach CC API callbacks",
                               {"cause": type(error).__name__}))
         self._finished.clear()
+        self._faults.clear()
         self._failures.clear()
         self._started = False
         if len(errors) == 1:

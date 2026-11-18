@@ -20,6 +20,7 @@ from pathlib import Path
 from robot_agent_runtime.adapters.simulator import Simulator
 from robot_agent_runtime.transport.server import RuntimeServer
 from robot_agent_runtime.repositories.sqlite import SQLiteTaskRepository
+from robot_agent_runtime.repositories.platform_events import SQLitePlatformEventRepository
 
 
 def _ensure_database_parent(database_path: str) -> None:
@@ -117,9 +118,11 @@ async def serve_cc(
         api.start()
         if not api.wait_until_connected(5000):
             raise RobotConnectionError("CC API did not connect within 5 seconds")
-        platform = create_cc_api_platform(api, skill_thread_group="audio")
+        platform = create_cc_api_platform(api, skill_thread_group="audio", enable_events=True)
         server = RuntimeServer(
             SQLiteTaskRepository(database_path), platform.skills, socket_path,
+            event_source=platform.event_source,
+            event_repository=SQLitePlatformEventRepository(database_path),
         )
         try:
             await platform.start()

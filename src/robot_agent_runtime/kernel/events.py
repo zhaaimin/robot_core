@@ -1,7 +1,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 
-from robot_agent_runtime.errors import EventStreamOverflow, InternalError
+from robot_agent_runtime.errors import EventStreamOverflow, InternalError, InvalidRequest
 from robot_agent_runtime.models import Event, TaskState
 from robot_agent_runtime.ports import TaskRepository
 
@@ -21,10 +21,18 @@ class EventBus:
         self._watermarks: dict[asyncio.Queue[Event | EventStreamOverflow | None], int] = {}
         self._overflowed: set[asyncio.Queue[Event | EventStreamOverflow | None]] = set()
         self._closed = False
+        self._all_subscribers: dict[asyncio.Queue[Event | EventStreamOverflow | None], frozenset[str]] = {}
 
     def publish(self, event: Event) -> None:
         if self._closed:
             return
+        for queue, event_types in tuple(self._all_subscribers.items()):
+            if queue in self._overflowed or (event_types and event.event_type not in event_types):
+                continue
+            if queue.qsize() >= self._queue_size:
+                self._overflow("*", queue)
+            else:
+                queue.put_nowait(event.model_copy(deep=True))
         for queue in tuple(self._subscribers.get(event.task_id, ())):
             if queue in self._overflowed:
                 continue
@@ -45,8 +53,8 @@ class EventBus:
             EventStreamOverflow(
                 "Event stream overflow; resubscribe to replay missed events",
                 details={
-                    "task_id": task_id,
-                    "after_sequence": self._watermarks.get(queue, 0),
+                    **({"stream": "all_task_events", "recovery": "replay tasks individually"}
+                       if task_id == "*" else {"task_id": task_id, "after_sequence": self._watermarks.get(queue, 0)}),
                     "queue_size": self._queue_size,
                 },
             )
@@ -66,6 +74,30 @@ class EventBus:
             if len(page) < self._page_size:
                 return
             await asyncio.sleep(0)
+
+    async def subscribe_all(self, event_types: set[str] | None = None) -> AsyncIterator[Event]:
+        """Observe all future task facts without inventing a global sequence.
+
+        Registration happens on the first pull. This live-only observation has
+        no cross-task replay cursor; recover task histories through subscribe.
+        """
+        if event_types is not None and (type(event_types) not in (set, frozenset) or any(type(value) is not str or not value.strip() for value in event_types)):
+            raise InvalidRequest("event_types must be a set of nonempty strings")
+        if self._closed:
+            return
+        queue: asyncio.Queue[Event | EventStreamOverflow | None] = asyncio.Queue(maxsize=self._queue_size + 1)
+        self._all_subscribers[queue] = frozenset(event_types or ())
+        try:
+            while True:
+                value = await queue.get()
+                if value is None:
+                    return
+                if isinstance(value, EventStreamOverflow):
+                    raise value
+                yield value
+        finally:
+            self._all_subscribers.pop(queue, None)
+            self._overflowed.discard(queue)
 
     async def subscribe(
         self, task_id: str, after_sequence: int = 0
@@ -125,6 +157,8 @@ class EventBus:
         for task_subscribers in subscribers.values():
             for queue in task_subscribers:
                 queue.put_nowait(None)
+        for queue in tuple(self._all_subscribers):
+            queue.put_nowait(None)
 
     @staticmethod
     def _is_terminal(event: Event) -> bool:
