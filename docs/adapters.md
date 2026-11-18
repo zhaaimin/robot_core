@@ -1,6 +1,5 @@
 # 技能定义与厂商接入
 
-> 本文由 README 拆分而来，正文未改动。
 > 返回 [README](../README.md) · 相关：[架构](architecture.md) · [SDK 参考](sdk-reference.md)
 
 ## 技能定义
@@ -79,13 +78,65 @@ ROS 2 都可在自己的驱动和技能里转换。`adapters.cc_api.contracts` �
 `CcApiResponse` 描述 CC SDK 边界，通用 `ports.py` 只保留厂商无关的运行时契约。
 未实现状态源或对账器时明确返回 `None`，不推测设备可用或动作已经完成。
 
+平台可额外提供 `event_source: PlatformEventSource | ThreadBinding[PlatformEventSource] | None`。
+这是 `from_platform` 通过可选属性读取的扩展，旧平台无需补齐。它只提供 `watch()` 异步流，
+不规定厂商使用回调、HTTP、SDK 或 ROS 2；不把厂商生命周期放入内核。来源创建
+`PlatformEvent(cursor=0, source=..., event_type=..., data=...)`，日志分配恢复游标。
+原生回调须桥接到所属循环并交接有界快照，不能跨线程操作 asyncio 队列。来源与日志的
+线程绑定和容量沿用既有规则；需要持久化时向 `from_platform` 传 `event_repository`。
+
+## CC 平台故障事件
+
+`create_cc_api_platform(api, enable_events=False)` 默认不启用事件，`event_source` 返回 `None`，
+旧语音接入无需改动。显式启用后，平台拥有 `CcApiEventSource` 并随平台启动 / 关闭，
+运行时仍仅消费该端口：
+
+```python
+from robot_agent_runtime.adapters.cc_api import create_cc_api_platform
+from robot_agent_runtime.repositories.platform_events import SQLitePlatformEventRepository
+from robot_agent_runtime.sdk import RobotRuntime
+
+platform = create_cc_api_platform(api, enable_events=True)
+await platform.start()
+try:
+    runtime = RobotRuntime.from_platform(
+        repository, platform,
+        allowed_permissions={"audio"},
+        event_repository=SQLitePlatformEventRepository("runtime.db"),
+    )
+    await runtime.start()
+    try:
+        # runtime.subscribe_platform_events() 也能观察没有任务时的设备变化。
+        ...
+    finally:
+        await runtime.close()
+finally:
+    await platform.close()
+```
+
+`CcApiDriver` 统一持有 `cc.api.fault.current.update` 回调并调用 `cc.api.fault.subscribe`；
+故障通知订阅和通信失效订阅相互独立，源关闭只删除自己的订阅。开始采集时查询
+`cc.api.fault.current.get`，发出 `robot.fault.snapshot`，后续回调发出 `robot.fault.changed`，
+连续相同的变化载荷会合并，初始查询期间缓冲的不同变化保留。驱动仍由平台最后释放。
+
+事件 `source="cc_api"`，厂商结构保留在 `data.payload`。故障 schema 及快照 / 回调的
+顺序栅栏尚未验证，事件标记 `data.sync.initial_snapshot_order="unverified"`；交付先后
+不构成设备时间上的权威顺序，不臆造 raised / cleared、严重度或安全结论。断连先产生
+`robot.connection.lost`，再以 `PlatformEventSourceUnavailable` 结束来源；不伪造空故障集合，
+不自动重连或重试。来源失效不等于任务动作已经停止，停止确认与资源隔离规则保持原样。
+
+`robot-agent-runtime serve-cc` 显式启用事件，并用 `--database` 对应文件创建独立
+`SQLitePlatformEventRepository`；CLI 参数不变。平台日志与任务仓储各自管理连接和事务。
+远程消费使用 `RemoteRuntime.subscribe_platform_events`，网络转发见
+[SDK 参考](sdk-reference.md#平台事件与通知)，不需要启用自研 Agent。
+
 ## CC API 语音播报
 
 `create_cc_api_platform` 接受已连接、专用的 `ubt_robot.Api` 实例，装配驱动和
-`audio.speak` 技能。首版无状态源和对账器。平台管理请求、订阅和技能，应用继续管理
+`audio.speak` 与机器人信息查询技能。当前无状态源和对账器。平台管理请求、订阅和技能，应用继续管理
 SDK 的 initialize/start/stop，不自动重连。
 
-工厂参数 `skill_thread_group` 默认为 `None`，保持技能独占；显式传入非空组名时，
+工厂参数 `skill_thread_group` 默认为 `None`，同驱动技能使用共享线程；显式传入非空组名时，
 平台返回 `ThreadBinding.group(skill, name)`。语音 demo 显式使用 `"audio"`，保留示例原有
 分组。技能本身仍把厂商通信交回驱动所属的应用循环，此分组配置不迁移 SDK 连接。
 

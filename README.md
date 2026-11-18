@@ -76,7 +76,23 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-更多可运行示例见 [examples/README.md](examples/README.md)（嵌入式、远程、前置条件、CC 语音）。
+更多可运行示例见 [examples/README.md](examples/README.md)（嵌入式、远程、前置条件、能力监听、平台事件、CC 语音）。
+
+统一能力客户端提供 `robot.add_task_listener(on_done=...)` 与
+`robot.add_platform_listener(on_event=...)`。前者默认自动跟踪本客户端后续 invoke，后者接收
+设备事实（包括故障）；on_error 可省略。用完调用 `await robot.close_listeners()` 释放回调资源。
+完整示例见 [capability_listeners_demo.py](examples/capability_listeners_demo.py)，
+接口与生命周期见 [能力层说明](capabilities/README.md#注册任务和平台监听)。
+
+空闲时的设备变化通过独立的可选平台事件流观察：给 `RobotRuntime` / `RuntimeServer` 配置
+`event_source`，再用 `subscribe_platform_events(after_cursor=...)` 回放并接续实时消息。
+`PlatformEvent` 先写日志再交付，默认使用有界内存日志；需要重启恢复时显式提供
+`SQLitePlatformEventRepository`。平台游标与任务内 `sequence` 分开，事件载荷不参与安全判定。
+使用统一能力客户端时，可通过 `RobotCapabilities.subscribe_events(after_cursor=...)` 消费同一
+事件流；显式 `sources={'task','platform'}` 可同时观察任务终态与设备事实，指定 task_ids 可补收
+快速完成任务。任务序号与平台游标分别恢复；默认平台行为不变，旧任务后端无需增加全局订阅能力。
+无硬件示例见 [platform_events_demo.py](examples/platform_events_demo.py)，恢复与网络转发边界见
+[SDK 参考](docs/sdk-reference.md#平台事件与通知)。
 
 ## 四种接入方式
 
@@ -119,9 +135,9 @@ if __name__ == "__main__":
 | 文档 | 内容 |
 | --- | --- |
 | [架构与模块结构](docs/architecture.md) | 分层、线程归属、模块路径、当前范围 |
-| [SDK 与公开 API](docs/sdk-reference.md) | 公开方法、监听执行模式、关闭顺序 |
+| [SDK 与公开 API](docs/sdk-reference.md) | 公开方法、平台事件、通知与 WebSocket 转发、监听执行模式 |
 | [生命周期、前置条件与恢复](docs/lifecycle.md) | 状态机、重启核对、降级行为 |
-| [技能定义与厂商接入](docs/adapters.md) | `SkillDefinition`、`RobotPlatform`、CC 语音 |
+| [技能定义与厂商接入](docs/adapters.md) | `SkillDefinition`、`RobotPlatform`、CC 语音与故障事件 |
 | [统一接入说明](docs/agent-integration.md) | 外部 Agent 接入的最短路径 |
 | [任务执行与恢复详解](docs/task-execution-and-recovery.md) | 端到端流程、持久化差异、Reconciler 范围 |
 | [测试与验证边界](docs/testing.md) | 覆盖了什么，没覆盖什么 |
@@ -135,13 +151,15 @@ if __name__ == "__main__":
 
 **已实现**：运行时内核、技能框架、Python SDK（嵌入式 + 远程）、UDS 守护进程、SQLite 持久化、
 模拟适配器、厂商接入契约、CC 语音技能、注册式任务监听、有界停止确认与失控资源隔离、
-任务总期限、事件分页与有界关闭。
+任务总期限、事件分页与有界关闭、独立平台事件日志、全任务实时订阅、可选通知出口和
+已连接 WebSocket 的顺序转发。`serve-cc` 启用 CC 故障事件与 SQLite 日志；既有工厂默认不启用事件。
 
 **未实现**：调度器（`priority` 已持久化但不参与排序，无并发上限与抢占）、结构化日志、
 自动重规划、回调进程隔离、云端管理平面。
 
 **尚未在真实硬件上验证**：真实模型凭据下的规划质量与动作效果（协议层用本地 HTTP 测试服务验证）；
 酒店/导览的导航目标需部署方填入地图数据；未见连接真实麦克风/ASR 或随行检测。
+CC 故障载荷结构及初始快照与增量的顺序栅栏尚未验证，当前保留原始载荷，不推断解除或严重度。
 
 **不是功能安全**：线程边界保护内核不被阻塞的 Python 回调拖住，不提供硬实时保证；
 真正的急停必须是硬件回路，这里的 `estop.clear` 只做准入判定，不是安全仪表功能。

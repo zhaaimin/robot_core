@@ -95,6 +95,71 @@ observed = await robot.invoke(
 SDK 的 operation_id/wait 使用关键字参数，MCP 将它们放入协议信封；业务 params 的 schema 相同。
 RobotCapabilities 不负责 runtime 连接、厂商平台或模型的 start/close。
 
+### Python 主动事件
+
+需要注册一次后继续 invoke 时，分别使用任务和平台监听：
+
+```python
+async def handle_done(task):
+    print('任务终态', task.id, task.state, task.result, task.error)
+
+async def handle_platform(event):
+    print('设备事实', event.event_type, event.data)  # 故障也在这里处理。
+
+task_listener = robot.add_task_listener(on_done=handle_done)
+platform_listener = robot.add_platform_listener(on_event=handle_platform)
+try:
+    await robot.invoke('robot_speak', {'message': '欢迎光临'}, operation_id='greeting-43')
+    await task_listener.wait()
+finally:
+    await robot.close_listeners()
+```
+
+这里 runtime 已配置平台事件源。任务监听默认只跟踪本能力客户端注册后的 invoke，旧任务
+使用 task_ids；on_done 包含成功 / 失败 / 取消等完整终态 Task。平台监听包含设备故障，
+不因此调用监听错误回调。on_error 可选，省略时由事件循环报告观察 / 回调异常；任务回调
+形参为 `(task_id | None, error)`，平台为 `(error)`。正常注销不触发 on_error。
+close_listeners 只释放本能力客户端监听和共享回调池，之后不再新增监听；runtime 仍由应用
+关闭。完整接口、线程和恢复边界见 [能力监听说明](../capabilities/README.md#注册任务和平台监听)。
+当前 McpRuntime 支持此任务监听，但不提供平台或全任务实时接口。
+
+两个监听入口均可设置 execution='caller'（默认）、'group' 或 'dedicated'。例如给任务与
+平台同时传 execution='group', group='reporting'，就会在本能力客户端共用一个回调 loop。
+同步函数、异步函数和返回的 awaitable 均在所选隔离 loop；订阅仍留在业务观察 loop。
+同名组不跨能力客户端或底层 SDK 共享。需要直接访问业务 loop 的 WebSocket、队列等对象时
+保持 caller，或通过线程安全桥接通知其所属 loop；不能从组 loop 直接复用这些对象。
+资源预算通过 RobotCapabilities.create(..., listener_options=RuntimeOptions(...)) 配置。
+
+Agent 可以通过同一个能力客户端接收任务终态和平台事实。已知任务用历史回放避免错过快速完成；
+下面 runtime 同时配置了平台事件，task_id 与两个已处理位置由应用保存：
+
+```python
+from contextlib import aclosing
+from robot_agent_runtime.models import Event
+
+async with aclosing(robot.subscribe_events(
+    sources={'task', 'platform'}, task_ids={task_id},
+    after_cursor=processed_platform_cursor,
+    after_sequences={task_id: processed_task_sequence}, task_terminal_only=True,
+)) as events:
+    async for event in events:
+        print(event.event_type, event.data)
+        if isinstance(event, Event):
+            print(event.task_id, event.sequence)  # 按任务保存已处理序号。
+        else:
+            print(event.cursor)  # 分别保存已处理的平台游标。
+```
+
+门面保留原始 `Event | PlatformEvent`，默认仍只订阅平台。全任务监控省略 task_ids，使用可选
+全任务实时流，没有就绪握手、历史补收或跨任务游标承诺；可靠结果通知优先指定任务 ID。
+任务终态包括失败 / 取消 / 未知 / 待对账，不代表物理动作已停止；需要完整结果时查询任务快照。
+退出订阅不关闭共享连接或取消物理任务，不自动重试、重连或激活模型。
+`allowed_skills` 只限制工具，事件可见范围须在
+应用 / 网关单独控制。无事件接口的后端明确抛 `CAPABILITY_EVENTS_UNSUPPORTED`；
+原始网络中断报告 `CAPABILITY_EVENT_TRANSPORT_FAILED`，运行时结构化错误保持原码与详情。
+当前 `McpRuntime` 可观察明确 task_ids，但没有平台 / 全任务实时接口；缺少所请求来源会明确
+报错，不静默降级。Python 门面不自动改变 MCP 的工具或通知协议。
+
 ## 当前边界
 
 - Runtime 继续独立发布，不依赖能力包、MCP、LangGraph 或某个 Agent。

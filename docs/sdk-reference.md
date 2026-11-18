@@ -1,6 +1,5 @@
 # SDK 与公开 API 参考
 
-> 本文由 README 拆分而来，正文未改动。
 > 返回 [README](../README.md) · 相关：[架构](architecture.md) · [生命周期与安全](lifecycle.md)
 
 ## 公开 API
@@ -13,6 +12,69 @@ MCP 原五项任务工具保留，并按同一白名单提供 robot_speak、robo
 robot_task_status/robot_cancel_task；技能调用信封为 `{operation_id, params, wait=false}`。
 默认键为 `robot:{operation_id}`，旧 RobotTools 的 `agent:` 键保持不变；不要跨命名空间重发旧动作。
 完整 Python 示例和 Codex/Claude Code stdio 配置见 [统一接入说明](agent-integration.md)。
+
+能力客户端还提供两个分开的回调入口，均返回 `robot_agent_capabilities.ports.ListenerHandle`：
+
+| 方法 | 说明 |
+| --- | --- |
+| `robot.add_task_listener(*, on_event=None, on_done=None, on_error=None, task_ids=None, all_tasks=False, event_types=None, execution="caller", group=None)` | 默认跟踪注册后本能力客户端 invoke 返回的任务；指定 task_ids 则只回放 / 观察这些任务 |
+| `robot.add_platform_listener(*, on_event=None, on_error=None, after_cursor=0, event_types=None, execution="caller", group=None)` | 从平台游标回放后接实时；设备故障交付 on_event |
+| `await robot.close_listeners()` | 关闭本客户端监听及共享回调池；之后拒绝新增监听，invoke / subscribe_events 仍可使用 |
+
+任务回调分别是 `on_event(Event)`、`on_done(Task)`、`on_error(task_id | None, exception)`；
+平台回调是 `on_event(PlatformEvent)`、`on_error(exception)`。任务业务失败仍走 on_done，
+设备故障仍走平台 on_event；只有观察 / 查询 / 回调失败才走 on_error。on_error 可省略，缺省由
+事件循环异常处理器报告；错误处理器失败不递归，正常注销不报监听错误。
+event_types 只筛选任务 on_event，不隐藏 on_done 的权威终态快照。幂等任务每注册只通知一次。
+等待超时取得任务 ID 后先在后台核对不可变步骤快照，再观察；冲突不会误推送旧任务或阻断
+后续正确调用的登记，查询 / 取消控制工具不自动登记。
+预期步骤在等待提交之前保存不可变 JSON 快照，正常返回、超时后台观察和超时后的补查均
+复用它，不会因调用方随后修改嵌套参数而改变身份判断。捕获仅遍历基础类型和容器，不调用
+外来复制 / 序列化钩子或消费生成器；不可表示输入仍由运行时按原有边界拒绝。
+
+`all_tasks=True` 与 task_ids 互斥，是显式全任务实时模式，无就绪握手 / 历史补收保证，
+终态去重缓存为最近 1000 个任务 ID。普通任务 wait 等待调用时已登记的任务观察，平台 / 全局
+wait 等待流结束；两者均不代表业务成功。句柄支持 wait / close / 只读 closed，注销不取消
+物理任务。取消 wait 不取消后台观察，异步回调可以关闭自身 / 全部监听，但不能 wait 自身。
+
+execution 支持 caller / group / dedicated。caller 默认保持异步回调在观察方循环、同步回调
+共用能力客户端有界池（4 线程、64 排队、5 秒排队期限）。group 的同名组在当前能力客户端
+共享一个专用线程 / loop，任务与平台可以同组；dedicated 按注册独占。两种隔离模式的同步 /
+异步及返回的 awaitable 均在所选 loop 执行，订阅 / 状态查询仍在观察方循环。只有 group
+模式接受非空白 group。组与线程预算不和底层 SDK 或其他能力客户端共享。
+实现复用 SDK ListenerLoops / CallbackLoop，不另实现线程、排队与期限机制。
+
+`RobotCapabilities.create(..., listener_options=RuntimeOptions(...))` 或直接构造时，可为本
+客户端配置 max_listener_threads（默认 16）、max_pending_listener_callbacks（每 loop 默认
+64，含在途）、listener_queue_timeout_s（默认 5 秒）和 cancel_grace_s（默认 0.2 秒）；
+跨 loop 异常净化使用同一 options 的快照预算。不修改后端配置或 caller 同步池限额。
+回调队列满 / 排队过期报告 LISTENER_CALLBACK_QUEUE_FULL / LISTENER_CALLBACK_TIMEOUT；
+错误回调受同一配置约束，无法执行时由观察方循环报告。关闭最后成员 / 连续流自然结束后
+释放线程；未真实结束的阻塞线程仍占预算。回调内自关闭经 SDK 桥接，返回后自行退出线程。
+同组允许异步交错，不保证跨任务 / 来源串行；已有连接和 asyncio 对象须在所属 loop 使用。
+每客户端最多 128 个注册，超限报告 LISTENER_CAPACITY_EXCEEDED。
+平台 / 全局 / 明确 ID 注册需要运行中的循环。用完监听必须
+close_listeners 释放共享池；它不关闭 runtime，已领取的阻塞回调不保证停止。平台处理位点由
+应用在业务处理成功后保存。详细使用示例见
+[能力监听说明](../capabilities/README.md#注册任务和平台监听)。
+
+能力客户端提供 `robot.subscribe_events(*, sources=None, after_cursor=0, event_types=None,
+task_ids=None, after_sequences=None, task_terminal_only=False)`，交付原始 `Event | PlatformEvent`。
+默认仅平台；`sources={'task'}` 只观察任务，两者一起则汇聚。指定 task_ids 时逐任务回放后接
+实时，after_sequences 只用于所选任务；未指定 task_ids 时使用可选全任务实时流，无历史或就绪
+握手保证。task_terminal_only 覆盖全部任务终态，不影响平台事件，也不表示物理停止或成功。
+独立可选 `TaskEventRuntime` / `PlatformEventRuntime` 不扩充原 `TaskRuntime`；新
+`capabilities.events` 只负责来源选择、每流一个在途读取与有界清理，不增加日志或全局序号。
+任务恢复位置是 task_id/sequence，after_cursor 仅是平台位置；内部回看上一条终态后滤掉已处理
+记录，避免恢复到已处理终态时继续等待。不同来源之间不保证全局顺序。
+关闭订阅只清理自持迭代器，不启停 runtime 或取消动作；工具白名单不充当事件授权。
+无事件接口 / 明确未实现时抛 `CapabilityEventsUnsupported`（`CAPABILITY_EVENTS_UNSUPPORTED`）；
+runtime 结构化错误原样传播。原始远程传输中断包装为 `CapabilityEventTransportError`
+（`CAPABILITY_EVENT_TRANSPORT_FAILED`），详情分开保留平台与任务的已交付位置，均不代表业务 ACK。
+清理共享 0.2 秒预算，超限报告 `CAPABILITY_EVENT_CLEANUP_TIMEOUT`；迟到读取会在实际结束后
+清理，迟到错误交给事件循环。主错误 / 取消优先，其余清理失败和超限来源附加在异常 notes 中。
+已知任务流完成后平台流仍可继续；任一来源失败则结束本次聚合。MCP 工具与通知协议不变，
+McpRuntime 仅可用既有单任务接口。用法见 [能力层说明](../capabilities/README.md#任务与平台事件)。
 
 Agent 应用入口为各自独立包提供的 `robot-agent` / `hotel-agent` / `guide-agent`（也可 `python -m robot_agent`、
 `python -m hotel_agent`、`python -m guide_agent`），通过下方公开 SDK 调用 runtime，不增加内核 API。
@@ -50,6 +112,8 @@ MCP 桥接及客户端位于独立包 `robot_runtime_mcp`；酒店通过应用�
 | `cancel_task(task_id)` | 请求取消并在有限停止确认期后返回终态；无法确认时进入待对账状态 |
 | `list_skills()` | 列出已注册技能定义 |
 | `subscribe_task_events(task_id, after_sequence=0)` | 分页回放历史后接续实时事件；订阅容量独立于查询和取消 |
+| `subscribe_all_task_events(event_types=None)` | 首次拉取登记后的全任务实时流；无全局游标，历史仍按单个任务恢复 |
+| `subscribe_platform_events(*, after_cursor=0, event_types=None)` | 从平台日志分页回放后接续实时事件，按独立 `cursor` 恢复 |
 | `add_task_listener(on_event=..., on_done=..., on_error=..., execution="caller", group=None)` | 监听本 SDK 后续提交的任务，返回 `TaskListener`；可选择调用方、分组或独立执行回调 |
 | `close()` | 嵌入式停止内核并限时清理监听；远程模式清理本客户端监听和连接 |
 
@@ -73,8 +137,9 @@ print(final.state, final.result, final.error)
 在关闭 SDK 前继续 `await listener.wait()`。
 
 嵌入式另提供 `RobotRuntime.from_platform(repository, platform, *, allowed_permissions=None,
-options=None)`，消费 `RobotPlatform` 并一次装配技能、状态源和对账器；显式线程绑定原样
-交给宿主，权限与选项传给同一个运行时构造入口。平台启动和关闭继续由应用负责。
+options=None, event_repository=None)`，消费 `RobotPlatform` 并一次装配技能、状态源、对账器和
+可选 `event_source`；显式线程绑定原样交给宿主。旧平台没有 `event_source` 属性时按 `None`
+处理，无需修改。平台启动和关闭继续由应用负责。
 
 `RobotRuntime(..., options=RuntimeOptions(...))` 与
 `RuntimeServer(repository, skills, socket_path, options=RuntimeOptions(...))` 可以配置隔离边界。
@@ -84,6 +149,7 @@ options=None)`，消费 `RobotPlatform` 并一次装配技能、状态源和对�
 |---|---|
 | `skills` | 稳定的只读 `Mapping[str, Skill \| ThreadBinding[Skill]]`，保留每个技能的线程选择 |
 | `robot_state` / `reconciler` | 各自的原始端口或 `ThreadBinding[端口类型]`；没有对应能力时返回 `None` |
+| 可选 `event_source` | `PlatformEventSource` 或其 `ThreadBinding`；不要求旧 `RobotPlatform` 新增属性 |
 | `start()` / `close()` | 启动驱动和技能、确认停止并释放订阅；重复等待共享真实结果 |
 
 服务端直接接收端口，不再接收已创建的 `RuntimeCore`：
@@ -154,6 +220,108 @@ asyncio 引擎，不自动提供线程隔离；面向业务的入口应使用 SD
 `KernelHost.begin_close()` 发起同一次关闭并立即返回，`close()` 等待结果；SDK 先发起
 业务停止，再限时清理监听。停止或排空失败仍继续资源释放并汇总异常。
 
+### 平台事件与通知
+
+`RobotRuntime(..., event_source=None, event_repository=None)` 与 `RuntimeServer` 接受相同的
+可选关键字，端口均可使用 `ThreadBinding`。配置源而未配置日志时使用
+`repositories.platform_events.InMemoryPlatformEventRepository`；需要重启恢复时显式传入
+`SQLitePlatformEventRepository(database, max_events=10000)`。仅配置日志可读取历史；两者均
+省略则不创建平台事件子系统，调用订阅报告 `INVALID_REQUEST`。
+
+`models.PlatformEvent` 包含 `event_id`、`source`、`event_type`、UTC `timestamp`、`data`、
+可选 `task_id` 与非负整数 `cursor`。来源提交 `cursor=0`，日志写入后分配正游标；`source`
+及载荷由来源定义，不带运行时的厂商或安全含义。`ports.PlatformEventSource.watch()` 返回
+异步事件流；应用负责其原始连接与生命周期。`PlatformEventRepository` 的公开契约为
+`start()` / `close()`、`append_platform_event(event)`、
+`list_platform_events(after_cursor=0, limit=128)`、`platform_event_bounds()`，边界为
+`(首个保留游标, 最后已分配游标)`。
+
+```python
+from contextlib import aclosing
+
+from robot_agent_runtime.repositories.platform_events import SQLitePlatformEventRepository
+from robot_agent_runtime.sdk import RobotRuntime
+
+runtime = RobotRuntime(
+    repository, skills,
+    event_source=event_source,
+    event_repository=SQLitePlatformEventRepository("runtime.db"),
+)
+await runtime.start()
+try:
+    async with aclosing(runtime.subscribe_platform_events(after_cursor=saved_cursor)) as events:
+        async for event in events:
+            await process_idempotently(event.event_id, event.data)
+            await save_cursor(event.cursor)  # 业务处理完成后才保存。
+finally:
+    await runtime.close()
+```
+
+两种日志默认只保留最新 10000 条，可用 `max_events` 调整。去重保证限于保留窗口；窗口内
+同一 `event_id` 重提同一事实返回原游标，同 ID 的不同载荷被 `InvalidRequest` 拒绝。
+`after_cursor` 表示最后已处理位置，必须非负且不能大于日志最后游标。
+`after_cursor < earliest_cursor - 1` 时抛
+`PlatformEventCursorExpired`（`PLATFORM_EVENT_CURSOR_EXPIRED`），details 包含
+`after_cursor`、`earliest_cursor`、`latest_cursor`；消费方应重新同步设备当前状态，不能把
+过期当作没有事件。未来游标报告 `INVALID_REQUEST`。内存日志不保证进程崩溃后的恢复。
+
+订阅先登记实时队列再分页回放，按 `cursor` 消除交接重复；`event_types` 为非空字符串集合，
+`None` 或空集合表示全部。过滤不重编号。默认每页 128 条、实时及关闭缓冲各 1000 条，沿用
+`event_page_size` / `max_event_buffer`。慢订阅者溢出报告 `EVENT_STREAM_OVERFLOW` 并携带
+最后实际交付的 `after_cursor`，不阻塞其他订阅者。来源失败或提前结束会先保留已收到的事实，
+再向订阅者报告异常；普通来源异常包装为 `PLATFORM_EVENT_SOURCE_UNAVAILABLE`。
+来源自行抛出 CancelledError 也按来源不可用报告，既有与新订阅均先读历史后报错；运行时
+正常关闭发起的采集取消仍是正常结束，不伪造来源故障。
+日志失败不会修改任务状态。保证从运行时成功保存事件开始，不保证厂商断线期间未观测事实的完整性。
+
+平台采集在 `NotificationHost` 的独立循环运行；源与日志调用使用既有端口隔离，计入外部线程
+总预算。关闭停止采集、有界排空已打开订阅并关闭日志，再释放外部线程；异常不跳过后续释放。
+取消只请求协作退出，不能证明厂商动作或通知的外部副作用已经停止。
+
+`subscribe_all_task_events(event_types=None)` 只观察第一次拉取完成登记之后的任务事件。
+仅创建异步生成器不算登记，也不回放历史；没有跨任务的全局 `sequence`。断线或溢出后，
+按每个任务保存的 `task_id/sequence` 调用 `subscribe_task_events` 恢复。已有注册式任务监听
+仍只观察本 SDK 后续提交的任务，行为不变。
+
+可选 `notifications.notifier.EventNotifier` 通过 `await notifier.consume(stream)` 消费公开流，
+不再接入 Core / EventBus 私有字段。先注册 `add_subscriber(id, channel, event_filter=None)`，
+再 `await notifier.start()`；退出时由应用结束消费并 `await notifier.stop()`。
+`DeliveryChannel` 仅要求异步 `deliver(event) -> bool` 与 `close()`；Webhook 使用
+`add_webhook(id, WebhookEndpoint(...))` 或显式 `WebhookChannel(endpoint, ...)`。
+各订阅者顺序交付并独立失败，默认输入队列和各出口队列均为 1000、最多 128 个订阅者，
+每出口保留最近 1000 个已交付事件 ID 去重。去重缓存有界且不持久化，任务序号不能跨任务
+去重；重复注册替换并关闭旧出口。输入溢出直接抛错；出口溢出或投递失败通过
+`subscriber_error(id)` 查询并停止该出口，不静默丢弃。消费方负责检查状态、持久化处理水位和补收。
+`deliver()` 返回 False 时默认按 1 / 3 / 10 秒重试；默认关闭等待为 5 秒，网络发送或
+`deliver=True` 均不代表业务 ACK。
+
+#### 已连接 WebSocket 的转发
+
+`transport.websocket` 提供两个异步函数，不自带 WebSocket 库或服务：
+
+| 函数 | 消息信封 |
+| --- | --- |
+| `forward_platform_events(runtime, websocket, *, after_cursor=0, event_types=None, send_timeout_s=5.0)` | `{"type":"platform_event","event":{...}}` |
+| `forward_task_events(runtime, websocket, *, event_types=None, send_timeout_s=5.0)` | `{"type":"task_event","event":{...}}`，全任务实时流 |
+
+`websocket` 结构匹配异步 `send(str)` 和 `wait_closed()`；空闲断连也必须唤醒后者。同进程传
+`RobotRuntime`，独立网关传 `RemoteRuntime`。调用方完成握手、认证、机器人可见范围校验和连接
+关闭，一个 socket 只运行一个转发器 / 发送者，顺序发送：
+
+```python
+from robot_agent_runtime.transport.websocket import forward_platform_events
+
+# websocket 已由应用建立并认证，saved_cursor 由客户端在业务处理后保存。
+await forward_platform_events(runtime, websocket, after_cursor=saved_cursor)
+```
+
+断连正常返回；来源 / 发送失败及发送超时向调用方抛出，并清理订阅。发送完成不推进业务确认
+水位；不配合取消的底层发送可能在转发器返回后继续，不能立即在同一连接上启动替代发送者。
+订阅清理的前台等待同样受 send_timeout_s 限制。如果读取抵抗取消，返回后保留一次延迟清理，
+待读取实际结束再调用 aclose，不并发读取和关闭，不发送迟到结果；迟到清理异常交给事件循环
+异常处理器。正在进行的外部操作仍可能继续，不能把有界返回当作副作用已停止。
+这些入口不自动激活 Agent；全任务信封仍保留各任务自身的 `sequence`。
+
 ### 外部对象的线程归属
 
 注册已有对象时可以用 `ThreadBinding` 选择线程，不传绑定保持原有的对象独占行为：
@@ -187,7 +355,7 @@ runtime = RobotRuntime(
 真正的异步 I/O 或 `await asyncio.sleep()` 会让出事件循环，适合使用共享或指定组线程；
 仅把包含同步阻塞调用的函数声明成 `async def`，仍会阻塞它所在的线程。
 
-技能、仓储、状态源和对账器都支持绑定。`RuntimeServer` 直接在端口构造参数中
+技能、仓储、状态源、对账器及平台事件源 / 日志都支持绑定。`RuntimeServer` 直接在端口构造参数中
 接收相同绑定，远程客户端不能改变服务端线程归属。共享和指定组均为运行时内部线程，
 不使用应用循环；默认 shared 线程与名为 `"shared"` 的指定组分开，不同运行时也不共享。
 同一对象按身份去重，重复注册必须使用相同模式和组名；普通对象等同 dedicated，
@@ -337,9 +505,24 @@ runtime.add_task_listener(on_event=slow_callback, execution="dedicated")
 | --- | --- |
 | `await listener.wait()` | 等待调用时已经登记的任务监听完成；以后仍可提交新任务并再次等待 |
 | `await listener.close()` | 注销并取消排队回调，遗弃在途同步回调结果；不取消业务任务，可以重复调用 |
+| `listener.closed` | 线程安全的只读注销标志，不表示机器人已停止 |
+| `listener.track(task_id, *, validate=None)` | 显式登记已知任务，回放后接实时；重复 ID 不重复交付 |
 
 取消 `wait()` 的调用者不会取消后台监听。同一个注册对同一任务 ID 只监听一次，
 所以重复提交幂等请求不会重复通知；去重 ID 保留到注销。多次注册得到独立的监听句柄。
 SDK `close()` 会停止监听，不保证交付尚未完成的回调，要收齐结果应先 `wait()`。
 监听流关闭或失败后 `wait()` 也会返回，因此业务成功要以 `on_done` 的任务状态为准。
 回调内部不能 `wait()` 自己的监听句柄，也不要吞掉取消信号。
+
+`track()` 在运行中的观察方循环调用，不负责提交任务。可选 validate 是短小的同步校验函数，
+接收独立 Task 快照并返回 None；失败只通过 on_error 报告，发生在事件订阅之前。它用于
+观察资格核对，不是任务准入或安全校验，不得在其中操作机器人。校验失败的 ID 可以再次登记；
+同一 ID 正在校验时，候选串行排队（最多 64 个），确认的无校验 track 优先。队列溢出且没有
+保留候选匹配时报告 LISTENER_CAPACITY_EXCEEDED；wait 包含已排队的替代校验，close 清除
+待校验项。已经开始正常观察后的失败仍保留原有去重行为。
+
+需要复用相同回调边界的上层观察者可从 `sdk.callback_executor` 使用
+`CallbackExecutor.invoke(callback, *args, can_start=None)`：异步回调 / 同步返回的 awaitable
+在调用循环等待，同步函数经既有有界池派发。可选 can_start 是短小同步检查，派发前、工作线程
+领取时及等待返回的 awaitable 前再次核对；返回 False 时遗弃结果。调用者取消会撤销未领取
+工作并遗弃在途结果，不能强制停止外部副作用。执行器由创建者显式 close。

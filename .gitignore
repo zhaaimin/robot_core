@@ -48,3 +48,5 @@ venv/
 .env.*
 !.env.example
 cc_api/examples/config.py
+
+plans
