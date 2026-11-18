@@ -44,6 +44,9 @@ class CallbackExecutor:
     waiting for user code. Threads use no executor registry or exit-time joins.
     Abandoned native coroutines are closed; errors from that cleanup are also
     abandoned so they cannot kill a worker or interrupt SDK shutdown.
+    invoke() keeps async callbacks and returned awaitables on its caller's loop,
+    reusing this same bounded pool for sync code. Its start guard is checked on
+    the execution thread so registrations can revoke callbacks still queued.
     """
 
     def __init__(
@@ -62,6 +65,52 @@ class CallbackExecutor:
         self._jobs: dict[asyncio.Future[Any], _CallbackWork] = {}
         self._started = False
         self._closed = False
+
+    async def invoke(
+        self, callback: Callable[..., Any], *args: Any,
+        can_start: Callable[[], bool] | None = None,
+    ) -> Any:
+        try:
+            if can_start is not None and not can_start():
+                return None
+            if inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(
+                getattr(callback, "__call__", None)
+            ):
+                result = callback(*args)
+            else:
+                def invoke_sync() -> Any:
+                    if can_start is not None and not can_start():
+                        return None
+                    return callback(*args)
+
+                future = self.submit(invoke_sync)
+                try:
+                    result = await future
+                except asyncio.CancelledError:
+                    self.cancel(future)
+                    if future.done() and not future.cancelled() and future.exception() is None:
+                        self.discard_result(future.result())
+                    raise
+            if inspect.isawaitable(result):
+                if can_start is not None and not can_start():
+                    self.discard_result(result)
+                    return None
+                return await result
+            return result
+        except asyncio.CancelledError as error:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            raise ListenerCallbackError("Task callback cancelled itself") from error
+        except BaseException as error:
+            if (
+                isinstance(error, Exception) and not isinstance(error, StopIteration)
+                and not (
+                    isinstance(error, RuntimeError) and isinstance(error.__cause__, StopIteration)
+                )
+            ):
+                raise
+            raise ListenerCallbackError(f"Task callback raised {type(error).__name__}") from error
 
     def submit(self, callback: Callable[..., Any], *args: Any) -> asyncio.Future[Any]:
         loop = asyncio.get_running_loop()

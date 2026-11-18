@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import threading
+from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import Future
 from contextlib import aclosing
@@ -9,6 +10,7 @@ from typing import Any
 from robot_agent_runtime.errors import (
     InvalidRequest,
     ListenerCallbackError,
+    ListenerCapacityExceeded,
     TaskEventStreamEnded,
 )
 from robot_agent_runtime.models import Event, Task, TaskState
@@ -28,6 +30,11 @@ DoneCallback = Callable[[Task], Awaitable[None] | None]
 ErrorCallback = Callable[[str, Exception], Awaitable[None] | None]
 EventSubscription = Callable[[str], AsyncGenerator[Event, None]]
 TaskLookup = Callable[[str], Awaitable[Task]]
+_MAX_PENDING_VALIDATORS = 64
+
+
+def _validation_capacity(snapshot: Task) -> None:
+    raise ListenerCapacityExceeded("Task listener validation backlog is exhausted", {"task_id": snapshot.id})
 
 
 def _consume(future: asyncio.Future[Any]) -> None:
@@ -36,7 +43,7 @@ def _consume(future: asyncio.Future[Any]) -> None:
 
 
 class TaskListener:
-    """One registration watching future submissions through its owning SDK.
+    """One registration watching submissions or explicitly tracked tasks.
 
     Events are replayed before live delivery, then the terminal snapshot is
     delivered once. Each task has its own coroutine, so callbacks that yield
@@ -51,7 +58,12 @@ class TaskListener:
     for robot actions or an in-flight synchronous callback to finish — a sync callback still
     running at close() is abandoned (its result is dropped). Callers who must see
     final callbacks must wait() before closing the SDK.
-    Observed IDs are retained until close to deduplicate idempotent submits.
+    Accepted IDs are retained until close to deduplicate idempotent submits.
+    Explicit tracking may validate a task snapshot before subscribing; a failed
+    validator ends only that observation and leaves its ID eligible for a later
+    explicit registration. Concurrent speculative validations are serialized in
+    a bounded queue; unconditional tracking takes precedence. Overflow is
+    reported if no retained candidate permits observation.
     """
 
     def __init__(
@@ -81,18 +93,67 @@ class TaskListener:
         self._cancel_grace_s = cancel_grace_s
         self._pending_callbacks: set[asyncio.Future[Any]] = set()
         self._seen: set[str] = set()
+        self._validating: set[str] = set()
+        self._pending_tracks: dict[str, deque[Callable[[Task], None] | None]] = {}
         self._closed = False
 
-    def _track(self, task_id: str) -> None:
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    def track(
+        self, task_id: str, *, validate: Callable[[Task], None] | None = None,
+    ) -> None:
+        if type(task_id) is not str or not task_id.strip():
+            raise InvalidRequest("Task ID must be a nonempty string")
+        if validate is not None and (
+            not callable(validate) or inspect.iscoroutinefunction(validate)
+            or inspect.iscoroutinefunction(getattr(validate, "__call__", None))
+        ):
+            raise InvalidRequest("Task validator must be a synchronous callable")
+        if validate is None:
+            self._track(task_id)
+        else:
+            self._track(task_id, validate=validate)
+
+    def _track(
+        self, task_id: str, *, validate: Callable[[Task], None] | None = None,
+    ) -> None:
         with self._lock:
             if self._closed or task_id in self._seen:
                 return
-            self._seen.add(task_id)
-            watcher = asyncio.create_task(self._observe(task_id), name=f"task-listener-{task_id}")
-            self._tasks[task_id] = watcher
+            if task_id in self._validating:
+                pending = self._pending_tracks.setdefault(task_id, deque())
+                if validate is None:
+                    pending.clear()
+                    pending.append(None)
+                elif not pending or pending[0] is not None:
+                    if len(pending) < _MAX_PENDING_VALIDATORS:
+                        pending.append(validate)
+                    elif not any(item is _validation_capacity for item in pending):
+                        pending.append(_validation_capacity)
+                return
             completion: Future[None] = Future()
-            self._completions[task_id] = completion
+            watcher = self._start_observer(task_id, validate, completion)
         watcher.add_done_callback(lambda finished: self._finished(task_id, finished))
+
+    def _start_observer(
+        self, task_id: str, validate: Callable[[Task], None] | None, completion: Future[None],
+    ) -> asyncio.Task[None]:
+        """Reserve the observation while its caller holds the registration lock."""
+        if validate is None:
+            self._seen.add(task_id)
+        else:
+            self._validating.add(task_id)
+        observation = (
+            self._observe(task_id) if validate is None
+            else self._observe(task_id, validate=validate)
+        )
+        watcher = asyncio.create_task(observation, name=f"task-listener-{task_id}")
+        self._tasks[task_id] = watcher
+        self._completions[task_id] = completion
+        return watcher
 
     async def wait(self) -> None:
         with self._lock:
@@ -117,6 +178,7 @@ class TaskListener:
             origin = callback_origin[1]
         with self._lock:
             self._closed = True
+            self._pending_tracks.clear()
             pending = [
                 (task, self._completions[task_id])
                 for task_id, task in self._tasks.items() if task is not origin
@@ -143,8 +205,26 @@ class TaskListener:
                 self._seen.clear()
             await self._detach(self)
 
-    async def _observe(self, task_id: str) -> None:
+    async def _observe(
+        self, task_id: str, *, validate: Callable[[Task], None] | None = None,
+    ) -> None:
         try:
+            if validate is not None:
+                if self._closed:
+                    return
+                snapshot = await self._get_task(task_id)
+                if self._closed:
+                    return
+                result = validate(snapshot.model_copy(deep=True))
+                if result is not None:
+                    self._executor.discard_result(result)
+                    raise InvalidRequest("Task validator must return None")
+                with self._lock:
+                    if self._closed:
+                        return
+                    self._validating.discard(task_id)
+                    self._seen.add(task_id)
+                    self._pending_tracks.pop(task_id, None)
             terminal = False
             async with aclosing(self._subscribe(task_id)) as stream:
                 async for event in stream:
@@ -232,11 +312,23 @@ class TaskListener:
         })
 
     def _finished(self, task_id: str, watcher: asyncio.Task[None]) -> None:
+        replacement: asyncio.Task[None] | None = None
         with self._lock:
             if self._tasks.get(task_id) is watcher:
                 self._tasks.pop(task_id, None)
                 completion = self._completions.pop(task_id)
-                completion.set_result(None)
+                self._validating.discard(task_id)
+                pending = self._pending_tracks.get(task_id)
+                if pending and not self._closed and task_id not in self._seen:
+                    validate = pending.popleft()
+                    if not pending:
+                        self._pending_tracks.pop(task_id, None)
+                    replacement = self._start_observer(task_id, validate, completion)
+                else:
+                    self._pending_tracks.pop(task_id, None)
+                    completion.set_result(None)
+        if replacement is not None:
+            replacement.add_done_callback(lambda finished: self._finished(task_id, finished))
         if not watcher.cancelled():
             error = watcher.exception()
             if error is not None and not self._closed:
