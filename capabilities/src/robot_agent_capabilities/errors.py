@@ -11,3 +11,15 @@ class CapabilityNotAllowed(AgentRuntimeError):
 
 class CapabilityTransportError(AgentRuntimeError):
     code = "CAPABILITY_TRANSPORT_UNCERTAIN"
+
+
+class CapabilityEventsUnsupported(AgentRuntimeError):
+    code = "CAPABILITY_EVENTS_UNSUPPORTED"
+
+
+class CapabilityEventTransportError(AgentRuntimeError):
+    code = "CAPABILITY_EVENT_TRANSPORT_FAILED"
+
+
+class CapabilityEventCleanupTimeout(AgentRuntimeError):
+    code = "CAPABILITY_EVENT_CLEANUP_TIMEOUT"

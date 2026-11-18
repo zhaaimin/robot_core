@@ -4,6 +4,41 @@
 用统一工具目录和稳定操作 ID 调用真实模拟 runtime。命令为
 `/opt/robot_agent_venv/bin/python examples/capabilities_demo.py`，无需 Agent 或 MCP 框架。
 
+## 能力层任务和平台监听
+
+[`capability_listeners_demo.py`](capability_listeners_demo.py) 使用模拟器和假平台事件源，
+分别注册 `robot.add_task_listener(...)` / `robot.add_platform_listener(...)`，演示任务自动登记、
+同步事件回调、异步终态 / 设备回调，以及 `close_listeners()` 释放资源。
+任务和平台监听使用同名 reporting 组，打印同一回调线程；回调通过 call_soon_threadsafe
+通知业务 loop。两个监听入口也支持默认 caller 与按注册独占的 dedicated。
+任务业务失败仍走 on_done，设备故障仍走平台 on_event；on_error 只报告监听失败并可省略。
+
+```bash
+docker exec robot_core_ubuntu24 bash -lc 'cd /workspace/robot_core && python3 examples/capability_listeners_demo.py'
+```
+
+示例不连接硬件或模型。两类句柄的 wait / close 与线程边界见
+[能力层说明](../capabilities/README.md#注册任务和平台监听)。
+
+## 空闲平台事件与恢复
+
+[platform_events_demo.py](platform_events_demo.py) 用假异步事件源产生初始快照与变化，
+通过 `RobotCapabilities.subscribe_events()` 接收，再从应用已处理的 `cursor` 重订阅补收。
+运行前安装本仓库的 runtime 与 capabilities 两个包；无需硬件、厂商 SDK 或新增第三方依赖：
+
+```bash
+python3 examples/platform_events_demo.py
+```
+
+示例把首次收到的变化当作尚未处理，只保存初始事件游标；重订阅后按事件 ID 收到同一变化。
+随后提交模拟器只读状态任务，在任务完成后通过同一订阅汇聚该任务终态与平台事实，验证不会
+错过快速完成；再从已处理终态序号恢复，确认不重复且能结束。不会连接或操作真实机器人。
+内存日志只在当前进程内有效。重启恢复需注入 `SQLitePlatformEventRepository`，消费方在完成业务
+处理后保存游标并按 `event_id` 幂等。日志默认保留 10000 条，过期后须重新同步设备当前状态。
+接口和已连接 WebSocket 的转发示例见 [SDK 参考](../docs/sdk-reference.md#平台事件与通知)。
+
+## CC API 语音入口
+
 CC API 语音分成三个独立入口，按当前要做的事选择即可：
 
 | 入口 | 展示内容 | 任务结果从哪里来 |
@@ -73,7 +108,7 @@ python3 examples/cc_api_speech_demo.py \
 ```
 
 只把监听2 移到独立线程，仍会受到提交方循环阻塞的影响。完整组合说明见
-[项目 README](../README.md#cc-api-语音播报)。此实验的监听异常只打印，不替代业务任务结果。
+[厂商接入文档](../docs/adapters.md#cc-api-语音播报)。此实验的监听异常只打印，不替代业务任务结果。
 
 ## 连接与生命周期
 

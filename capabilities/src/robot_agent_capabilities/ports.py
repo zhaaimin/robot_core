@@ -1,7 +1,48 @@
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
 from typing import Protocol
 
-from robot_agent_runtime.models import Event, SkillDefinition, Task, TaskRequest
+from robot_agent_runtime.models import Event, PlatformEvent, SkillDefinition, Task, TaskRequest
+
+
+class ListenerHandle(Protocol):
+    """Own observation only; completion never establishes robot action success.
+
+    Task wait joins the tasks already registered when called. Continuous
+    platform/all-task wait joins the observer itself. close is idempotent and
+    does not own the shared runtime or cancel robot work.
+    """
+
+    @property
+    def closed(self) -> bool: ...
+
+    async def wait(self) -> None: ...
+
+    async def close(self) -> None: ...
+
+
+class PlatformEventRuntime(Protocol):
+    """Optional observation independent of task support and client lifecycle.
+
+    The backend owns journal cursors, filtering and replay. Ending observation
+    releases only this iterator, never the runtime or physical work. Consumers
+    retain their processed cursor; delivery alone does not acknowledge it.
+    """
+
+    def subscribe_platform_events(
+        self, *, after_cursor: int = 0, event_types: set[str] | None = None,
+    ) -> AsyncIterator[PlatformEvent]: ...
+
+
+class TaskEventRuntime(Protocol):
+    """Optional live all-task observation without a cross-task replay cursor.
+
+    Known task histories use TaskRuntime.subscribe_task_events instead. This
+    optional port never implies that events preceding registration can replay.
+    """
+
+    def subscribe_all_task_events(
+        self, event_types: set[str] | None = None,
+    ) -> AsyncIterator[Event]: ...
 
 
 class TaskRuntime(Protocol):
